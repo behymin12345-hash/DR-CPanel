@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="2.4.1"
+VERSION="2.4.2"
 CONF_DIR="/etc/dr-cpanel"
 BLK="$CONF_DIR/blocked"             # ports cut off by their quota (written by the web panel)
 CONF="$CONF_DIR/rules.conf"          # lines: name|proto|listen_port|dest_ip|dest_port
@@ -279,6 +279,27 @@ def validate(d):
     for r in read_rules():
         if r["lport"] == lport and (r["proto"] == proto or "both" in (r["proto"], proto)): raise ValueError("A forward on this port already exists")
     return dict(name=name or "fw%d" % lport, proto=proto, lport=lport, ip=ip, dport=dport)
+
+def split_ports(v):
+    return [x for x in re.split(r"[,\s\u060c;]+", str(v or "")) if x]
+
+def validate_many(d):
+    # "lport" may hold several ports ("8899,2044"). All-or-nothing: if one is invalid, nothing is added.
+    ls = split_ports(d.get("lport")); ds = split_ports(d.get("dport"))
+    if not ls: raise ValueError("Invalid port")
+    if len(ls) > 50: raise ValueError("Too many ports (max 50)")
+    if len(ds) > 1 and len(ds) != len(ls): raise ValueError("Destination ports must be one value or the same count as listen ports")
+    base = str(d.get("name") or "").strip()
+    out = []
+    for i, l in enumerate(ls):
+        dd = dict(d, lport=l, dport=(ds[i] if len(ds) > 1 else ds[0] if ds else ""))
+        if len(ls) > 1: dd["name"] = ("%s-%s" % (base, l)) if base else ""
+        try: out.append(validate(dd))
+        except ValueError as e:
+            if len(ls) > 1: raise ValueError("%s: %s" % (l, e))
+            raise
+    if len({r["lport"] for r in out}) != len(out): raise ValueError("Duplicate port in the list")
+    return out
 
 # -------------------------------------------------------- system sampling
 def sysval(k):
@@ -654,9 +675,10 @@ class H(BaseHTTPRequestHandler):
                 return self.out(200, {"ok": True}, extra=[("Set-Cookie", "drc=; Max-Age=0; Path=/")])
             if self.path == "/api/rules":
                 with LOCK:
-                    r = validate(d); rs = read_rules(); rs.append(r); write_rules(rs)
-                    open(DEF, "w").write(r["ip"])
-                log("info", "Added forward %s :%d → %s:%d (%s)" % (r["name"], r["lport"], r["ip"], r["dport"], r["proto"]))
+                    new = validate_many(d); rs = read_rules(); rs.extend(new); write_rules(rs)
+                    open(DEF, "w").write(new[0]["ip"])
+                for r in new:
+                    log("info", "Added forward %s :%d → %s:%d (%s)" % (r["name"], r["lport"], r["ip"], r["dport"], r["proto"]))
                 return self.out(200, {"ok": True})
             if self.path in ("/api/quota", "/api/sub"):
                 k = str(int(d.get("lport", 0)))
@@ -954,7 +976,7 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 </main></div>
 
 <div class="modal" id="m"><div class="box"><h3>افزودن تانل جدید</h3>
-<div class="row"><div><label>پورت ورودی (این سرور)</label><input id="f_l" inputmode="numeric"></div><div><label>پروتکل</label><select id="f_p"><option>tcp</option><option>udp</option><option>both</option></select></div></div>
+<div class="row"><div><label>پورت ورودی (این سرور)</label><input id="f_l" placeholder="8899,2044" dir="ltr" autocomplete="off"></div><div><label>پروتکل</label><select id="f_p"><option>tcp</option><option>udp</option><option>both</option></select></div></div>
 <label>IP سرور خارج</label><input id="f_i" placeholder="1.2.3.4">
 <div class="row"><div><label>پورت مقصد (خالی = برابر)</label><input id="f_d" inputmode="numeric"></div><div><label>نام (اختیاری)</label><input id="f_n"></div></div>
 <div class="acts"><button class="btn p" id="f_ok">ذخیره</button><button class="btn" id="f_x">انصراف</button></div></div></div>
