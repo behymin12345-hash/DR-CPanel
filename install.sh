@@ -53,12 +53,16 @@ VER="$(grep -m1 'VERSION="' "$TMP" | sed 's/.*VERSION="\([^"]*\)".*/\1/')"
 MODE="install"
 [[ -x $BIN ]] && MODE="update"
 
+# keep the previous version so "dr-cpanel rollback" can restore it
+[[ $MODE == update ]] && cp -f "$BIN" "$BIN.bak" 2>/dev/null
+
 install -m 755 "$TMP" "$BIN"
 rm -f "$TMP"
 ok "v$VER saved to $BIN"
 
 if [[ $MODE == update ]]; then
   ok "Updated (existing tunnels and settings in /etc/dr-cpanel are kept)."
+  info "If anything breaks:  dr-cpanel rollback"
 else
   ok "Installed."
   echo

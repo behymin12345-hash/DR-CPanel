@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="2.7.0"
+VERSION="2.8.0"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
 TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active
@@ -21,6 +21,8 @@ BIN="/usr/local/bin/dr-cpanel"
 UNIT="/etc/systemd/system/dr-cpanel.service"
 SYSCTL_FWD="/etc/sysctl.d/99-dr-cpanel-forward.conf"
 SYSCTL_OPT="/etc/sysctl.d/99-dr-cpanel-optimize.conf"
+PERF_STATE="$CONF_DIR/perf_preset"
+AUDF="/var/log/dr-cpanel-audit.log"
 
 C_RST=$'\e[0m'; C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'
 C_CYN=$'\e[36m'; C_BLD=$'\e[1m'
@@ -157,6 +159,7 @@ tun_write_conf() {   # id
   local r id fip port mtu ipriv fpub
   r=$(awk -F'|' -v i="$1" '$1==i{print;exit}' "$TUN")
   IFS='|' read -r id fip port mtu ipriv _ _ fpub _ <<< "$r"
+  (( mtu >= 1200 && mtu <= 1500 )) || mtu=1420   # 0 = auto: start with a safe value
   mkdir -p /etc/wireguard
   ( umask 077; cat > "/etc/wireguard/drwg$id.conf" <<EOF
 [Interface]
@@ -190,11 +193,11 @@ tun_down() {   # id
   rm -f "/etc/wireguard/drwg$1.conf"
 }
 
-tun_add() {   # foreign_ip [udp_port] [mtu]
-  local fip=$1 port=${2:-51820} mtu=${3:-1380} id=1 ipriv fpriv
+tun_add() {   # foreign_ip [udp_port] [mtu]   (mtu 0 = auto-detect once the link is up)
+  local fip=$1 port=${2:-51820} mtu=${3:-0} id=1 ipriv fpriv
   valid_ip "$fip" || { echo "error: invalid IP" >&2; return 1; }
   [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { echo "error: invalid UDP port" >&2; return 1; }
-  [[ $mtu =~ ^[0-9]+$ ]] && (( mtu >= 1200 && mtu <= 1500 )) || { echo "error: invalid MTU" >&2; return 1; }
+  [[ $mtu =~ ^[0-9]+$ ]] && (( mtu == 0 || (mtu >= 1200 && mtu <= 1500) )) || { echo "error: invalid MTU" >&2; return 1; }
   [[ -n $(tun_row "$fip") ]] && { echo "error: a tunnel to $fip already exists" >&2; return 1; }
   tun_need_wg || return 1
   while [[ -s $TUN ]] && cut -d'|' -f1 "$TUN" | grep -qx "$id"; do id=$((id + 1)); done
@@ -208,6 +211,26 @@ tun_add() {   # foreign_ip [udp_port] [mtu]
     echo "error: could not start the WireGuard interface" >&2; return 1
   fi
   apply_rules
+}
+
+tun_probe_mtu() {   # id : echo the largest inner-MTU the link actually passes (binary search with DF pings)
+  local id=$1 lo=1200 hi=1500 mid best=0
+  ip link set dev "drwg$id" mtu 1500 >/dev/null 2>&1 || return 1
+  while (( lo <= hi )); do
+    mid=$(( (lo + hi) / 2 ))
+    if ping -M do -s $((mid - 28)) -c1 -W1 "10.66.$id.2" >/dev/null 2>&1; then best=$mid; lo=$((mid + 1)); else hi=$((mid - 1)); fi
+  done
+  echo "$best"
+}
+
+tun_automtu() {   # foreign_ip : detect the best MTU, save it and bounce the interface
+  local r id mtu; r=$(tun_row "$1"); [[ -n $r ]] || return 1
+  id=${r%%|*}
+  [[ $(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}') -gt 0 ]] || return 1   # needs a live link
+  mtu=$(tun_probe_mtu "$id"); (( mtu >= 1200 )) || return 1
+  awk -F'|' -v OFS='|' -v i="$id" -v m="$mtu" '$1==i{$4=m}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+  tun_write_conf "$id"; tun_up "$id"
+  echo "$mtu"
 }
 
 tun_del() {   # foreign_ip
@@ -226,6 +249,8 @@ tun_active() {   # foreign_ip 0|1   (1 = send the forwards through the tunnel)
     local hs; hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
     [[ ${hs:-0} -gt 0 ]] || { echo "error: no handshake yet. Run the setup script on the foreign server first" >&2; return 1; }
     ping -c 2 -W 2 "10.66.$id.2" >/dev/null 2>&1 || { echo "error: the foreign end does not answer inside the tunnel" >&2; return 1; }
+    local am; am=$(awk -F'|' -v i="$id" '$1==i{print $4}' "$TUN")
+    if [[ $am == 0 ]]; then tun_automtu "$1" >/dev/null 2>&1 || true; fi   # MTU "auto": measure the real path once the link is live
   fi
   awk -F'|' -v OFS='|' -v ip="$1" -v v="$2" '$2==ip{$9=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
   apply_rules
@@ -237,6 +262,20 @@ tun_sync() {   # rebuild interfaces from tunnels.conf (after a restore)
   tun_need_wg || return 1
   for id in $(cut -d'|' -f1 "$TUN"); do tun_write_conf "$id"; tun_up "$id"; done
   apply_rules
+}
+
+repair_wg() {   # watchdog helper: bounce every active interface whose handshake went stale
+  local r id hs
+  [[ -s $TUN ]] || return 0
+  while IFS='|' read -r id _ _ _ _ _ _ _ a; do
+    [[ -z $id || $a != 1 ]] && continue
+    hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
+    if [[ ${hs:-0} -gt 0 ]]; then
+      (( $(date +%s) - hs > 300 )) || continue
+    fi
+    wg show "drwg$id" >/dev/null 2>&1 || { tun_write_conf "$id"; tun_up "$id"; continue; }
+    (( $(date +%s) - ${hs:-0} > 300 )) && { systemctl restart "wg-quick@drwg$id" 2>/dev/null || { tun_write_conf "$id"; tun_up "$id"; }; }
+  done < "$TUN"
 }
 
 tun_script() {   # foreign_ip : the script to run on the foreign server
@@ -271,6 +310,26 @@ WGEOF
 systemctl enable wg-quick@drwg$id >/dev/null 2>&1 || true
 systemctl restart wg-quick@drwg$id 2>/dev/null || { wg-quick down drwg$id 2>/dev/null; wg-quick up drwg$id; }
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow $port/udp; ufw allow in on drwg$id; fi
+# iperf3 listener on the tunnel IP: lets the panel measure the real bandwidth of this link
+command -v iperf3 >/dev/null 2>&1 || {
+  if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y -q iperf3 >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then yum install -y -q iperf3 >/dev/null 2>&1 || true; fi
+}
+if command -v iperf3 >/dev/null 2>&1; then
+cat > /etc/systemd/system/drc-iperf.service <<IPEOF
+[Unit]
+Description=DR-CPanel bandwidth test (iperf3 on the tunnel link)
+After=network-online.target
+[Service]
+ExecStart=/usr/bin/iperf3 -s -B 10.66.$id.2
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+IPEOF
+systemctl daemon-reload; systemctl enable --now drc-iperf >/dev/null 2>&1 || true
+fi
 echo "Done. Tunnel address on this server: 10.66.$id.2"
 EOS
 }
@@ -283,7 +342,9 @@ tunnel_cli() {
     use)    tun_active "${2:-}" 1;;
     direct) tun_active "${2:-}" 0;;
     sync)   tun_sync;;
-    *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] | del IP | script IP | use IP | direct IP | sync"; return 1;;
+    mtu)    tun_automtu "${2:-}";;
+    repair) repair_wg;;
+    *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] | del IP | script IP | use IP | direct IP | mtu IP | sync | repair"; return 1;;
   esac
 }
 
@@ -312,6 +373,7 @@ tunnel_menu() {
   echo "   3) Switch forwards to the tunnel   (after the foreign side is set up)"
   echo "   4) Switch forwards back to direct"
   echo "   5) Remove tunnel"
+  echo "   6) Auto-tune MTU         find the largest packet the link passes"
   echo "   0) Back"; echo
   read -rp "  Select: " c
   case $c in
@@ -319,9 +381,10 @@ tunnel_menu() {
        if tun_add "$fip" "${port:-51820}"; then ok "Tunnel created. Run this on the foreign server as root:"; echo; tun_script "$fip"
        else err "Failed."; fi;;
     2) tun_pick && tun_script "$TFIP";;
-    3) tun_pick && { if tun_active "$TFIP" 1; then ok "Forwards to $TFIP now use the tunnel."; else err "Not switched."; fi; };;
+    3) tun_pick && { if tun_active "$TFIP" 1; then ok "Forwards to $TFIP now use the tunnel. MTU: $(awk -F'|' -v ip="$TFIP" '$2==ip{print $4}' "$TUN")"; else err "Not switched."; fi; };;
     4) tun_pick && { tun_active "$TFIP" 0 && ok "Forwards to $TFIP are direct again."; };;
     5) tun_pick && confirm "Remove the tunnel to $TFIP? Its forwards go back to direct." && tun_del "$TFIP" && ok "Removed.";;
+    6) tun_pick && { local got; if got=$(tun_automtu "$TFIP"); then ok "Best MTU for this link: $got"; else err "Could not measure (link must be connected first)."; fi; };;
   esac
 }
 
@@ -493,6 +556,42 @@ def notify(text):
 
 def mkhash(pw, salt): return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200000).hex()
 
+# ------------------------------------------------- audit / TOTP (stdlib only)
+AUDF = "/var/log/dr-cpanel-audit.log"
+
+def audit(action, detail="", ip="-"):
+    try:
+        with open(AUDF, "a") as f: f.write("%s|%s|%s|%s\n" % (time.strftime("%F %T"), ip, action, str(detail)[:300]))
+    except Exception: pass
+
+def audit_read(n=300):
+    out = []
+    try:
+        with open(AUDF) as f: out = [l.rstrip("\n") for l in f if l.strip()][-n:]
+    except Exception: pass
+    return out
+
+def b32secret(): return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+def totp_code(secret, off=0):
+    key = base64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8), casefold=True)
+    c = int(time.time() // 30) + off
+    h = hmac.new(key, c.to_bytes(8, "big"), hashlib.sha1).digest()
+    o = h[19] & 15
+    return "%06d" % ((int.from_bytes(h[o:o + 4], "big") & 0x7FFFFFFF) % 1000000)
+
+def totp_ok(secret, code):
+    try: return any(hmac.compare_digest(totp_code(secret, o), code) for o in (0, 1, -1))
+    except Exception: return False
+
+def rec_use(code, c):   # one-time recovery codes: c["rec"] = [sha256hex, ...]
+    h = hashlib.sha256(code.strip().encode()).hexdigest()
+    lst = c.get("rec") or []
+    for x in lst:
+        if hmac.compare_digest(x, h):
+            lst.remove(x); upd(rec=lst); return True
+    return False
+
 # ------------------------------------------------------------------ rules
 def read_rules():
     out = []
@@ -619,6 +718,26 @@ def transport_test(ip, port):
             res["verdict"] = "wg" if sw <= sd * 1.3 + 10 else "direct"
     return res
 
+def bwtest(ip):
+    # real throughput of the encrypted link: iperf3 UDP to the iperf3 listener on the foreign tunnel IP
+    t = tunnels().get(ip)
+    if not t: raise ValueError("no_tunnel")
+    if not shutil.which("iperf3"):
+        for pm in (["apt-get", "install", "-y", "-qq", "iperf3"], ["dnf", "install", "-y", "iperf3"], ["yum", "install", "-y", "iperf3"]):
+            if shutil.which(pm[0]):
+                subprocess.run(pm, capture_output=True, timeout=300); break
+    if not shutil.which("iperf3"): raise ValueError("no_iperf")
+    try:
+        r = subprocess.run(["iperf3", "-c", peer(t), "-u", "-b", "0", "-t", "5", "-J"], capture_output=True, text=True, timeout=45)
+    except Exception: raise ValueError("bw_fail")
+    if r.returncode: raise ValueError("bw_nosvc")
+    try:
+        s = json.loads(r.stdout).get("end", {}).get("sum_sent") or {}
+        assert s.get("bits_per_second")
+    except Exception: raise ValueError("bw_fail")
+    return dict(mbps=round(s.get("bits_per_second", 0) / 1e6, 1), jitter=round(s.get("jitter_ms", 0), 2),
+                loss=round(s.get("lost_percent", 0), 1), pps=round(s.get("packets", 0) / 5), mtu=t.get("mtu"))
+
 def counters():
     c = {}
     try: out = subprocess.run(["iptables", "-t", "nat", "-nvxL", "DRC_PRE"], capture_output=True, text=True, timeout=5).stdout
@@ -735,6 +854,12 @@ def monitor():
                             log("warn", "%s is DOWN: %s:%d unreachable" % (r["name"], r["ip"], r["dport"]))
                             notify("🔴 %s (:%d → %s:%d) is DOWN" % (r["name"], r["lport"], r["ip"], r["dport"]))
             watchdog()
+            try: wg_watch()
+            except Exception as e: log("warn", "wg_watch error: %s" % type(e).__name__)
+            try: traffic_tick()
+            except Exception: pass
+            try: tg_daily_jobs()
+            except Exception: pass
             c = cfg(); cpu = SYS.get("cpu", 0); ram = 100 * SYS.get("ram_used", 0) / max(SYS.get("ram_total", 1), 1)
             if (cpu > 90 or ram > 92) and time.time() - c.get("_lastres", 0) > 1800:
                 upd(_lastres=time.time()); log("warn", "High resource use: CPU %.0f%% RAM %.0f%%" % (cpu, ram)); notify("⚠️ High resource use: CPU %.0f%% · RAM %.0f%%" % (cpu, ram))
@@ -751,6 +876,147 @@ def watchdog():
         log("warn", "Watchdog: forwarding rules were missing (%d/%d) and have been restored" % (got, exp))
         notify("♻️ Watchdog restored forwarding rules (%d/%d)" % (got, exp))
 
+def tg_send_file(data, name, caption=""):
+    c = cfg()
+    if not (c.get("tg_token") and c.get("tg_chat")): return "Telegram is not configured"
+    try:
+        b = "----drc" + secrets.token_hex(8)
+        parts = [("--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n" % (b, c["tg_chat"])).encode()]
+        if caption: parts.append(("--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n" % (b, caption[:900])).encode())
+        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"document\"; filename=\"%s\"\r\nContent-Type: application/gzip\r\n\r\n" % (b, name)).encode() + data + b"\r\n")
+        parts.append(("--%s--\r\n" % b).encode())
+        u = ("%s/bot%s/sendDocument" % (c.get("tg_api") or "https://api.telegram.org", c["tg_token"])).replace("//bot", "/bot")
+        req = urllib.request.Request(u, data=b"".join(parts), headers={"Content-Type": "multipart/form-data; boundary=" + b})
+        urllib.request.urlopen(req, timeout=60).read(); return None
+    except Exception as e: return "%s" % type(e).__name__
+
+def hum(sec):
+    sec = int(sec); s = ""
+    if sec >= 3600: s += "%dh " % (sec // 3600)
+    if sec % 3600 >= 60 or not s: s += "%dm" % (sec % 3600 // 60)
+    return s.strip()
+
+WGF = D + "/wgstate.json"; T24F = D + "/traffic24.json"
+T24 = None; T24_PREV = 0; T24_SAVED = 0
+
+def traffic_tick():
+    # hourly forwarded-bytes buckets for the 24 h chart
+    global T24, T24_PREV, T24_SAVED
+    cur = fwd_bytes()
+    if cur is None: return
+    tot = sum(cur.values())
+    if T24 is None: T24 = jload(T24F).get("b", [])
+    h = int(time.time() // 3600)
+    if not T24 or T24[-1][0] != h:
+        T24.append([h, 0]); T24 = T24[-25:]
+    d = tot - T24_PREV if tot >= T24_PREV else tot
+    if d > 0: T24[-1][1] += d
+    T24_PREV = tot
+    if time.time() - T24_SAVED > 300:
+        T24_SAVED = time.time(); jsave(T24F, {"b": T24})
+
+def wg_watch():
+    # tunnel watchdog: track down/up, auto-restart stale links, report downtime (auto-heal after a foreign reboot)
+    st = jload(WGF); now = time.time(); ids = set()
+    for t in tunnel_info():
+        k = str(t["id"]); ids.add(k); e = st.setdefault(k, {})
+        if not t["active"]: continue
+        if t["up"]:
+            if e.get("down_since"):
+                dt = now - e["down_since"]; e.pop("down_since", None); e.pop("restart", None)
+                log("info", "Tunnel %s is linked again (downtime %s)" % (t["ip"], hum(dt)))
+                notify("🟢 تانل WireGuard %s وصل شد (قطعی: %s)" % (t["ip"], hum(dt)))
+        else:
+            if not e.get("down_since"):
+                e["down_since"] = now
+                log("warn", "Tunnel %s: no handshake" % t["ip"]); notify("🔴 تانل WireGuard %s قطع شد (بدون handshake)" % t["ip"])
+            if now - e["down_since"] > 300 and now - e.get("restart", 0) > 600:
+                e["restart"] = now
+                subprocess.run(["systemctl", "restart", "wg-quick@drwg%s" % k], timeout=30)
+                subprocess.run([BIN, "apply"], timeout=20)
+                log("warn", "Watchdog restarted the WireGuard interface for %s" % t["ip"])
+    for k in list(st):
+        if k not in ids: st.pop(k)
+    jsave(WGF, st)
+
+def daily_report_text():
+    up = dn = 0
+    for r in read_rules():
+        h = HEALTH.get("%d/%s" % (r["lport"], r["proto"]))
+        if h and h["ok"] is True: up += 1
+        elif h and h["ok"] is False: dn += 1
+    t24 = sum(b for _, b in (T24 or [])[::-1][:24])
+    tg = sum(1 for t in tunnel_info() if t["up"])
+    tn = len(tunnel_info())
+    bk = len(blocked())
+    cpu = SYS.get("cpu", 0); ram = 100 * SYS.get("ram_used", 0) / max(SYS.get("ram_total", 1), 1)
+    return "📊 گزارش روزانه DR-CPanel\n" \
+           "🟢 سرویس‌های آنلاین: %d · 🔴 قطع: %d\n" \
+           "🔗 تانل‌های WireGuard: %d/%d متصل\n" \
+           "📈 ترافیک ۲۴ ساعت: %s\n" \
+           "⛔ سرویس‌های قطع‌شده (حجم/انقضا): %d\n" \
+           "🖥 CPU: %s%% · RAM: %s%%\n" \
+           "⏱ آپتایم: %s" % (up, dn, tg, tn, hbytes(t24), bk, cpu, ram, hum(SYS.get("up", 0) * 60))
+
+def tg_daily_jobs():
+    # one daily report + one nightly backup, each once per day
+    c = cfg()
+    if not (c.get("tg_token") and c.get("tg_chat")): return
+    day = time.strftime("%F")
+    try: rh = int(c.get("tg_report_hour", 12))
+    except Exception: rh = 12
+    if c.get("tg_report", True) and c.get("_rday") != day and time.localtime().tm_hour >= rh:
+        upd(_rday=day); e = tg_send(daily_report_text())
+        log("info", "Daily report sent to Telegram" if not e else "Daily report failed: " + e)
+    try: bh = int(c.get("tg_backup_hour", 3))
+    except Exception: bh = 3
+    if c.get("tg_backup", True) and c.get("_bday") != day and time.localtime().tm_hour >= bh:
+        upd(_bday=day); e = tg_send_file(make_backup(), "dr-cpanel-backup-%s.tar.gz" % day, "🌙 بکاپ خودکار شبانه DR-CPanel")
+        log("info", "Nightly backup sent to Telegram" if not e else "Nightly backup failed: " + e)
+
+def bot_reply(args):
+    rs = read_rules()
+    if not rs: return "هنوز تانلی ساخته نشده."
+    a = (args or [""])[0].lower()
+    if a.startswith("tunnel") or a.startswith("tan"):
+        out = ["🔗 تانل‌ها:"]
+        for t in tunnel_info():
+            out.append("%s %s — %s، ترافیک ↓%s ↑%s" % ("🟢" if t["up"] else "🔴", t["ip"], "فعال" if t["active"] else "مستقیم", hbytes(t["rx"]), hbytes(t["tx"])))
+        return "\n".join(out)
+    if a.startswith("traf") or a.startswith("t24"):
+        now = int(time.time() // 3600)
+        per = sorted(((hbytes(e.get("used", 0)), r["name"]) for r, e in ((r, jload(QUOTA).get(str(r["lport"]), {})) for r in rs)), reverse=True)[:5]
+        return "📈 ترافیک ۲۴ ساعت: %s\n" % hbytes(sum(b for h, b in (T24 or []) if h > now - 24)) + "\n".join("• %s — %s" % (n, v) for v, n in per)
+    if a.startswith("repo") or a.startswith("gza"):
+        return daily_report_text()
+    up = dn = 0
+    for r in rs:
+        h = HEALTH.get("%d/%s" % (r["lport"], r["proto"]))
+        up += 1 if h and h["ok"] else 0; dn += 1 if h and h["ok"] is False else 0
+    return "🖥 وضعیت DR-CPanel\n🟢 آنلاین: %d · 🔴 قطع: %d · کل: %d\n" \
+           "CPU: %s%% · RAM: %s%%\n" \
+           "BBR: %s" % (up, dn, len(rs), SYS.get("cpu", 0), 100 * SYS.get("ram_used", 0) // max(SYS.get("ram_total", 1), 1), sysval("net.ipv4.tcp_congestion_control"))
+
+def tg_bot():
+    time.sleep(10); off = 0
+    while True:
+        try:
+            c = cfg()
+            if not (c.get("tg_token") and c.get("tg_chat") and c.get("tg_bot", True)): time.sleep(15); continue
+            u = ("%s/bot%s/getUpdates" % (c.get("tg_api") or "https://api.telegram.org", c["tg_token"])).replace("//bot", "/bot")
+            r = json.load(urllib.request.urlopen(u + "?timeout=25&offset=" + str(off), timeout=35))
+            for up in r.get("result", []):
+                off = up["update_id"] + 1
+                msg = up.get("message") or {}
+                if str(msg.get("chat", {}).get("id")) != str(c["tg_chat"]): continue
+                txt = (msg.get("text") or "").strip().split()
+                cmd = txt[0].split("@")[0].lstrip("/").lower() if txt else ""
+                if cmd in ("status", "s", "start", "help", "report", "traffic", "tunnels"):
+                    rep = bot_reply([cmd] if cmd not in ("start", "help") else [] ) if cmd not in ("start", "help") else \
+                          "ربات DR-CPanel:\n/status — وضعیت سرویس‌ها\n/tunnels — وضعیت تانل‌های رمزنگاری‌شده\n/traffic — ترافیک ۲۴ ساعت\n/report — گزارش کامل روزانه"
+                    if rep: tg_send(rep)
+        except Exception: time.sleep(10)
+
 # ------------------------------------------------------------ views / ops
 def state():
     c = counters(); rs = []; qd = jload(QUOTA); sb = jload(SUBF); bk = blocked(); sec = sec_read(); tun = tunnels()
@@ -761,10 +1027,29 @@ def state():
         h = HEALTH.get("%d/%s" % (r["lport"], r["proto"]))
         st = "unknown" if not h or h["ok"] is None else ("up" if h["ok"] else "down")
         e = qd.get(str(r["lport"]), {}); by = int(e.get("used", by))
+        expired = bool(e.get("expires")) and time.time() > exp_ts(e["expires"])
         rs.append(dict(r, packets=pk, bytes=by, limit=int(e.get("limit", 0)), blocked=str(r["lport"]) in bk, sub=str(r["lport"]) in sb, sec=sec.get(str(r["lport"]), {}), enc=bool(tun.get(r["ip"], {}).get("active")), status=st, ms=h["ms"] if h else None,
-                       hist=list(h["hist"]) if h else [], since=h["since"] if h else None))
+                       hist=list(h["hist"]) if h else [], since=h["since"] if h else None,
+                       period=e.get("period", ""), reset_at=e.get("reset_at", 0), expires=e.get("expires", ""), expired=expired, hours=e.get("h") or []))
+    pc = perf_current_py()
+    ct = cm = 0
+    try: ct = int(open("/proc/sys/net/netfilter/nf_conntrack_count").read()); cm = int(open("/proc/sys/net/netfilter/nf_conntrack_max").read())
+    except Exception: pass
+    cf = cfg()
     return {"rules": rs, "host": socket.gethostname(), "sys": dict(SYS), "ip_forward": sysval("net.ipv4.ip_forward") == "1",
-            "cc": sysval("net.ipv4.tcp_congestion_control"), "now": time.time(), "ver": "__DR_VERSION__"}
+            "cc": sysval("net.ipv4.tcp_congestion_control"), "now": time.time(), "ver": "__DR_VERSION__",
+            "t24": [(h * 3600, b) for h, b in (T24 or [])], "perf": dict(preset=pc, ct=ct, cm=cm),
+            "totp": bool(cf.get("totp")), "bot": bool(cf.get("tg_bot", True)), "rhour": cf.get("tg_report_hour", 12), "bhour": cf.get("tg_backup_hour", 3)}
+
+def perf_current_py():
+    try:
+        n = open(D + "/perf_preset").read().strip()
+        if n in ("balanced", "turbo", "throughput", "gaming"): return n
+    except Exception: pass
+    try:
+        if os.path.exists("/etc/sysctl.d/99-dr-cpanel-optimize.conf"): return "custom"
+    except Exception: pass
+    return "default"
 
 def health_check():
     items = []
@@ -800,7 +1085,7 @@ def health_check():
 def make_backup():
     b = io.BytesIO()
     with tarfile.open(fileobj=b, mode="w:gz") as t:
-        for n in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf", "web.json", "web.crt", "web.key"):
+        for n in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf", "web.json", "web.crt", "web.key", "traffic24.json", "wgstate.json", "perf_preset"):
             if os.path.exists(D + "/" + n): t.add(D + "/" + n, arcname=n)
     return b.getvalue()
 
@@ -850,7 +1135,8 @@ def quota_tick():
     with QLOCK:
         cur = fwd_bytes()
         if cur is None: return
-        q = jload(QUOTA); old = blocked(); new = set(); names = {}
+        now = time.time()
+        q = jload(QUOTA); old = blocked(); new = set(); expired = set(); names = {}
         for r in read_rules(): names[str(r["lport"])] = r["name"]
         for k in list(q):
             if k not in names: q.pop(k)
@@ -859,13 +1145,33 @@ def quota_tick():
             d = c - e["last"] if c >= e["last"] else c
             if d > 0 and k not in old: e["used"] += d
             e["last"] = c
-            if e["limit"] and e["used"] >= e["limit"]: new.add(k)
+            pr = e.get("period")
+            if pr in ("daily", "weekly", "monthly"):
+                if not e.get("reset_at"):
+                    e["reset_at"] = next_reset(now, pr)
+                elif now >= e["reset_at"]:
+                    e["used"] = 0; e["reset_at"] = next_reset(now, pr)
+                    log("info", "Periodic quota of :%s (%s) reset" % (names[k], pr))
+                    notify("🔄 حجم %s (:%s) دوره‌ای ریست شد (%s)" % (names[k], k, pr))
+            ex = e.get("expires")
+            if ex and now > exp_ts(ex): expired.add(k)
+            hbkt = int(now // 3600)
+            h = e.get("h")
+            if not isinstance(h, list): h = []
+            if not h or h[-1][0] != hbkt:
+                h.append([hbkt, 0]); h = h[-25:]
+            if d > 0 and k not in old: h[-1][1] += d
+            e["h"] = h
+            if (e["limit"] and e["used"] >= e["limit"]) or k in expired: new.add(k)
         if new != old:
             with open(BLKF, "w") as f: f.write("".join(k + "\n" for k in sorted(new)))
             subprocess.run([BIN, "apply"], timeout=20)
             for e in q.values(): e["last"] = 0
             for k in new - old:
-                log("warn", "%s (:%s) used up its quota and is cut off" % (names[k], k)); notify("⛔ %s (:%s) حجمش تمام شد و قطع شد" % (names[k], k))
+                if k in expired:
+                    log("warn", "%s (:%s) expired and is cut off" % (names[k], k)); notify("⌛ %s (:%s) تاریخ انقضایش رسیده و قطع شد" % (names[k], k))
+                else:
+                    log("warn", "%s (:%s) used up its quota and is cut off" % (names[k], k)); notify("⛔ %s (:%s) حجمش تمام شد و قطع شد" % (names[k], k))
             for k in old - new: log("info", "%s (:%s) is back online" % (names.get(k, "?"), k))
         jsave(QUOTA, q)
 
@@ -882,12 +1188,34 @@ def quota_loop():
         except Exception as e: log("warn", "quota error: %s" % type(e).__name__)
         time.sleep(3)
 
-def quota_set(lport, limit=None, reset=False):
+def next_reset(ts, period):   # next daily / weekly (Mon) / monthly boundary, local time
+    lt = time.localtime(ts)
+    if period == "daily": return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+    if period == "weekly":
+        d = (lt.tm_wday + 1) % 7   # 0 = Monday
+        return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + (7 - d), 0, 0, 0, 0, 0, -1))
+    m, y = (lt.tm_mon + 1, lt.tm_year) if lt.tm_mon < 12 else (1, lt.tm_year + 1)
+    return time.mktime((y, m, 1, 0, 0, 0, 0, 0, -1))
+
+def exp_ts(s):
+    try:
+        p = time.strptime(str(s)[:10], "%Y-%m-%d")
+        return time.mktime(p[:3] + (23, 59, 59) + p[6:8] + (-1,))
+    except Exception: return 0
+
+def quota_set(lport, limit=None, reset=False, period=None, expires=None):
     quota_tick()
     with QLOCK:
         q = jload(QUOTA); e = q.setdefault(str(lport), {"limit": 0, "used": 0, "last": 0})
         if limit is not None: e["limit"] = max(0, int(limit))
         if reset: e["used"] = 0
+        if period is not None:
+            if period in ("daily", "weekly", "monthly"):
+                e["period"] = period; e["reset_at"] = next_reset(time.time(), period)
+            else: e.pop("period", None); e.pop("reset_at", None)
+        if expires is not None:
+            if str(expires).strip(): e["expires"] = str(expires).strip()[:10]
+            else: e.pop("expires", None)
         jsave(QUOTA, q)
     quota_tick()
 
@@ -902,9 +1230,16 @@ def forget(lport):
         if k in b:
             b.discard(k); open(BLKF, "w").write("".join(x + "\n" for x in sorted(b)))
 
-def sub_html(name, used, lim, left, pct, off):
+def sub_html(name, used, lim, left, pct, off, expires="", days_left=None, hours=None):
     tone = "er" if off else ("wa" if lim and pct >= 90 else "ok")
     st = "حجم تمام شده — سرویس قطع است" if off else ("حجم رو به پایان است" if tone == "wa" else "سرویس فعال است")
+    dl = ("%d روز مانده" % days_left) if days_left is not None else "امروز تمام می‌شود" if expires else ""
+    exp = '<div class="exp">⌛ تاریخ انقضا: %s · %s</div>' % (expires, dl) if expires else ""
+    chart = ""
+    if hours:
+        v = [b for _, b in hours][-24:]; m = max(v + [1])
+        bars = "".join('<rect x="%d" y="%d" width="9" height="%d" rx="2"></rect>' % (i * 14, 44 - max(3, int(40 * x / m)), max(3, int(40 * x / m))) for i, x in enumerate(v))
+        chart = '<div class="ch"><span>ترافیک ۲۴ ساعت اخیر</span><svg viewBox="0 0 %d 46" preserveAspectRatio="none">%s</svg></div>' % (max(len(v), 1) * 14 - 5, bars)
     page = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#07060f">
@@ -940,6 +1275,11 @@ h1{margin:0;font-size:17px;letter-spacing:.01em}small{color:var(--mu)}
 .g div{border:1px solid var(--line);border-radius:14px;padding:13px 4px;background:rgba(255,255,255,.03)}
 .g span{display:block;color:var(--mu);font-size:11.5px;margin-bottom:5px}
 .g b{font-size:15px;direction:ltr;display:inline-block;font-variant-numeric:tabular-nums}
+.exp{margin:-6px 0 16px;padding:10px 13px;border:1px solid color-mix(in srgb,var(--wa) 35%,transparent);background:color-mix(in srgb,var(--wa) 9%,transparent);border-radius:12px;color:var(--wa);font-size:13px}
+.ch{margin-top:18px;border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:rgba(255,255,255,.03)}
+.ch span{display:block;color:var(--mu);font-size:11.5px;margin-bottom:8px}
+.ch svg{width:100%;height:46px;display:block}
+.ch rect{fill:var(--ac);opacity:.75}
 footer{margin-top:20px;padding-top:16px;border-top:1px solid var(--line);color:var(--mu);font-size:12px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap}
 footer a{color:var(--mu);text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:.2s}
 footer a:hover{color:var(--tx)}
@@ -950,14 +1290,32 @@ footer svg{width:13px;height:13px;fill:currentColor}
 <div class="aur" aria-hidden="true"><i class="a1"></i><i class="a2"></i><i class="a3"></i><i class="stars"></i></div>
 <main class="c @TONE@">
 <div class="hd"><span class="mk"><svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.5h6L9.5 22 19 9.5h-6.2z" fill="none" stroke="#fbbf24" stroke-width="1.8" stroke-linejoin="round"/></svg></span><div><h1>@NAME@</h1><small>وضعیت مصرف حجم</small></div></div>
-<div class="st"><i></i>@ST@</div>@BAR@
+<div class="st"><i></i>@ST@</div>@EXP@@BAR@@CHART@
 <div class="g"><div><span>مصرف‌شده</span><b>@USED@</b></div><div><span>کل حجم</span><b>@LIM@</b></div><div><span>باقی‌مانده</span><b>@LEFT@</b></div></div>
 <footer><span>آخرین بروزرسانی: @TIME@ · هر ۶۰ ثانیه خودکار تازه می‌شود</span><i class="dot"></i><a href="https://github.com/behymin12345-hash/DR-CPanel" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55v-2.17c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.66.41.36.78 1.05.78 2.13v3.16c0 .3.21.67.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>GitHub</a><i class="dot"></i><a href="https://t.me/DR_Gojo_Satoruu" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24"><path d="M9.04 15.51l-.38 5.32c.54 0 .78-.23 1.06-.51l2.55-2.44 5.28 3.87c.97.53 1.66.25 1.92-.9L23.9 4.4c.31-1.42-.51-1.98-1.45-1.63L2.9 10.2c-1.38.53-1.36 1.3-.24 1.65l4.69 1.46L18.3 6.9c.51-.34.98-.15.6.19l-9.86 8.42z"/></svg><span dir="ltr">@DR_Gojo_Satoruu</span></a></footer></main></body></html>"""
     rep = {"@TONE@": tone, "@NAME@": html.escape(name), "@ST@": st, "@USED@": hbytes(used),
            "@LIM@": hbytes(lim) if lim else "نامحدود", "@LEFT@": hbytes(left) if lim else "—",
-           "@BAR@": '<div class="bar"><b style="width:%d%%"></b></div>' % pct if lim else "", "@TIME@": time.strftime("%F %H:%M")}
+           "@BAR@": '<div class="bar"><b style="width:%d%%"></b></div>' % pct if lim else "", "@TIME@": time.strftime("%F %H:%M"),
+           "@EXP@": exp, "@CHART@": chart}
     for k, v in rep.items(): page = page.replace(k, v)
     return page
+
+def offline_pkg():
+    d = open(BIN, "rb").read()
+    inst = (b"#!/usr/bin/env bash\n"
+            b"# DR-CPanel offline installer - no internet needed\n"
+            b"set -e; cd \"$(dirname \"$0\")\"\n"
+            b"[ \"$(id -u)\" = 0 ] || { echo \"run as root\"; exit 1; }\n"
+            b"sha256sum -c SHA256SUMS >/dev/null 2>&1 || { echo \"checksum FAILED - package is broken\"; exit 1; }\n"
+            b"echo \"checksum OK\"\n"
+            b"install -m 755 dr-cpanel.sh /usr/local/bin/dr-cpanel\n"
+            b"echo \"installed. open the menu with: dr-cpanel\"\n"
+            b"exec /usr/local/bin/dr-cpanel\n")
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:gz") as t:
+        for name, data, mode in (("dr-cpanel.sh", d, 0o755), ("install.sh", inst, 0o755), ("SHA256SUMS", (hashlib.sha256(d).hexdigest() + "  dr-cpanel.sh\n" + hashlib.sha256(inst).hexdigest() + "  install.sh\n").encode(), 0o644)):
+            ti = tarfile.TarInfo(name); ti.size = len(data); ti.mode = mode; t.addfile(ti, io.BytesIO(data))
+    return b.getvalue()
 
 def restart_later():
     threading.Timer(1.5, lambda: subprocess.run(["systemctl", "restart", "dr-cpanel-web"])).start()
@@ -1044,6 +1402,7 @@ class H(BaseHTTPRequestHandler):
         if not self.authed(): return self.out(401, {"error": "auth"})
         if p == "/api/state": return self.out(200, state())
         if p == "/api/logs": return self.out(200, list(LOGS)[::-1])
+        if p == "/api/audit": return self.out(200, {"a": audit_read()})
         if p == "/api/health": return self.out(200, health_check())
         if p == "/api/tunnels": return self.out(200, {"tunnels": tunnel_info(), "wg": bool(shutil.which("wg"))})
         if p == "/api/tunnel/script":
@@ -1055,9 +1414,11 @@ class H(BaseHTTPRequestHandler):
             if k not in {str(r["lport"]) for r in read_rules()}: return self.out(404, {"error": "No such rule"})
             t = jload(SUBF).get(k, ""); return self.out(200, {"token": t, "path": "/sub/" + t if t else ""})
         if p == "/api/settings":
-            c = cfg(); return self.out(200, {"domain": c.get("domain", ""), "tg_chat": c.get("tg_chat", ""), "tg_api": c.get("tg_api", ""), "has_token": bool(c.get("tg_token")), "port": c.get("port"), "tls": c.get("tls")})
+            c = cfg(); return self.out(200, {"domain": c.get("domain", ""), "tg_chat": c.get("tg_chat", ""), "tg_api": c.get("tg_api", ""), "has_token": bool(c.get("tg_token")), "port": c.get("port"), "tls": c.get("tls"), "totp": bool(c.get("totp")), "bot": bool(c.get("tg_bot", True)), "report": bool(c.get("tg_report", True)), "backup": bool(c.get("tg_backup", True)), "rhour": c.get("tg_report_hour", 12), "bhour": c.get("tg_backup_hour", 3)})
         if p == "/api/backup":
             return self.out(200, make_backup(), "application/gzip", [("Content-Disposition", 'attachment; filename="dr-cpanel-backup-%s.tar.gz"' % time.strftime("%Y%m%d-%H%M%S"))])
+        if p == "/api/package":
+            return self.out(200, offline_pkg(), "application/gzip", [("Content-Disposition", 'attachment; filename="dr-cpanel-offline.tar.gz"')])
         self.out(404, {"error": "not found"})
 
     def sub_public(self, p):
@@ -1076,9 +1437,11 @@ class H(BaseHTTPRequestHandler):
             MISS[ip].append(now); return self.out(404, {"error": "not found"})
         e = jload(QUOTA).get(hit, {}); used = int(e.get("used", 0)); lim = int(e.get("limit", 0))
         left = max(0, lim - used) if lim else 0; pct = min(100, int(100 * used / lim)) if lim else 0; off = hit in blocked()
+        exp = e.get("expires", ""); xts = exp_ts(exp) if exp else 0
+        dl = max(0, int((xts - now) // 86400) + 1) if exp and xts >= now else (0 if exp else None)
         ex = [("X-Robots-Tag", "noindex, nofollow"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")]
-        if js: return self.out(200, {"name": r["name"], "used": used, "limit": lim, "left": left, "percent": pct, "offline": off, "unlimited": not lim}, extra=ex)
-        return self.out(200, sub_html(r["name"], used, lim, left, pct, off).encode(), "text/html; charset=utf-8", ex)
+        if js: return self.out(200, {"name": r["name"], "used": used, "limit": lim, "left": left, "percent": pct, "offline": off, "unlimited": not lim, "expires": exp, "days_left": dl, "period": e.get("period", "")}, extra=ex)
+        return self.out(200, sub_html(r["name"], used, lim, left, pct, off, exp, dl, e.get("h")).encode(), "text/html; charset=utf-8", ex)
 
     def do_DELETE(self):
         m = re.fullmatch(r"/api/rules/(\d+)", self.path)
@@ -1087,7 +1450,7 @@ class H(BaseHTTPRequestHandler):
             rs = read_rules(); i = int(m.group(1)) - 1
             if not 0 <= i < len(rs): return self.out(404, {"error": "No such rule"})
             r = rs.pop(i); write_rules(rs); forget(r["lport"])
-        log("info", "Removed forward %s (:%d)" % (r["name"], r["lport"]))
+        log("info", "Removed forward %s (:%d)" % (r["name"], r["lport"])); audit("rule_del", ":%d" % r["lport"], self.client_address[0])
         self.out(200, {"ok": True})
 
     def do_POST(self):
@@ -1104,13 +1467,18 @@ class H(BaseHTTPRequestHandler):
                     open(DEF, "w").write(new[0]["ip"])
                 for r in new:
                     log("info", "Added forward %s :%d → %s:%d (%s)" % (r["name"], r["lport"], r["ip"], r["dport"], r["proto"]))
+                audit("rule_add", ",".join(":%d" % r["lport"] for r in new), self.client_address[0])
                 return self.out(200, {"ok": True})
             if self.path in ("/api/quota", "/api/sub"):
                 k = str(int(d.get("lport", 0)))
                 if k not in {str(r["lport"]) for r in read_rules()}: return self.out(404, {"error": "No such rule"})
                 if self.path == "/api/quota":
-                    if d.get("reset"): quota_set(k, reset=True); log("info", "Usage of :%s reset" % k)
-                    else: quota_set(k, limit=int(d.get("limit", 0))); log("info", "Quota of :%s set to %s" % (k, hbytes(int(d.get("limit", 0))) if d.get("limit") else "unlimited"))
+                    if d.get("reset"):
+                        quota_set(k, reset=True); log("info", "Usage of :%s reset" % k); audit("quota_reset", ":" + k, self.client_address[0])
+                    else:
+                        quota_set(k, limit=int(d.get("limit", 0)), period=d.get("period"), expires=d.get("expires"))
+                        log("info", "Quota of :%s set to %s" % (k, hbytes(int(d.get("limit", 0))) if d.get("limit") else "unlimited"))
+                        audit("quota_set", ":%s limit=%s period=%s expires=%s" % (k, d.get("limit", 0), d.get("period") or "-", d.get("expires") or "-"), self.client_address[0])
                     return self.out(200, {"ok": True})
                 s = jload(SUBF); a = d.get("action")
                 if a in ("create", "rotate"):
@@ -1118,16 +1486,43 @@ class H(BaseHTTPRequestHandler):
                 elif a == "delete": s.pop(k, None)
                 else: raise ValueError("Bad action")
                 jsave(SUBF, s); t = s.get(k, ""); return self.out(200, {"token": t, "path": "/sub/" + t if t else ""})
-            if self.path in ("/api/tunnel", "/api/tunnel/test"):
+            if self.path in ("/api/tunnel", "/api/tunnel/test", "/api/tunnel/bw"):
                 try: ip = str(ipaddress.IPv4Address(str(d.get("ip", "")).strip()))
                 except Exception: raise ValueError("Invalid IP")
                 if self.path.endswith("/test"): return self.out(200, transport_test(ip, int(d.get("port") or 0)))
+                if self.path.endswith("/bw"): return self.out(200, bwtest(ip))
                 a = d.get("action")
                 with LOCK:
                     if a == "add": tun_cmd("add", ip, str(int(d.get("port") or 51820)))
                     elif a in ("use", "direct", "del"): tun_cmd(a, ip)
                     else: raise ValueError("Bad action")
-                log("info", "Tunnel %s: %s" % (a, ip)); return self.out(200, {"ok": True})
+                log("info", "Tunnel %s: %s" % (a, ip)); audit("tunnel_" + str(a), ip, self.client_address[0]); return self.out(200, {"ok": True})
+            if self.path == "/api/perf":
+                p = str(d.get("preset", ""))
+                if p not in ("balanced", "turbo", "throughput", "gaming"): raise ValueError("Bad preset")
+                r = subprocess.run([BIN, "perf", p], capture_output=True, text=True, timeout=120)
+                if r.returncode: raise ValueError("Preset failed: " + (r.stderr or "").strip()[-150:])
+                log("info", "Performance preset applied: %s" % p); audit("perf", p, self.client_address[0])
+                return self.out(200, {"ok": True, "preset": p})
+            if self.path == "/api/totp":
+                c = cfg(); a = d.get("action"); ip = self.client_address[0]
+                if a == "setup":
+                    s = b32secret(); upd(_totp_tmp=s)
+                    return self.out(200, {"secret": s, "uri": "otpauth://totp/DR-CPanel:%s?secret=%s&issuer=DR-CPanel&algorithm=SHA1&digits=6&period=30" % (socket.gethostname(), s)})
+                if a == "enable":
+                    s = c.get("_totp_tmp")
+                    if not s: raise ValueError("Setup first")
+                    if not totp_ok(s, str(d.get("code", "")).strip()): raise ValueError("Wrong code")
+                    codes = ["-".join((secrets.token_hex(2).upper() for _ in range(2))) for _ in range(8)]
+                    upd(totp=True, totp_secret=s, rec=[hashlib.sha256(x.encode()).hexdigest() for x in codes], _totp_tmp="")
+                    log("info", "2FA enabled"); audit("2fa_enabled", "", ip)
+                    return self.out(200, {"ok": True, "codes": codes})
+                if a == "disable":
+                    if not hmac.compare_digest(mkhash(str(d.get("password", "")), c["salt"]), c["hash"]): raise ValueError("Current password is wrong")
+                    upd(totp=False, totp_secret="", rec=[])
+                    log("info", "2FA disabled"); audit("2fa_disabled", "", ip)
+                    return self.out(200, {"ok": True})
+                raise ValueError("Bad action")
             if self.path == "/api/rules/bulk":
                 ks = {int(x) for x in d.get("lports", [])}
                 with LOCK:
@@ -1156,10 +1551,13 @@ class H(BaseHTTPRequestHandler):
                 r = rs[i]
                 return self.out(200, {"ms": None if r["proto"] == "udp" else tcp_ms(eff_ip(r["ip"]), r["dport"]), "udp": r["proto"] == "udp"})
             if self.path == "/api/settings/telegram":
-                kw = {"tg_chat": str(d.get("chat", "")).strip()[:64], "tg_api": str(d.get("api", "")).strip().rstrip("/")[:200]}
+                kw = {"tg_chat": str(d.get("chat", "")).strip()[:64], "tg_api": str(d.get("api", "")).strip().rstrip("/")[:200], "tg_bot": bool(d.get("bot", True)), "tg_report": bool(d.get("report", True)), "tg_backup": bool(d.get("backup", True))}
                 if kw["tg_api"] and not kw["tg_api"].startswith("http"): raise ValueError("API address must start with https://")
                 if d.get("token"): kw["tg_token"] = str(d["token"]).strip()[:200]
-                upd(**kw); log("info", "Telegram settings updated"); return self.out(200, {"ok": True})
+                for key, val in (("tg_report_hour", d.get("report_hour")), ("tg_backup_hour", d.get("backup_hour"))):
+                    try: kw[key] = max(0, min(23, int(val)))
+                    except Exception: pass
+                upd(**kw); log("info", "Telegram settings updated"); audit("tg_settings", "", self.client_address[0]); return self.out(200, {"ok": True})
             if self.path == "/api/settings/tgtest":
                 e = tg_send("✅ DR-CPanel: Telegram connection works")
                 return self.out(200 if not e else 400, {"ok": not e, "error": e})
@@ -1172,9 +1570,9 @@ class H(BaseHTTPRequestHandler):
                 keep = self.token()
                 for t in list(SESS):
                     if t != keep: SESS.pop(t)
-                log("info", "Admin password changed"); return self.out(200, {"ok": True})
+                log("info", "Admin password changed"); audit("password_changed", "", self.client_address[0]); return self.out(200, {"ok": True})
             if self.path == "/api/restore":
-                with LOCK: restore(base64.b64decode(d.get("data", ""))); log("info", "Forwards restored from backup")
+                with LOCK: restore(base64.b64decode(d.get("data", ""))); log("info", "Forwards restored from backup"); audit("restore", "", self.client_address[0])
                 return self.out(200, {"ok": True})
             self.out(404, {"error": "not found"})
         except (ValueError, tarfile.TarError, base64.binascii.Error) as e: self.out(400, {"error": str(e) or "Bad request"})
@@ -1187,9 +1585,14 @@ class H(BaseHTTPRequestHandler):
         ok = "hash" in c and hmac.compare_digest(mkhash(str(d.get("password", "")), c["salt"]), c["hash"])
         if not ok:
             n += 1; FAILS[ip] = (n, time.time() + 300 if n >= 5 else 0)
-            log("warn", "Failed login from %s" % ip); time.sleep(1); return self.out(401, {"error": "Wrong password"})
+            log("warn", "Failed login from %s" % ip); audit("login_failed", "", ip); time.sleep(1); return self.out(401, {"error": "Wrong password"})
+        if c.get("totp"):
+            code = str(d.get("code") or "").strip()
+            if not code: return self.out(200, {"totp": True})   # client must ask for the second step
+            if not (totp_ok(c.get("totp_secret", ""), code) or rec_use(code, c)):
+                audit("2fa_failed", "", ip); time.sleep(1); return self.out(401, {"error": "Wrong code"})
         FAILS.pop(ip, None); t = secrets.token_urlsafe(32); SESS[t] = time.time() + 43200
-        log("info", "Login from %s" % ip)
+        log("info", "Login from %s" % ip); audit("login", "", ip)
         ck = "drc=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200%s" % (t, "; Secure" if c.get("tls") else "")
         self.out(200, {"ok": True}, extra=[("Set-Cookie", ck)])
 
@@ -1206,6 +1609,7 @@ if __name__ == "__main__":
     else:
         threading.Thread(target=sampler, daemon=True).start()
         threading.Thread(target=monitor, daemon=True).start()
+        threading.Thread(target=tg_bot, daemon=True).start()
         try: subprocess.run([BIN, "apply"], timeout=20)
         except Exception: pass
         threading.Thread(target=quota_loop, daemon=True).start()
@@ -1440,6 +1844,7 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="hero"><i class="mk"><svg><use href="#i-bolt"/></svg></i><svg class="dr" viewBox="0 0 76 36" aria-label="DR"><use href="#i-dr"/></svg><h2>CPanel</h2><p>ورود به پنل مدیریت تانل</p></div>
 <label for="pw">رمز عبور</label>
 <div class="pwf"><svg class="ic lk" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus spellcheck="false" autocapitalize="off"><button class="eye" id="eye" type="button" title="نمایش رمز"><svg class="ic" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+<div class="pwf hide" id="tfa"><svg class="ic lk" viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V5z"/><path d="M9 12l2 2 4-4"/></svg><input id="to" inputmode="numeric" maxlength="10" placeholder="کد دومرحله‌ای یا کد بازیابی" autocomplete="one-time-code" spellcheck="false" autocapitalize="off"></div>
 <button class="btn p go" id="lb" type="button">ورود<svg class="ic" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
 </div><div class="ft"><a class="fgl" href="https://github.com/behymin12345-hash/DR-CPanel" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-gh"/></svg>GitHub</a><i class="fd"></i><a class="fgl" href="https://t.me/DR_Gojo_Satoruu" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-tg"/></svg>@DR_Gojo_Satoruu</a></div></div></div>
 
@@ -1466,6 +1871,8 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="cell"><div class="hd"><b class="v" id="t_s">0 B/s</b><span class="l">سرعت لحظه‌ای</span></div><div class="s">live</div></div>
 <div class="cell"><div class="hd"><b class="v sm" id="t_fw">—</b></div><div class="s" id="t_cc">—</div></div>
 </div>
+<div class="sec">ترافیک ۲۴ ساعت</div>
+<div class="card" style="padding:16px"><div id="ch24" style="height:110px"></div><div class="hint" id="ch24s" style="margin:8px 0 0"></div></div>
 <div class="sec">وضعیت تانل‌ها</div>
 <div class="card"><div class="srch"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q_d" placeholder="جستجو (نام، پورت، آی‌پی)…" autocomplete="off"><button class="clr hide" id="q_dx" type="button" title="پاک کردن"><svg class="ic" style="width:13px;height:13px" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div><div class="tbl"><table><thead><tr><th>نام</th><th>مسیر</th><th>وضعیت</th><th>پینگ</th><th>نمودار</th><th>سرعت</th></tr></thead><tbody id="tb_d"></tbody></table></div></div></section>
 
@@ -1482,18 +1889,23 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <textarea id="t_sx" rows="9" readonly style="font-size:12px"></textarea><div class="acts"><button class="btn p" id="t_cp">کپی</button></div></div>
 <div class="card" style="margin-top:16px"><h2 style="margin-top:0;font-size:16px">تست ترنسپورت</h2>
 <div class="hint" style="margin:0 0 12px">مسیر مستقیم و تانل رمزنگاری‌شده را با هم مقایسه می‌کند (تأخیر، نوسان و ازدست‌رفتن بسته) و بهترین را پیشنهاد می‌دهد.</div>
-<div class="row"><div><label>سرور خارج</label><select id="t_ti"></select></div><div><label>پورت سرویس روی سرور خارج (خالی = خودکار)</label><input id="t_tp" inputmode="numeric"></div><div style="flex:0 0 auto;align-self:end"><button class="btn p" id="t_run">اجرای تست</button></div></div><div id="t_res" style="margin-top:12px"></div></div></section>
+<div class="row"><div><label>سرور خارج</label><select id="t_ti"></select></div><div><label>پورت سرویس روی سرور خارج (خالی = خودکار)</label><input id="t_tp" inputmode="numeric"></div><div style="flex:0 0 auto;align-self:end"><button class="btn p" id="t_run">اجرای تست</button> <button class="btn" id="t_bw">تست پهنای باند</button></div></div><div id="t_res" style="margin-top:12px"></div></div></section>
 <section id="p_health" class="hide"><div class="bar"><h1 style="margin:0">بررسی سلامت</h1><button class="btn p" id="hrun">اجرای بررسی</button></div><div class="card" id="hl"><div class="empty">برای شروع «اجرای بررسی» را بزنید</div></div></section>
-<section id="p_logs" class="hide"><h1>لاگ‌ها</h1><div class="card"><div class="lg" id="lg"></div></div></section>
+<section id="p_logs" class="hide"><div class="bar"><h1 style="margin:0">لاگ‌ها</h1><div class="acts" style="margin:0"><button class="btn on" id="lgs" type="button">سیستم</button><button class="btn" id="lga" type="button">حسابرسی</button></div></div><div class="card"><div class="lg" id="lg"></div></div></section>
 
 <section id="p_set" class="hide"><h1>تنظیمات</h1>
+<div class="card"><h2 style="margin-top:0;font-size:16px">پریست کارایی</h2>
+<div class="hint" style="margin:0 0 10px">تنظیمات هسته (BBR، بافرها، conntrack) برای سناریوی شما. فعال: <b id="pf_c">—</b> · conntrack: <span id="pf_n">—</span></div>
+<div class="acts" id="pf_b" style="margin:0"><button class="btn" data-pf="balanced" type="button">Balanced</button><button class="btn" data-pf="turbo" type="button">Turbo</button><button class="btn" data-pf="throughput" type="button">Throughput</button><button class="btn" data-pf="gaming" type="button">Gaming</button></div></div>
 <div class="card"><h2 style="margin-top:0;font-size:16px">رنگ‌بندی و ظاهر</h2>
 <div class="hint" style="margin:0">رنگ اصلی پنل را انتخاب کنید؛ روی دکمه‌ها، تب فعال، نوارها و نمودارها اعمال می‌شود.</div>
 <div class="sws" id="sws"></div>
 <label>زبان</label><div class="acts" style="margin-top:6px"><button class="btn" type="button" data-l="fa">فارسی</button><button class="btn" type="button" data-l="en">English</button></div></div>
-<div class="card"><h2 style="margin-top:0;font-size:16px">تلگرام (اعلان قطع/وصل و منابع)</h2>
+<div class="card"><h2 style="margin-top:0;font-size:16px">تلگرام (اعلان قطع/وصل، ربات، گزارش و بکاپ)</h2>
 <div class="row"><div><label>Bot Token</label><input id="g_t" placeholder="123456:ABC…" autocomplete="off"></div><div><label>Chat ID</label><input id="g_c"></div></div>
 <label>آدرس API تلگرام (اختیاری — برای سرور ایران با پروکسی/ورکر)</label><input id="g_a" placeholder="https://api.telegram.org">
+<div class="row" style="margin-top:8px"><div><label>ساعت گزارش روزانه (۰–۲۳)</label><input id="g_rh" type="number" min="0" max="23"></div><div><label>ساعت بکاپ شبانه (۰–۲۳)</label><input id="g_bh" type="number" min="0" max="23"></div></div>
+<div class="acts" style="margin:4px 0 0;flex-wrap:wrap"><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--mu);cursor:pointer;margin-inline-end:14px"><input type="checkbox" id="g_b"> ربات (/status /tunnels /traffic)</label><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--mu);cursor:pointer;margin-inline-end:14px"><input type="checkbox" id="g_rep"> گزارش روزانه</label><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--mu);cursor:pointer"><input type="checkbox" id="g_bk"> بکاپ شبانه در تلگرام</label></div>
 <div class="hint" id="g_h"></div><div class="acts"><button class="btn p" id="g_s">ذخیره</button><button class="btn" id="g_x">ارسال پیام تست</button></div></div>
 <div class="card"><h2 style="margin-top:0;font-size:16px">دامنه و HTTPS</h2>
 <div class="hint" id="d_h" style="margin:0 0 8px"></div>
@@ -1504,16 +1916,20 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="card"><h2 style="margin-top:0;font-size:16px">تغییر رمز</h2>
 <div class="row"><div><label>رمز فعلی</label><input id="w_o" type="password"></div><div><label>رمز جدید (حداقل ۸ کاراکتر)</label><input id="w_n" type="password"></div></div>
 <div class="acts"><button class="btn p" id="w_s">تغییر رمز</button></div></div>
+<div class="card"><h2 style="margin-top:0;font-size:16px">ورود دومرحله‌ای (TOTP)</h2>
+<div class="hint" id="tf_h" style="margin:0 0 10px"></div>
+<div id="tf_setup" style="display:none"><label>این راز را در Google Authenticator / Aegis ثبت کن (یا لینک otpauth):</label><textarea id="tf_s" rows="3" readonly></textarea><label>کد ۶ رقمی:</label><input id="tf_c" inputmode="numeric" maxlength="6"><div class="acts"><button class="btn p" id="tf_on">تأیید و فعال‌سازی</button></div></div>
+<div class="acts" id="tf_acts" style="margin:0"></div><div id="tf_rc" class="hint" style="display:none;margin-top:10px"></div></div>
 <div class="card"><h2 style="margin-top:0;font-size:16px">بکاپ و بازیابی</h2>
-<div class="hint" style="margin:0 0 10px">بکاپ شامل تانل‌ها، تنظیمات پنل، رمز و گواهی است. بازیابی فقط لیست تانل‌ها را برمی‌گرداند.</div>
-<div class="acts" style="margin:0"><button class="btn p" id="k_d">دانلود بکاپ</button><button class="btn" id="k_r">بازیابی از فایل</button><input id="k_f" type="file" accept=".gz,.tgz" class="hide"></div></div></section>
+<div class="hint" style="margin:0 0 10px">بکاپ شامل تانل‌ها، تنظیمات پنل، رمز و گواهی است. بازیابی فقط لیست تانل‌ها را برمی‌گرداند. پکیج آفلاین برای سرورهایی است که به گیت‌هاب دسترسی ندارند و شامل checksum SHA256 است.</div>
+<div class="acts" style="margin:0"><button class="btn p" id="k_d">دانلود بکاپ</button><button class="btn" id="k_r">بازیابی از فایل</button><button class="btn" id="k_p">پکیج آفلاین</button><input id="k_f" type="file" accept=".gz,.tgz" class="hide"></div></div></section>
 </main>
 <footer class="foot"><div class="fin">
 <a class="fgl" href="https://t.me/DR_Gojo_Satoruu" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-tg"/></svg><span>@DR_Gojo_Satoruu</span></a>
 <i class="fd"></i>
 <a class="fgl" href="https://github.com/behymin12345-hash/DR-CPanel" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-gh"/></svg><span>GitHub · DR-CPanel</span></a>
 <i class="fd"></i>
-<span class="fver" id="fver">v2.7.0</span>
+<span class="fver" id="fver">v2.8.0</span>
 </div></footer>
 </div>
 
@@ -1538,7 +1954,8 @@ let LANG="fa";try{LANG=localStorage.getItem("drl")==="en"?"en":"fa"}catch(e){}
 const EN={"ورود به پنل مدیریت تانل": "Sign in to the tunnel manager", "رمز عبور": "Password", "نمایش رمز": "Show password", "ورود": "Sign in", "تم": "Theme", "ظاهر": "Appearance", "خروج": "Sign out", "داشبورد": "Dashboard", "تانل‌ها": "Tunnels", "بررسی سلامت": "Health check", "لاگ‌ها": "Logs", "تنظیمات": "Settings", "سرور": "Server", "دیسک": "Disk", "تانل": "Tunnels", "ترافیک کل": "Total traffic", "سرعت لحظه‌ای": "Live speed", "وضعیت تانل‌ها": "Tunnel status", "نام": "Name", "مسیر": "Route", "وضعیت": "Status", "پینگ": "Ping", "نمودار": "Chart", "سرعت": "Speed", "+ افزودن تانل": "+ Add tunnel", "پروتکل": "Protocol", "پورت ورودی": "Listen port", "مقصد": "Destination", "حجم (مصرف / سقف)": "Quota (used / limit)", "اجرای بررسی": "Run check", "برای شروع «اجرای بررسی» را بزنید": "Press “Run check” to start", "تلگرام (اعلان قطع/وصل و منابع)": "Telegram (up/down and resource alerts)", "آدرس API تلگرام (اختیاری — برای سرور ایران با پروکسی/ورکر)": "Telegram API address (optional — for Iran servers via proxy/worker)", "ذخیره": "Save", "ارسال پیام تست": "Send test message", "دامنه و HTTPS": "Domain & HTTPS", "دامنه (باید به IP همین سرور اشاره کند)": "Domain (must point to this server's IP)", "ایمیل (اختیاری)": "Email (optional)", "برای گرفتن گواهی Let's Encrypt پورت ۸۰ باید آزاد باشد. تمدید خودکار انجام می‌شود. لینک کاربران هم روی همین دامنه و HTTPS کار می‌کند.": "To get a Let's Encrypt certificate, port 80 must be free. Renewal is automatic. User links also work on this domain over HTTPS.", "دریافت گواهی و فعال‌سازی": "Get certificate & enable", "حذف دامنه": "Remove domain", "یا گواهی خودم را وارد می‌کنم": "Or I'll enter my own certificate", "نصب گواهی": "Install certificate", "تغییر رمز": "Change password", "رمز فعلی": "Current password", "رمز جدید (حداقل ۸ کاراکتر)": "New password (min. 8 characters)", "بکاپ و بازیابی": "Backup & restore", "بکاپ شامل تانل‌ها، تنظیمات پنل، رمز و گواهی است. بازیابی فقط لیست تانل‌ها را برمی‌گرداند.": "The backup includes tunnels, panel settings, password and certificate. Restore only brings back the tunnel list.", "دانلود بکاپ": "Download backup", "بازیابی از فایل": "Restore from file", "افزودن تانل جدید": "Add new tunnel", "پورت ورودی (این سرور)": "Listen port (this server)", "IP سرور خارج": "Foreign server IP", "پورت مقصد (خالی = برابر)": "Destination port (empty = same)", "نام (اختیاری)": "Name (optional)", "انصراف": "Cancel", "حجم تانل": "Tunnel quota", "حجم تانل —": "Tunnel quota —", "بستن": "Close", "ریست مصرف": "Reset usage", "لینک کاربر": "User link", "صفحه‌ای فقط‌خواندنی که کاربر بدون ورود به پنل، حجم مصرف‌شده و باقی‌مانده‌اش را می‌بیند. آدرس آن حدس‌زدنی نیست.": "A read-only page where the user can see used and remaining data without signing in to the panel. Its address is not guessable.", "خطا": "Error", "آنلاین": "online", "قطع": "offline", "نامشخص": "unknown", "آنلاین ·": "online ·", "هنوز تانلی نساخته‌اید": "No tunnels yet", "حجم تمام": "Quota reached", "تست": "Test", "حجم": "Quota", "لینک": "Link", "حذف": "Delete", "UDP قابل تست نیست": "UDP can't be tested", "مقصد پاسخ نمی‌دهد": "Destination is not responding", "اتصال موفق ·": "Connected ·", "این تانل حذف شود؟": "Delete this tunnel?", "حذف شد": "Deleted", "تانل اضافه شد": "Tunnel added", "در حال بررسی…": "Checking…", "لاگی ثبت نشده": "No logs yet", "•••••• (ذخیره شده — برای تغییر وارد کنید)": "•••••• (saved — enter a new one to change)", "فعال: https://": "Active: https://", "بدون دامنه: گواهی self-signed (مرورگر هشدار می‌دهد)": "No domain: self-signed certificate (the browser will warn)", "HTTPS خاموش است": "HTTPS is off", "اگر سرور ایران به تلگرام دسترسی ندارد، آدرس یک پروکسی/ورکر سازگار با Bot API را در فیلد API بگذارید.": "If the Iran server can't reach Telegram, put the address of a Bot API–compatible proxy/worker in the API field.", "ذخیره شد": "Saved", "پیام تست ارسال شد": "Test message sent", "ارسال ناموفق:": "Send failed:", "رمز تغییر کرد": "Password changed", "لیست تانل‌ها با محتوای این بکاپ جایگزین شود؟": "Replace the tunnel list with this backup's contents?", "بازیابی شد": "Restored", "رمز را وارد کنید": "Enter the password", "مصرف": "Used", "سقف": "Limit", "نامحدود": "Unlimited", "باقی‌مانده": "Remaining", "حجم تمام شده و تانل قطع است. با بالا بردن سقف یا ریست مصرف، خودکار وصل می‌شود.": "The quota is used up and the tunnel is cut off. Raising the limit or resetting usage reconnects it automatically.", "مقدار دلخواه": "Custom amount", "افزودن به سقف:": "Add to limit:", "سقف حجم ذخیره شد": "Quota limit saved", "سقف حجم برداشته شد": "Quota limit removed", "مصرف این تانل صفر شود؟": "Reset this tunnel's usage to zero?", "مصرف صفر شد": "Usage reset", "لینک کاربر —": "User link —", "کپی لینک": "Copy link", "لینک جدید": "New link", "حذف لینک": "Delete link", "ساخت لینک": "Create link", "کپی شد": "Copied", "لینک قبلی از کار می‌افتد. ادامه؟": "The old link will stop working. Continue?", "لینک حذف شود؟": "Delete the link?", "دامنه را وارد کنید": "Enter a domain", "گواهی گرفته می‌شود و پنل ری‌استارت می‌شود. ادامه؟": "A certificate will be issued and the panel will restart. Continue?", "در حال دریافت گواهی؛ تا دو دقیقه صبر کنید…": "Getting the certificate; wait up to two minutes…", "فعال شد؛ در حال انتقال به دامنه…": "Enabled; redirecting to the domain…", "دامنه حذف شود و گواهی self-signed برگردد؟": "Remove the domain and go back to the self-signed certificate?", "انجام شد؛ پنل ری‌استارت می‌شود": "Done; the panel is restarting", "گواهی نصب شد؛ پنل ری‌استارت می‌شود": "Certificate installed; the panel is restarting", "رنگ‌بندی و ظاهر": "Colors & appearance", "رنگ اصلی پنل را انتخاب کنید؛ روی دکمه‌ها، تب فعال، نوارها و نمودارها اعمال می‌شود.": "Pick the panel's main color. It applies to buttons, the active tab, meters and charts.", "زبان": "Language", "در حال بارگذاری…": "Loading…", "احراز هویت": "Authentication", "داده‌های سرور": "Server metrics", "رابط کاربری": "Interface"};
 const FA={"Wrong password": "رمز اشتباه است", "Too many attempts, try later": "تلاش‌های زیاد؛ بعداً امتحان کنید", "Too many requests": "درخواست‌های زیاد؛ کمی صبر کنید", "Current password is wrong": "رمز فعلی اشتباه است", "New password must be at least 8 characters": "رمز جدید باید حداقل ۸ کاراکتر باشد", "A forward on this port already exists": "برای این پورت قبلاً تانل ساخته شده", "Invalid IP": "آی‌پی نامعتبر است", "Invalid port": "پورت نامعتبر است", "Port out of range": "پورت خارج از محدوده است", "Invalid protocol": "پروتکل نامعتبر است", "Invalid domain": "دامنه نامعتبر است", "Invalid email": "ایمیل نامعتبر است", "This port is used by the web panel": "این پورت توسط خود پنل استفاده می‌شود", "No such rule": "چنین تانلی وجود ندارد", "Server error": "خطای سرور", "Bad request": "درخواست نامعتبر", "Too large": "حجم داده زیاد است", "Bad action": "عملیات نامعتبر", "Port 80 is busy: Let's Encrypt needs it for a moment": "پورت ۸۰ اشغال است؛ Let's Encrypt لحظه‌ای به آن نیاز دارد", "API address must start with https://": "آدرس API باید با https:// شروع شود", "No forwards found in this file": "در این فایل تانلی پیدا نشد", "Certificate and key are invalid or do not match": "گواهی و کلید نامعتبر یا ناهمخوان‌اند", "Certificate and key must be PEM text": "گواهی و کلید باید متن PEM باشند"};
 Object.assign(EN,{"ترنسپورت":"Transport","تانل رمزنگاری‌شده (WireGuard)":"Encrypted tunnel (WireGuard)","سرور خارج":"Foreign server","پورت UDP":"UDP port","وضعیت لینک":"Link status","ترافیک":"Traffic","مسیر فورواردها":"Forwards via","متصل":"Linked","بدون handshake":"No handshake","مستقیم":"Direct","ساخت تانل":"Create tunnel","دستور سرور خارج":"Foreign setup script","برگشت به مستقیم":"Back to direct","فعال‌سازی":"Activate","کپی":"Copy","کپی شد":"Copied","انجام شد":"Done","هنوز تانلی ساخته نشده":"No tunnels yet","تست ترنسپورت":"Transport test","اجرای تست":"Run test","پاسخ می‌دهد":"Responds","بی‌پاسخ":"No answer","میانگین":"Average","کمترین / بیشترین":"Min / Max","نوسان":"Jitter","ازدست‌رفتن":"Loss","حذف همه":"Delete all","این تانل حذف شود؟ فورواردها به حالت مستقیم برمی‌گردند.":"Remove this tunnel? Its forwards go back to direct.","همه پورت‌های این سرور حذف شوند؟":"Delete every port of this server?","در حال تست… (حدود ۲۰ ثانیه)":"Testing… (about 20 s)","در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…":"Creating (installing WireGuard can take a moment)…","این دستور را روی سرور خارج (root) اجرا کن":"Run this on the foreign server (root)","IP سرور خارج":"Foreign server IP","حذف شد":"Deleted","امنیت تانل ذخیره شد":"Tunnel security saved","امنیت تانل":"Tunnel security","امنیت":"Security","این محدودیت‌ها فقط روی پورت همین تانل اعمال می‌شوند و ترافیک را دست‌نخورده عبور می‌دهند.":"These limits apply only to this tunnel's port and pass traffic through untouched.","آی‌پی‌های مجاز (هر خط یا با کاما؛ خالی = همه)":"Allowed IPs (one per line or comma-separated; empty = anyone)","حداکثر اتصال همزمان هر آی‌پی (۰ = خاموش)":"Max simultaneous connections per IP (0 = off)","اتصال جدید در دقیقه برای هر آی‌پی (۰ = خاموش)":"New connections per minute per IP (0 = off)","فقط آی‌پی‌های داخل لیست به این پورت می‌رسند. مطمئن شو آی‌پی مشتری‌ها داخل لیست است.":"Only the listed IPs can reach this port. Make sure your clients' IPs are in the list.","پورت":"port","جستجو (نام، پورت، آی‌پی)…":"Search name, port, IP…","موردی پیدا نشد":"No matches found","پاک کردن":"Clear","نشست منقضی شد":"Session expired — sign in again"});
-Object.assign(FA,{"Invalid IP or network":"آی‌پی یا شبکه نامعتبر است","Too many IPs":"تعداد آی‌پی‌ها زیاد است","Numbers out of range":"عدد خارج از محدوده است","Session expired — sign in again":"نشست منقضی شد — دوباره وارد شوید"});
+Object.assign(FA,{"Invalid IP or network":"آی‌پی یا شبکه نامعتبر است","Too many IPs":"تعداد آی‌پی‌ها زیاد است","Numbers out of range":"عدد خارج از محدوده است","Session expired — sign in again":"نشست منقضی شد — دوباره وارد شوید","Wrong code":"کد اشتباه است","Setup first":"اول «فعال‌سازی» را بزنید","no_tunnel":"تانل رمزنگاری‌شده‌ای برای این سرور ساخته نشده","no_iperf":"iperf3 نصب نشد (دسترسی مخازن؟)","bw_nosvc":"سرور خارج آماده تست نیست — اسکریپت سمت خارج را دوباره اجرا کن","bw_fail":"تست پهنای باند ناموفق بود","Bad preset":"پریست نامعتبر","Preset failed":"اعمال پریست ناموفق بود"});
+Object.assign(EN,{"ترافیک ۲۴ ساعت":"24-hour traffic","پریست کارایی":"Performance preset","ورود دومرحله‌ای (TOTP)":"Two-step login (TOTP)","حسابرسی":"Audit","سیستم":"System","تست پهنای باند":"Bandwidth test","پکیج آفلاین":"Offline package","ربات (/status /tunnels /traffic)":"Bot (/status /tunnels /traffic)","گزارش روزانه":"Daily report","بکاپ شبانه در تلگرام":"Nightly backup to Telegram","ساعت گزارش روزانه (۰–۲۳)":"Daily report hour (0–23)","ساعت بکاپ شبانه (۰–۲۳)":"Nightly backup hour (0–23)","ریست دوره‌ای مصرف":"Periodic usage reset","تاریخ انقضا (اختیاری)":"Expiry date (optional)","کد دومرحله‌ای یا کد بازیابی":"Two-step or recovery code","منقضی":"Expired","تلگرام (اعلان قطع/وصل، ربات، گزارش و بکاپ)":"Telegram (alerts, bot, report and backup)"});
 const RE=new RegExp(Object.keys(EN).sort((a,b)=>b.length-a.length).map(k=>k.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|"),"g");
 const TX=s=>{s=String(s);return LANG==="en"?s.replace(RE,m=>EN[m]):(FA[s]||s)};
 const cf=s=>confirm(TX(s));
@@ -1616,9 +2033,9 @@ const ms=r=>r.ms==null?"—":r.ms+" ms";
 function drawDash(){const s=window.LAST;if(!s)return;const rs=s.rules.filter(r=>fmatch(r,FLT.d));
  $("tb_d").innerHTML=rs.length?rs.map(r=>`<tr><td>${esc(r.name)}</td><td class="ltr cp" data-cp="${r.ip}:${r.dport}" title="کپی">${r.lport} → ${r.ip}:${r.dport}</td><td>${pill(r.status)}</td><td class="ltr">${ms(r)}</td><td>${spark(r.hist)}</td><td class="ltr">${hb(SP[r.lport+r.proto]||0)}/s</td></tr>`).join(""):`<tr><td colspan="6" class="empty">${s.rules.length?"موردی پیدا نشد":"هنوز تانلی نساخته‌اید"}</td></tr>`}
 const qcr=r=>{const p=r.limit?Math.min(100,100*r.bytes/r.limit):0,c=r.blocked||p>=90?"var(--er)":p>=70?"var(--wa)":"var(--ok)";return `<div class="ltr">${hb(r.bytes)} / ${r.limit?hb(r.limit):"∞"}</div>${r.limit?`<div class="mb"><i style="width:${p}%;background:${c}"></i></div>`:""}`};
-const ruleSig=r=>[r.name,r.proto,r.lport,r.ip,r.dport,r.status,r.blocked?1:0,r.sub?1:0,r.sec&&(r.sec.allow||r.sec.maxc||r.sec.rate)?1:0,r.enc?1:0].join("|");
+const ruleSig=r=>[r.name,r.proto,r.lport,r.ip,r.dport,r.status,r.blocked?1:0,r.expired?1:0,r.period||"",r.expires||"",r.sub?1:0,r.sec&&(r.sec.allow||r.sec.maxc||r.sec.rate)?1:0,r.enc?1:0].join("|");
 let TSIG="";
-function rowH(r,i,sub){return `<tr${sub?' class="sub"':''}><td>${sub?"":i+1}</td><td>${esc(r.name)}</td><td><span class="tag">${r.proto}</span></td><td class="ltr">${r.lport}</td><td class="ltr cp" data-cp="${r.ip}:${r.dport}" title="کپی">${r.ip}:${r.dport}</td><td>${r.blocked?'<span class="pill down">حجم تمام</span>':pill(r.status)}</td><td class="ltr" data-ms="${i}">${ms(r)}</td><td data-qc="${i}">${qcr(r)}</td><td><button class="btn" onclick="tst(${i+1},this)">تست</button> <button class="btn" onclick="qopen(${i})">حجم</button> <button class="btn" onclick="secopen(${i})">${r.sec&&(r.sec.allow||r.sec.maxc||r.sec.rate)?"🛡 ":""}امنیت</button> <button class="btn" onclick="sopen(${i})">${r.sub?"🔗 ":""}لینک</button> <button class="btn d" onclick="del(${i+1})">حذف</button></td></tr>`}
+function rowH(r,i,sub){return `<tr${sub?' class="sub"':''}><td>${sub?"":i+1}</td><td>${esc(r.name)}</td><td><span class="tag">${r.proto}</span></td><td class="ltr">${r.lport}</td><td class="ltr cp" data-cp="${r.ip}:${r.dport}" title="کپی">${r.ip}:${r.dport}</td><td>${r.expired?'<span class="pill down">منقضی</span>':r.blocked?'<span class="pill down">حجم تمام</span>':pill(r.status)}</td><td class="ltr" data-ms="${i}">${ms(r)}</td><td data-qc="${i}">${qcr(r)}</td><td><button class="btn" onclick="tst(${i+1},this)">تست</button> <button class="btn" onclick="qopen(${i})">حجم</button> <button class="btn" onclick="secopen(${i})">${r.sec&&(r.sec.allow||r.sec.maxc||r.sec.rate)?"🛡 ":""}امنیت</button> <button class="btn" onclick="sopen(${i})">${r.sub?"🔗 ":""}لینک</button> <button class="btn d" onclick="del(${i+1})">حذف</button></td></tr>`}
 function drawTunAll(force){const s=window.LAST;if(!s)return;const q=FLT.m;
  const sig=s.rules.map(ruleSig).join(";")+"#"+q;
  if(!force&&sig===TSIG)return;TSIG=sig;let h="";
@@ -1656,7 +2073,16 @@ function render(s){window.LAST=s;
  animNum($("t_b"),s.rules.reduce((a,r)=>a+r.bytes,0),v=>hb(v));$("t_p").textContent=s.rules.reduce((a,r)=>a+r.packets,0)+" packets";
  animNum($("t_s"),all,v=>nv(hb(v)+"/s"));
  $("t_fw").innerHTML=`<span style="color:var(${s.ip_forward?"--ok":"--er"})">●</span> IP Forward: ${s.ip_forward?"ON":"OFF"}`;$("t_cc").textContent="TCP: "+s.cc.toUpperCase();
+ draw24(s.t24);
+ const pf=s.perf||{};$("pf_c").textContent=pf.preset||"—";$("pf_n").textContent=(pf.ct||0)+" / "+(pf.cm||0);document.querySelectorAll("#pf_b [data-pf]").forEach(x=>x.classList.toggle("on",x.dataset.pf===pf.preset));
  drawDash();drawTunAll();patchTun()}
+function draw24(v){const el=$("ch24");if(!el)return;v=v||[];
+ if(!v.length){el.innerHTML='<div class="empty">هنوز داده‌ای ثبت نشده</div>';$("ch24s").textContent="";return}
+ const w=720,h=110,pd=6,mx=Math.max(...v.map(x=>x[1]),1),n=v.length,st=w/Math.max(n,1);
+ let pts="";v.forEach((x,i)=>{pts+=(i?" L":"M")+(i*st+st/2).toFixed(1)+","+(h-pd-(x[1]/mx)*(h-pd*2)).toFixed(1)});
+ el.innerHTML=`<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%;height:100%;display:block"><defs><linearGradient id="g24" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--ac)" stop-opacity=".35"/><stop offset="1" stop-color="var(--ac)" stop-opacity="0"/></linearGradient></defs><path d="${pts} L${w},${h} L0,${h} Z" fill="url(#g24)"/><path d="${pts}" fill="none" stroke="var(--ac)" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>`;
+ const hrs=[0,6,12,18].map(i=>{const b=v[Math.min(i,v.length-1)];return new Date(b[0]*1000).toLocaleTimeString("sv",{hour:"2-digit",minute:"2-digit"})}).join(" · ");
+ $("ch24s").textContent="مجموع ۲۴ ساعت: "+hb(v.reduce((a,x)=>a+x[1],0))+" · بیشترین ساعت: "+hb(mx)+" · "+hrs}
 async function tst(n,b){b.disabled=true;try{const r=await api("test/"+n,"POST",{});toast(r.udp?"UDP قابل تست نیست":r.ms==null?"مقصد پاسخ نمی‌دهد":"اتصال موفق · "+r.ms+" ms",r.udp?"":r.ms==null?"e":"s")}catch(e){toast(e.message,"e")}b.disabled=false}
 async function del(n){if(!cf("این تانل حذف شود؟"))return;try{await api("rules/"+n,"DELETE");toast("حذف شد","s");load()}catch(e){toast(e.message,"e")}}
 $("add").onclick=()=>$("m").classList.add("on");$("f_x").onclick=()=>$("m").classList.remove("on");
@@ -1685,10 +2111,22 @@ $("t_run").onclick=async()=>{const b=$("t_run");b.disabled=true;$("t_res").inner
   const row=(n,x)=>!x?"":`<tr><td>${n}</td><td>${x.ok?'<span class="pill up">پاسخ می‌دهد</span>':'<span class="pill down">بی‌پاسخ</span>'}</td><td class="ltr">${x.ok?x.avg+" ms":"—"}</td><td class="ltr">${x.ok?x.min+" / "+x.max:"—"}</td><td class="ltr">${x.ok?x.jitter+" ms":"—"}</td><td class="ltr">${x.loss}%</td></tr>`;
   const v=TV[r.verdict];
   $("t_res").innerHTML=`<div style="overflow-x:auto"><table><thead><tr><th>مسیر (پورت ${r.port})</th><th>وضعیت</th><th>میانگین</th><th>کمترین / بیشترین</th><th>نوسان</th><th>ازدست‌رفتن</th></tr></thead><tbody>${row("مستقیم (بدون رمزنگاری)",r.direct)}${row("WireGuard (رمزنگاری‌شده)",r.tunnel&&r.tunnel.tcp)}</tbody></table></div><div class="hl" style="margin-top:12px"><b class="${v[1]}">${{ok:"✔",warn:"!",err:"✘"}[v[1]]}</b><div>${v[0]}</div></div>`}catch(e){$("t_res").innerHTML="";toast(e.message,"e")}b.disabled=false};
-async function logs(){try{const r=await api("logs");$("lg").innerHTML=r.length?r.map(l=>`<div class="${l.l}">${new Date(l.t*1000).toLocaleString("sv")} [${l.l}] ${esc(l.m)}</div>`).join(""):'<div class="empty">لاگی ثبت نشده</div>'}catch(e){}}
+let LGV="s";
+$("lgs").onclick=()=>{LGV="s";$("lgs").classList.add("on");$("lga").classList.remove("on");logs()};
+$("lga").onclick=()=>{LGV="a";$("lga").classList.add("on");$("lgs").classList.remove("on");logs()};
+async function logs(){if(LGV==="a"){try{const r=await api("audit");$("lg").innerHTML=r.a.length?r.a.map(l=>{const p=String(l).split("|");return `<div class="info">[${esc(p[0]||"")}] ${esc(p[2]||"")} · ${esc(p[3]||"")} · ${esc(p[1]||"")}</div>`}).join(""):'<div class="empty">لاگی ثبت نشده</div>'}catch(e){}return}
+ try{const r=await api("logs");$("lg").innerHTML=r.length?r.map(l=>`<div class="${l.l}">${new Date(l.t*1000).toLocaleString("sv")} [${l.l}] ${esc(l.m)}</div>`).join(""):'<div class="empty">لاگی ثبت نشده</div>'}catch(e){}}
 async function settings(){try{const s=await api("settings");$("g_c").value=s.tg_chat;$("g_a").value=s.tg_api;$("g_t").value="";$("g_t").placeholder=s.has_token?"•••••• (ذخیره شده — برای تغییر وارد کنید)":"123456:ABC…";
- $("d_h").textContent=s.domain?"فعال: https://"+s.domain+":"+s.port:(s.tls?"بدون دامنه: گواهی self-signed (مرورگر هشدار می‌دهد)":"HTTPS خاموش است");$("g_h").textContent="اگر سرور ایران به تلگرام دسترسی ندارد، آدرس یک پروکسی/ورکر سازگار با Bot API را در فیلد API بگذارید."}catch(e){}}
-$("g_s").onclick=async()=>{try{await api("settings/telegram","POST",{token:$("g_t").value,chat:$("g_c").value,api:$("g_a").value});toast("ذخیره شد","s");settings()}catch(e){toast(e.message,"e")}};
+ $("g_rh").value=s.rhour;$("g_bh").value=s.bhour;$("g_b").checked=!!s.bot;$("g_rep").checked=s.report!==false;$("g_bk").checked=s.backup!==false;
+ $("d_h").textContent=s.domain?"فعال: https://"+s.domain+":"+s.port:(s.tls?"بدون دامنه: گواهی self-signed (مرورگر هشدار می‌دهد)":"HTTPS خاموش است");$("g_h").textContent="اگر سرور ایران به تلگرام دسترسی ندارد، آدرس یک پروکسی/ورکر سازگار با Bot API را در فیلد API بگذارید.";tfUI(s)}catch(e){}}
+function tfUI(s){const on=!!s.totp;$("tf_h").innerHTML=on?"✅ فعال است — ورود به پنل علاوه بر رمز، به کد اپ Authenticator یا یکی از کدهای بازیابی نیاز دارد.":"خاموش است. با فعال‌کردن، ورود به پنل علاوه بر رمز به کد ۶ رقمی اپ Authenticator نیاز دارد و ۸ کد بازیابی یک‌بارمصرف می‌گیری.";
+ $("tf_setup").style.display="none";$("tf_rc").style.display="none";$("tf_acts").innerHTML=on?'<button class="btn d" id="tf_off">غیرفعال‌سازی</button>':'<button class="btn p" id="tf_st">فعال‌سازی</button>';
+ $("tf_acts").onclick=async e=>{const b=e.target.closest("button");if(!b)return;
+  if(b.id==="tf_st"){try{const r=await api("totp","POST",{action:"setup"});$("tf_s").value=r.secret+"\n"+r.uri;$("tf_setup").style.display="block";$("tf_c").focus()}catch(x){toast(x.message,"e")}}
+  if(b.id==="tf_off"){const p=prompt(TX("رمز را وارد کنید"));if(p==null)return;try{await api("totp","POST",{action:"disable",password:p});toast("2FA خاموش شد","s");load();settings()}catch(x){toast(x.message,"e")}}};
+ $("tf_on").onclick=async()=>{try{const r=await api("totp","POST",{action:"enable",code:$("tf_c").value.trim()});$("tf_setup").style.display="none";
+  $("tf_rc").innerHTML="<b>کدهای بازیابی (فقط همین یک‌بار نشان داده می‌شوند — جایی ذخیره کن):</b><br>"+r.codes.map(esc).join(" · ");$("tf_rc").style.display="block";toast("2FA فعال شد","s");load()}catch(x){toast(x.message,"e")}};}
+$("g_s").onclick=async()=>{try{await api("settings/telegram","POST",{token:$("g_t").value,chat:$("g_c").value,api:$("g_a").value,bot:$("g_b").checked,report:$("g_rep").checked,backup:$("g_bk").checked,report_hour:+$("g_rh").value||0,backup_hour:+$("g_bh").value||0});toast("ذخیره شد","s");settings()}catch(e){toast(e.message,"e")}};
 $("g_x").onclick=async()=>{try{await api("settings/tgtest","POST",{});toast("پیام تست ارسال شد","s")}catch(e){toast("ارسال ناموفق: "+e.message,"e")}};
 $("w_s").onclick=async()=>{try{await api("settings/password","POST",{old:$("w_o").value,new:$("w_n").value});$("w_o").value=$("w_n").value="";toast("رمز تغییر کرد","s")}catch(e){toast(e.message,"e")}};
 $("k_d").onclick=async()=>{try{const r=await fetch("/api/backup");if(!r.ok)throw new Error("خطا");const a=document.createElement("a");a.href=URL.createObjectURL(await r.blob());a.download="dr-cpanel-backup.tar.gz";a.click()}catch(e){toast(e.message,"e")}};
@@ -1696,10 +2134,19 @@ $("k_r").onclick=()=>$("k_f").click();
 $("k_f").onchange=async e=>{const f=e.target.files[0];if(!f)return;if(!cf("لیست تانل‌ها با محتوای این بکاپ جایگزین شود؟"))return;
  const buf=new Uint8Array(await f.arrayBuffer());let s="";for(let i=0;i<buf.length;i+=8192)s+=String.fromCharCode.apply(null,buf.subarray(i,i+8192));
  try{await api("restore","POST",{data:btoa(s)});toast("بازیابی شد","s");load()}catch(x){toast(x.message,"e")}e.target.value=""};
-async function login(){if(!$("pw").value){toast("رمز را وارد کنید","e");return}try{await api("login","POST",{password:$("pw").value});$("pw").value="";bootStart(1,1500);show(true)}catch(e){toast(e.message,"e")}}
+$("pf_b").onclick=async e=>{const b=e.target.closest("[data-pf]");if(!b)return;if(!cf("این پریست sysctl سرور را بازنویسی می‌کند. اعمال شود؟"))return;try{await api("perf","POST",{preset:b.dataset.pf});toast("اعمال شد: "+b.dataset.pf,"s");load()}catch(x){toast(x.message,"e")}};
+$("t_bw").onclick=async()=>{const b=$("t_bw");b.disabled=true;$("t_res").innerHTML='<div class="empty">در حال اندازه‌گیری… (حدود ۷ ثانیه)</div>';
+ try{const r=await api("tunnel/bw","POST",{ip:$("t_ti").value});
+  $("t_res").innerHTML=`<div style="overflow-x:auto"><table><thead><tr><th>پهنای باند تانل (${esc($("t_ti").value)})</th><th>نرخ</th><th>نوسان</th><th>ازدست‌رفتن</th><th>MTU</th></tr></thead><tbody><tr><td><span class="pill up">اندازه‌گیری شد</span></td><td class="ltr">${r.mbps} Mbps</td><td class="ltr">${r.jitter} ms</td><td class="ltr">${r.loss}%</td><td class="ltr">${r.mtu||"—"}</td></tr></tbody></table></div><div class="hint" style="margin-top:8px">UDP بدون سقف به‌مدت ۵ ثانیه از داخل تانل WireGuard. اگر خطا گرفتی، اسکریپت سمت سرور خارج را دوباره اجرا کن (سرویس iperf3 را نصب می‌کند).</div>`}catch(e){$("t_res").innerHTML="";toast(e.message,"e")}b.disabled=false};
+$("k_p").onclick=async()=>{try{const r=await fetch("/api/package");if(!r.ok)throw new Error("خطا");const a=document.createElement("a");a.href=URL.createObjectURL(await r.blob());a.download="dr-cpanel-offline.tar.gz";a.click();toast("پکیج آفلاین دانلود شد","s")}catch(e){toast(e.message,"e")}};
+let TF=false;
+async function login(){if($("tfa").classList.contains("hide")){if(!$("pw").value){toast("رمز را وارد کنید","e");return}}else if(!$("to").value){toast("کد را وارد کنید","e");return} try{const r=await api("login","POST",{password:$("pw").value,code:$("to").value});
+  if(r.totp){$("tfa").classList.remove("hide");$("to").focus();toast("کد دومرحله‌ای را وارد کنید","");return}
+  $("pw").value="";$("to").value="";$("tfa").classList.add("hide");bootStart(1,1500);show(true)}catch(e){toast(e.message,"e")}}
 $("login").addEventListener("click",e=>{if(!e.target.closest("button,a,input"))$("pw").focus()});
-document.addEventListener("keydown",e=>{if($("login").classList.contains("hide")||e.ctrlKey||e.metaKey||e.altKey||e.key.length!==1)return;const a=document.activeElement;if(a&&a.id==="pw")return;$("pw").focus()});
+document.addEventListener("keydown",e=>{if($("login").classList.contains("hide")||e.ctrlKey||e.metaKey||e.altKey||e.key.length!==1)return;const a=document.activeElement;if(a&&(a.id==="pw"||a.id==="to"))return;($("tfa").classList.contains("hide")?$("pw"):$("to")).focus()});
 $("lb").onclick=login;$("pw").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();login()}});
+$("to").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();login()}});
 $("eye").onclick=()=>{const p=$("pw");p.type=p.type==="password"?"text":"password";p.focus()};
 $("out").onclick=async()=>{await api("logout","POST",{}).catch(()=>{});show(false)};
 
@@ -1714,13 +2161,15 @@ function qdraw(){const r=QR,u=r.bytes,w=QW,p=w?Math.min(1,u/w):0,col=!w?"var(--m
  ${r.blocked?'<div class="qs er">حجم تمام شده و تانل قطع است. با بالا بردن سقف یا ریست مصرف، خودکار وصل می‌شود.</div>':""}
  <div class="pre">${[[0,"نامحدود"],[50*GB,"50 GB"],[100*GB,"100 GB"],[500*GB,"500 GB"],[TB,"1 TB"],[2*TB,"2 TB"]].map(([v,l])=>`<button class="btn${v===w?" on":""}" data-v="${v}">${l}</button>`).join("")}</div>
  <div class="row" style="margin-top:10px"><input id="q_n" type="number" min="0" step="any" placeholder="مقدار دلخواه"><select id="q_u"><option value="${GB}">GB</option><option value="${TB}">TB</option></select></div>
+ <div class="row" style="margin-top:10px"><div><label>ریست دوره‌ای مصرف</label><select id="q_p"><option value="">خاموش</option><option value="daily"${r.period==="daily"?" selected":""}>روزانه</option><option value="weekly"${r.period==="weekly"?" selected":""}>هفتگی</option><option value="monthly"${r.period==="monthly"?" selected":""}>ماهانه</option></select></div><div><label>تاریخ انقضا (اختیاری)</label><input id="q_e" type="date" value="${r.expires||""}"></div></div>
+ ${r.reset_at?`<div class="hint" style="margin-top:8px">ریست بعدی مصرف: ${new Date(r.reset_at*1000).toLocaleString("sv")}</div>`:""}
  <div class="pre" style="margin-top:10px"><span class="hint" style="align-self:center;margin:0">افزودن به سقف:</span>${[10*GB,100*GB,TB].map(a=>`<button class="btn" data-a="${a}">+ ${hb(a)}</button>`).join("")}</div>`;
  $("q_ok").disabled=w===(r.limit||0);$("q_r").disabled=!r.bytes}
 $("q_b").onclick=e=>{const b=e.target.closest("button");if(!b)return;if(b.dataset.v!==undefined)QW=+b.dataset.v;else if(b.dataset.a)QW=(QW||QR.bytes||0)+ +b.dataset.a;else return;qdraw()};
 $("q_b").oninput=e=>{if(e.target.id==="q_n"||e.target.id==="q_u"){const n=+$("q_n").value;if(n>0){QW=Math.round(n*+$("q_u").value);$("q_ok").disabled=QW===(QR.limit||0)}}};
 $("q_b").onchange=e=>{if(e.target.id==="q_n")qdraw()};
 $("q_x").onclick=()=>$("qm").classList.remove("on");
-$("q_ok").onclick=async()=>{try{await api("quota","POST",{lport:QR.lport,limit:QW});toast(QW?"سقف حجم ذخیره شد":"سقف حجم برداشته شد","s");$("qm").classList.remove("on");load()}catch(e){toast(e.message,"e")}};
+$("q_ok").onclick=async()=>{try{await api("quota","POST",{lport:QR.lport,limit:QW,period:$("q_p").value||null,expires:$("q_e").value||null});toast(QW?"سقف حجم ذخیره شد":"سقف حجم برداشته شد","s");$("qm").classList.remove("on");load()}catch(e){toast(e.message,"e")}};
 $("q_r").onclick=async()=>{if(!cf("مصرف این تانل صفر شود؟"))return;try{await api("quota","POST",{lport:QR.lport,reset:true});toast("مصرف صفر شد","s");$("qm").classList.remove("on");load()}catch(e){toast(e.message,"e")}};
 let CRS=[];
 function secopen(i,ip){CRS=ip?window.LAST.rules.filter(r=>r.ip===ip):[window.LAST.rules[i]];const s=CRS[0].sec||{};$("c_t").textContent="امنیت تانل — "+(ip?ip+" ("+CRS.length+" پورت)":CRS[0].name);$("c_a").value=(s.allow||"").split(",").filter(Boolean).join("\n");$("c_m").value=s.maxc||0;$("c_r").value=s.rate||0;$("c_w").style.display=s.allow?"block":"none";$("cm").classList.add("on")}
@@ -1958,32 +2407,91 @@ test_forwards() {
   done < "$CONF"
 }
 
-optimize() {
-  banner; echo "  ${C_BLD}Optimize (BBR + buffers)${C_RST}"; echo
+perf_apply() {   # name : write one sysctl file for the preset and apply it
+  local name=$1
+  case $name in balanced|turbo|throughput|gaming) ;; *) echo "error: unknown preset '$name'" >&2; return 1;; esac
   modprobe tcp_bbr 2>/dev/null || true
-  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-    warn "BBR is not available on this kernel (some VPS types block it). Buffers only."
-  fi
+  modprobe nf_conntrack 2>/dev/null || true
+  local bbr=""
+  grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && bbr=1
   {
-    grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && {
-      echo "net.core.default_qdisc=fq"
-      echo "net.ipv4.tcp_congestion_control=bbr"
-    }
-    echo "net.core.rmem_max=16777216"
-    echo "net.core.wmem_max=16777216"
-    echo "net.ipv4.tcp_rmem=4096 87380 16777216"
-    echo "net.ipv4.tcp_wmem=4096 65536 16777216"
-    [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]] && echo "net.netfilter.nf_conntrack_max=262144"
+    echo "# DR-CPanel performance preset: $name (applied $(date '+%F %T'))"
+    echo "net.ipv4.ip_forward=1"
+    [[ -n $bbr ]] && { echo "net.core.default_qdisc=fq"; echo "net.ipv4.tcp_congestion_control=bbr"; }
+    echo "net.ipv4.tcp_fastopen=3"
+    echo "net.ipv4.tcp_mtu_probing=1"
+    echo "net.netfilter.nf_conntrack_tcp_timeout_time_wait=30"
+    case $name in
+      balanced)
+        echo "net.core.rmem_max=16777216";      echo "net.core.wmem_max=16777216"
+        echo "net.ipv4.tcp_rmem=4096 87380 16777216"; echo "net.ipv4.tcp_wmem=4096 65536 16777216"
+        echo "net.netfilter.nf_conntrack_max=262144"
+        echo "net.netfilter.nf_conntrack_tcp_timeout_established=7200";;
+      turbo)
+        echo "net.core.rmem_max=33554432";      echo "net.core.wmem_max=33554432"
+        echo "net.core.netdev_max_backlog=16384"; echo "net.core.somaxconn=8192"
+        echo "net.ipv4.tcp_rmem=4096 87380 33554432"; echo "net.ipv4.tcp_wmem=4096 65536 33554432"
+        echo "net.ipv4.tcp_max_syn_backlog=8192"; echo "net.ipv4.tcp_notsent_lowat=131072"
+        echo "net.netfilter.nf_conntrack_max=524288"
+        echo "net.netfilter.nf_conntrack_tcp_timeout_established=7200";;
+      throughput)
+        echo "net.core.rmem_max=67108864";      echo "net.core.wmem_max=33554432"
+        echo "net.core.netdev_max_backlog=32768"; echo "net.core.somaxconn=16384"
+        echo "net.ipv4.tcp_rmem=4096 87380 67108864"; echo "net.ipv4.tcp_wmem=4096 65536 33554432"
+        echo "net.ipv4.tcp_max_syn_backlog=16384"; echo "net.ipv4.tcp_notsent_lowat=262144"
+        echo "net.ipv4.tcp_slow_start_after_idle=0"
+        echo "net.netfilter.nf_conntrack_max=1048576"
+        echo "net.netfilter.nf_conntrack_tcp_timeout_established=86400";;
+      gaming)
+        echo "net.core.rmem_max=8388608";       echo "net.core.wmem_max=8388608"
+        echo "net.ipv4.tcp_rmem=4096 87380 8388608";  echo "net.ipv4.tcp_wmem=4096 65536 8388608"
+        echo "net.ipv4.tcp_notsent_lowat=16384"
+        echo "net.ipv4.tcp_slow_start_after_idle=0"
+        echo "net.ipv4.tcp_fin_timeout=15"; echo "net.ipv4.tcp_keepalive_time=300"
+        echo "net.core.busy_poll=50"; echo "net.core.busy_read=50"
+        echo "net.netfilter.nf_conntrack_max=262144"
+        echo "net.netfilter.nf_conntrack_tcp_timeout_established=3600";;
+    esac
   } > "$SYSCTL_OPT"
   sysctl -q -p "$SYSCTL_OPT" >/dev/null 2>&1
-  ok "Applied and saved to $SYSCTL_OPT"
-  info "Congestion control now: $(sysctl -n net.ipv4.tcp_congestion_control)"
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  echo "$name" > "$PERF_STATE"
+}
+
+perf_current() {
+  local n=""; [[ -s $PERF_STATE ]] && n=$(<"$PERF_STATE")
+  [[ $n =~ ^(balanced|turbo|throughput|gaming)$ ]] || { [[ -s $SYSCTL_OPT ]] && n=custom || n=default; }
+  echo "$n"
+}
+
+perf_menu() {
+  banner; echo "  ${C_BLD}Performance presets${C_RST}"; echo
+  local cur ct=0 cm=0
+  cur=$(perf_current)
+  ct=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+  cm=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+  info "Active preset: ${C_BLD}${cur}${C_RST} · congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  info "Conntrack: $ct / $cm"
+  echo
+  echo "   1) Balanced    default: BBR + 16 MB buffers + conntrack 256k"
+  echo "   2) Turbo       BBR + 32 MB buffers + bigger backlogs + conntrack 512k"
+  echo "   3) Throughput  BBR + 64 MB buffers, max windows, conntrack 1M (many users / heavy traffic)"
+  echo "   4) Gaming      lowest latency: small buffers, busy-poll, short timeouts"
+  echo "   0) Back"; echo
+  local c; read -rp "  Select: " c
+  case $c in
+    1) perf_apply balanced && ok "Balanced preset applied.";;
+    2) perf_apply turbo && ok "Turbo preset applied.";;
+    3) perf_apply throughput && ok "Throughput preset applied.";;
+    4) perf_apply gaming && ok "Gaming preset applied.";;
+  esac
 }
 
 backup_restore() {
   banner; echo "  ${C_BLD}Backup & Restore${C_RST}"; echo
   echo "   1) Backup settings"
   echo "   2) Restore from file"
+  echo "   3) Build offline package  (for servers without GitHub access)"
   echo "   0) Back"; echo
   local c f; read -rp "  Select: " c
   case $c in
@@ -1993,7 +2501,41 @@ backup_restore() {
     2) read -rp "  Backup file path: " f
        [[ -f $f ]] || { err "File not found."; return; }
        tar xzf "$f" -C / "${CONF_DIR#/}" && apply_rules && ensure_boot && ok "Restored and applied.";;
+    3) pkg_make;;
   esac
+}
+
+pkg_make() {   # build a self-contained offline package with SHA256 checksums (for servers that cannot reach GitHub)
+  local self dir out
+  self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+  [[ -s $self ]] || { err "Cannot find this script."; return 1; }
+  dir=$(mktemp -d) || return 1
+  cp "$self" "$dir/dr-cpanel.sh"
+  cat > "$dir/install.sh" <<'OFEOF'
+#!/usr/bin/env bash
+# DR-CPanel offline installer — no internet needed
+set -e
+cd "$(dirname "$0")"
+[[ $EUID -eq 0 ]] || { echo "run as root (sudo)"; exit 1; }
+sha256sum -c SHA256SUMS >/dev/null 2>&1 || { echo "checksum FAILED — package is broken, do not use it"; exit 1; }
+echo "checksum OK"
+install -m 755 dr-cpanel.sh /usr/local/bin/dr-cpanel
+echo "installed. open the menu with:  dr-cpanel"
+exec /usr/local/bin/dr-cpanel
+OFEOF
+  ( cd "$dir" && sha256sum dr-cpanel.sh install.sh > SHA256SUMS )
+  out="/root/dr-cpanel-$VERSION-offline.tar.gz"
+  tar czf "$out" -C "$dir" . && rm -rf "$dir" || { rm -rf "$dir"; err "Could not create the package."; return 1; }
+  ok "Offline package: $out"
+  info "Move it to the server (scp/USB), extract, then: bash install.sh"
+  sha256sum "$out"
+}
+
+do_rollback() {   # restore the version saved by the last update
+  [[ -f $BIN.bak ]] || { err "No previous version saved (a .bak copy is kept on every update)."; return 1; }
+  install -m 755 "$BIN.bak" "$BIN"
+  command -v systemctl >/dev/null 2>&1 && { systemctl restart dr-cpanel-web 2>/dev/null; systemctl restart dr-cpanel 2>/dev/null; }
+  ok "Rolled back to the previous version: $(grep -m1 'VERSION="' "$BIN" | sed 's/.*VERSION="\([^"]*\)".*/\1/')"
 }
 
 import_legacy() {
@@ -2098,8 +2640,8 @@ main_menu() {
     echo "   2) List forwards         with live traffic counters"
     echo "   3) Remove forward"
     echo "   4) Connection test       TCP connect time and ping"
-    echo "   5) Optimize              BBR and buffers"
-    echo "   6) Backup & Restore"
+    echo "   5) Performance presets   Balanced / Turbo / Throughput / Gaming"
+    echo "   6) Backup & Restore      + offline package"
     echo "   7) Import manual rules   adopt hand-made iptables rules"
     echo "   8) Status"
     echo "   9) Web panel             install and manage the web UI"
@@ -2115,7 +2657,7 @@ main_menu() {
       2) banner; list_rules; pause;;
       3) remove_forward; pause;;
       4) test_forwards; pause;;
-      5) optimize; pause;;
+      5) perf_menu; pause;;
       6) backup_restore; pause;;
       7) import_legacy; pause;;
       8) status; pause;;
@@ -2136,8 +2678,12 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     apply) apply_rules;;
     list)  list_rules;;
     tunnel) shift; tunnel_cli "$@";;
+    perf)  shift; perf_apply "${1:-}";;
+    audit) tail -n "${2:-60}" "$AUDF" 2>/dev/null || info "Audit log is empty.";;
+    package) pkg_make;;
+    rollback) do_rollback;;
     update) bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh);;
     "")    main_menu;;
-    *)     echo "Usage: $0 [apply|list|update|tunnel]"; exit 1;;
+    *)     echo "Usage: $0 [apply|list|update|rollback|package|perf NAME|audit|tunnel]"; exit 1;;
   esac
 fi
