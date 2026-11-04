@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,8 +10,10 @@
 
 set -u
 
-VERSION="2.4.2"
+VERSION="2.7.0"
 CONF_DIR="/etc/dr-cpanel"
+SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
+TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active
 BLK="$CONF_DIR/blocked"             # ports cut off by their quota (written by the web panel)
 CONF="$CONF_DIR/rules.conf"          # lines: name|proto|listen_port|dest_ip|dest_port
 DEF_IP_FILE="$CONF_DIR/default_ip"
@@ -70,25 +72,287 @@ banner() {
 
 # ---------------------------------------------------------------- core ----
 
+valid_cidr() {   # IPv4 or IPv4/mask
+  local ip=${1%%/*} m=""
+  [[ $1 == */* ]] && m=${1#*/}
+  valid_ip "$ip" || return 1
+  [[ -z $m ]] || { [[ $m =~ ^[0-9]+$ ]] && (( m >= 0 && m <= 32 )); }
+}
+
+sec_get() {   # sets SEC_ALLOW SEC_MAXC SEC_RATE for a listen port
+  SEC_ALLOW=""; SEC_MAXC=0; SEC_RATE=0
+  [[ -s $SEC ]] || return 0
+  local l; l=$(awk -F'|' -v p="$1" '$1==p{print; exit}' "$SEC")
+  [[ -n $l ]] || return 0
+  IFS='|' read -r _ SEC_ALLOW SEC_MAXC SEC_RATE <<< "$l"
+  [[ ${SEC_MAXC:-} =~ ^[0-9]+$ ]] || SEC_MAXC=0
+  [[ ${SEC_RATE:-} =~ ^[0-9]+$ ]] || SEC_RATE=0
+}
+
+sec_set() {   # lport allow maxconn rate   (all empty/0 removes the entry)
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  [[ -f $SEC ]] && sed -i "/^$1|/d" "$SEC"
+  if [[ -n $2 || ${3:-0} -gt 0 || ${4:-0} -gt 0 ]]; then
+    echo "$1|$2|${3:-0}|${4:-0}" >> "$SEC"
+  fi
+}
+
+sec_cleanup() {   # remove per-tunnel allow-list chains (mangle)
+  local c
+  for c in $(iptables -t mangle -S 2>/dev/null | awk '/^-N DRC_A[0-9]/{print $2}'); do
+    iptables -t mangle -F "$c" 2>/dev/null; iptables -t mangle -X "$c" 2>/dev/null
+  done
+}
+
+sec_apply() {   # lport proto-list : build the security rules for one tunnel (mangle PREROUTING, before DNAT)
+  local lport=$1 plist=$2 a p burst
+  sec_get "$lport"
+  [[ -z $SEC_ALLOW && $SEC_MAXC -eq 0 && $SEC_RATE -eq 0 ]] && return 0
+  if [[ -n $SEC_ALLOW ]]; then
+    iptables -t mangle -N "DRC_A$lport" 2>/dev/null || iptables -t mangle -F "DRC_A$lport"
+    for a in ${SEC_ALLOW//,/ }; do iptables -t mangle -A "DRC_A$lport" -s "$a" -j RETURN; done
+    iptables -t mangle -A "DRC_A$lport" -j DROP
+  fi
+  for p in $plist; do
+    [[ -n $SEC_ALLOW ]] && iptables -t mangle -A DRC_SEC -p "$p" --dport "$lport" -j "DRC_A$lport"
+    if (( SEC_MAXC > 0 )); then
+      iptables -t mangle -A DRC_SEC -p "$p" --dport "$lport" -m conntrack --ctstate NEW \
+        -m connlimit --connlimit-above "$SEC_MAXC" --connlimit-mask 32 --connlimit-saddr -j DROP
+    fi
+    if (( SEC_RATE > 0 )); then
+      burst=$SEC_RATE; (( burst < 10 )) && burst=10
+      iptables -t mangle -A DRC_SEC -p "$p" --dport "$lport" -m conntrack --ctstate NEW \
+        -m hashlimit --hashlimit-name "d${lport}${p:0:1}" --hashlimit-mode srcip \
+        --hashlimit-above "${SEC_RATE}/min" --hashlimit-burst "$burst" -j DROP
+    fi
+  done
+}
+
+
+# ------------------------------------------- encrypted transport (WireGuard)
+# Every foreign server gets its own WireGuard link: 10.66.<id>.1 (this server) <-> 10.66.<id>.2 (foreign).
+# rules.conf keeps the real foreign IP. Once a link is switched on ("active"), apply_rules DNATs to the link
+# address instead, so counters, quotas, health checks and the security rules keep working unchanged.
+
+tun_row()    { [[ -s $TUN ]] && awk -F'|' -v ip="$1" '$2==ip{print;exit}' "$TUN"; }
+tun_target() { local r; r=$(tun_row "$1"); if [[ -n $r && ${r##*|} == 1 ]]; then echo "10.66.${r%%|*}.2"; else echo "$1"; fi; }
+
+tun_need_wg() {
+  if ! command -v wg-quick >/dev/null 2>&1; then
+    echo "Installing WireGuard..." >&2
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard >/dev/null 2>&1 || {
+        apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard >/dev/null 2>&1; }
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y wireguard-tools >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then yum install -y epel-release wireguard-tools >/dev/null 2>&1
+    fi
+  fi
+  command -v wg-quick >/dev/null 2>&1 || { echo "error: could not install WireGuard" >&2; return 1; }
+  modprobe wireguard >/dev/null 2>&1
+  if ip link add drwgchk type wireguard >/dev/null 2>&1; then ip link del drwgchk >/dev/null 2>&1
+  else echo "error: this kernel has no WireGuard support" >&2; return 1; fi
+}
+
+tun_write_conf() {   # id
+  local r id fip port mtu ipriv fpub
+  r=$(awk -F'|' -v i="$1" '$1==i{print;exit}' "$TUN")
+  IFS='|' read -r id fip port mtu ipriv _ _ fpub _ <<< "$r"
+  mkdir -p /etc/wireguard
+  ( umask 077; cat > "/etc/wireguard/drwg$id.conf" <<EOF
+[Interface]
+Address = 10.66.$id.1/30
+PrivateKey = $ipriv
+MTU = $mtu
+Table = off
+
+[Peer]
+PublicKey = $fpub
+Endpoint = $fip:$port
+AllowedIPs = 10.66.$id.2/32
+PersistentKeepalive = 25
+EOF
+  )
+}
+
+tun_up() {   # id
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable "wg-quick@drwg$1" >/dev/null 2>&1
+    systemctl restart "wg-quick@drwg$1" >/dev/null 2>&1
+  else
+    wg-quick down "drwg$1" >/dev/null 2>&1; wg-quick up "drwg$1" >/dev/null 2>&1
+  fi
+}
+
+tun_down() {   # id
+  if command -v systemctl >/dev/null 2>&1; then systemctl disable --now "wg-quick@drwg$1" >/dev/null 2>&1
+  else wg-quick down "drwg$1" >/dev/null 2>&1; fi
+  ip link del "drwg$1" >/dev/null 2>&1
+  rm -f "/etc/wireguard/drwg$1.conf"
+}
+
+tun_add() {   # foreign_ip [udp_port] [mtu]
+  local fip=$1 port=${2:-51820} mtu=${3:-1380} id=1 ipriv fpriv
+  valid_ip "$fip" || { echo "error: invalid IP" >&2; return 1; }
+  [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { echo "error: invalid UDP port" >&2; return 1; }
+  [[ $mtu =~ ^[0-9]+$ ]] && (( mtu >= 1200 && mtu <= 1500 )) || { echo "error: invalid MTU" >&2; return 1; }
+  [[ -n $(tun_row "$fip") ]] && { echo "error: a tunnel to $fip already exists" >&2; return 1; }
+  tun_need_wg || return 1
+  while [[ -s $TUN ]] && cut -d'|' -f1 "$TUN" | grep -qx "$id"; do id=$((id + 1)); done
+  (( id <= 200 )) || { echo "error: too many tunnels" >&2; return 1; }
+  ipriv=$(wg genkey); fpriv=$(wg genkey)
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  ( umask 077; echo "$id|$fip|$port|$mtu|$ipriv|$fpriv|$(wg pubkey <<< "$ipriv")|$(wg pubkey <<< "$fpriv")|0" >> "$TUN" )
+  tun_write_conf "$id"
+  if ! tun_up "$id"; then
+    tun_down "$id"; sed -i "/^$id|/d" "$TUN"
+    echo "error: could not start the WireGuard interface" >&2; return 1
+  fi
+  apply_rules
+}
+
+tun_del() {   # foreign_ip
+  local r; r=$(tun_row "$1")
+  [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  tun_down "${r%%|*}"
+  sed -i "/^${r%%|*}|/d" "$TUN"
+  apply_rules
+}
+
+tun_active() {   # foreign_ip 0|1   (1 = send the forwards through the tunnel)
+  local r id; r=$(tun_row "$1")
+  [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  id=${r%%|*}
+  if [[ $2 == 1 ]]; then
+    local hs; hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
+    [[ ${hs:-0} -gt 0 ]] || { echo "error: no handshake yet. Run the setup script on the foreign server first" >&2; return 1; }
+    ping -c 2 -W 2 "10.66.$id.2" >/dev/null 2>&1 || { echo "error: the foreign end does not answer inside the tunnel" >&2; return 1; }
+  fi
+  awk -F'|' -v OFS='|' -v ip="$1" -v v="$2" '$2==ip{$9=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+  apply_rules
+}
+
+tun_sync() {   # rebuild interfaces from tunnels.conf (after a restore)
+  local id
+  [[ -s $TUN ]] || return 0
+  tun_need_wg || return 1
+  for id in $(cut -d'|' -f1 "$TUN"); do tun_write_conf "$id"; tun_up "$id"; done
+  apply_rules
+}
+
+tun_script() {   # foreign_ip : the script to run on the foreign server
+  local r id port mtu fpriv ipub
+  r=$(tun_row "$1"); [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  IFS='|' read -r id _ port mtu _ fpriv ipub _ <<< "$r"
+  cat <<EOS
+# DR-CPanel: foreign-server side of the encrypted tunnel. Run once, as root.
+set -e
+[ "\$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+if ! command -v wg-quick >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y wireguard-tools
+  elif command -v yum >/dev/null 2>&1; then yum install -y epel-release wireguard-tools
+  else echo "install WireGuard first"; exit 1; fi
+fi
+mkdir -p /etc/wireguard
+( umask 077; cat > /etc/wireguard/drwg$id.conf <<'WGEOF'
+[Interface]
+Address = 10.66.$id.2/30
+ListenPort = $port
+PrivateKey = $fpriv
+MTU = $mtu
+PostUp = iptables -I INPUT -p udp --dport $port -j ACCEPT || true; iptables -I INPUT -i drwg$id -j ACCEPT || true
+PostDown = iptables -D INPUT -p udp --dport $port -j ACCEPT || true; iptables -D INPUT -i drwg$id -j ACCEPT || true
+
+[Peer]
+PublicKey = $ipub
+AllowedIPs = 10.66.$id.1/32
+WGEOF
+)
+systemctl enable wg-quick@drwg$id >/dev/null 2>&1 || true
+systemctl restart wg-quick@drwg$id 2>/dev/null || { wg-quick down drwg$id 2>/dev/null; wg-quick up drwg$id; }
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow $port/udp; ufw allow in on drwg$id; fi
+echo "Done. Tunnel address on this server: 10.66.$id.2"
+EOS
+}
+
+tunnel_cli() {
+  case "${1:-}" in
+    add)    shift; tun_add "$@";;
+    del)    tun_del "${2:-}";;
+    script) tun_script "${2:-}";;
+    use)    tun_active "${2:-}" 1;;
+    direct) tun_active "${2:-}" 0;;
+    sync)   tun_sync;;
+    *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] | del IP | script IP | use IP | direct IP | sync"; return 1;;
+  esac
+}
+
+tun_pick() {   # sets TFIP
+  local n; TFIP=""
+  [[ -s $TUN ]] || { err "No tunnels yet."; return 1; }
+  read -rp "  Tunnel number: " n
+  [[ $n =~ ^[0-9]+$ ]] && TFIP=$(sed -n "${n}p" "$TUN" | cut -d'|' -f2)
+  [[ -n $TFIP ]] || { err "Invalid number."; return 1; }
+}
+
+tunnel_menu() {
+  banner; echo "  ${C_BLD}Encrypted transport (WireGuard)${C_RST}"; echo
+  info "Encrypts the Iran <-> foreign link in the kernel (ChaCha20). One command runs on the foreign server."; echo
+  local i=0 id fip port a hs c r
+  if [[ -s $TUN ]]; then
+    printf "  ${C_BLD}%-3s %-17s %-6s %-13s %s${C_RST}\n" "#" "FOREIGN IP" UDP LINK "FORWARDS VIA"
+    while IFS='|' read -r id fip port _ _ _ _ _ a; do
+      [[ -z $id ]] && continue; i=$((i + 1))
+      hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
+      printf "  %-3s %-17s %-6s %-13s %s\n" "$i" "$fip" "$port" "$([[ ${hs:-0} -gt 0 ]] && echo linked || echo no-handshake)" "$([[ $a == 1 ]] && echo tunnel || echo direct)"
+    done < "$TUN"; echo
+  fi
+  echo "   1) Create tunnel to a foreign server"
+  echo "   2) Show the setup script for the foreign server"
+  echo "   3) Switch forwards to the tunnel   (after the foreign side is set up)"
+  echo "   4) Switch forwards back to direct"
+  echo "   5) Remove tunnel"
+  echo "   0) Back"; echo
+  read -rp "  Select: " c
+  case $c in
+    1) read -rp "  Foreign server IP: " fip; read -rp "  UDP port [51820]: " port
+       if tun_add "$fip" "${port:-51820}"; then ok "Tunnel created. Run this on the foreign server as root:"; echo; tun_script "$fip"
+       else err "Failed."; fi;;
+    2) tun_pick && tun_script "$TFIP";;
+    3) tun_pick && { if tun_active "$TFIP" 1; then ok "Forwards to $TFIP now use the tunnel."; else err "Not switched."; fi; };;
+    4) tun_pick && { tun_active "$TFIP" 0 && ok "Forwards to $TFIP are direct again."; };;
+    5) tun_pick && confirm "Remove the tunnel to $TFIP? Its forwards go back to direct." && tun_del "$TFIP" && ok "Removed.";;
+  esac
+}
+
 apply_rules() {
   sysctl -q -w net.ipv4.ip_forward=1 >/dev/null 2>&1
   local spec t chain parent
-  for spec in "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD"; do
+  for spec in "mangle PREROUTING DRC_SEC" "mangle FORWARD DRC_MSS" "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD"; do
     set -- $spec; t=$1; parent=$2; chain=$3
     iptables -t "$t" -N "$chain" 2>/dev/null || true
     iptables -t "$t" -F "$chain"
     iptables -t "$t" -C "$parent" -j "$chain" 2>/dev/null || iptables -t "$t" -I "$parent" 1 -j "$chain"
   done
+  sec_cleanup
+  local tid
+  if [[ -s $TUN ]]; then   # keep TCP packets small enough for the tunnel MTU
+    while IFS='|' read -r tid _; do
+      [[ -n $tid ]] && iptables -t mangle -A DRC_MSS -o "drwg$tid" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    done < "$TUN"
+  fi
   [[ -s $CONF ]] || return 0
-  local name proto lport ip dport p act
+  local name proto lport ip dport p act tip
   while IFS='|' read -r name proto lport ip dport; do
     [[ -z $name ]] && continue
+    tip=$(tun_target "$ip")
     act=ACCEPT; [[ -s $BLK ]] && grep -qx "$lport" "$BLK" && act=DROP
+    sec_apply "$lport" "$(proto_list "$proto")"
     for p in $(proto_list "$proto"); do
-      iptables -t nat    -A DRC_PRE  -p "$p" --dport "$lport" -j DNAT --to-destination "$ip:$dport"
-      iptables -t nat    -A DRC_POST -p "$p" -d "$ip" --dport "$dport" -j MASQUERADE
-      iptables -t filter -A DRC_FWD  -p "$p" -d "$ip" --dport "$dport" -m comment --comment "drc:$lport" -j "$act"
-      iptables -t filter -A DRC_FWD  -p "$p" -s "$ip" --sport "$dport" -m comment --comment "drc:$lport" -j "$act"
+      iptables -t nat    -A DRC_PRE  -p "$p" --dport "$lport" -j DNAT --to-destination "$tip:$dport"
+      iptables -t nat    -A DRC_POST -p "$p" -d "$tip" --dport "$dport" -j MASQUERADE
+      iptables -t filter -A DRC_FWD  -p "$p" -d "$tip" --dport "$dport" -m comment --comment "drc:$lport" -j "$act"
+      iptables -t filter -A DRC_FWD  -p "$p" -s "$tip" --sport "$dport" -m comment --comment "drc:$lport" -j "$act"
     done
   done < "$CONF"
 }
@@ -186,7 +450,7 @@ from http.cookies import SimpleCookie
 
 D = "/etc/dr-cpanel"; CONF = D + "/rules.conf"; WEB = D + "/web.json"; DEF = D + "/default_ip"
 BIN = "/usr/local/bin/dr-cpanel"; UI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-CERT = D + "/web.crt"; KEY = D + "/web.key"; LOGF = "/var/log/dr-cpanel.log"
+CERT = D + "/web.crt"; KEY = D + "/web.key"; LOGF = "/var/log/dr-cpanel.log"; SECF = D + "/security.conf"
 LOCK = threading.Lock(); CLOCK = threading.Lock(); SESS = {}; FAILS = {}
 LOGS = collections.deque(maxlen=300); HEALTH = {}; SYS = {}
 
@@ -248,6 +512,113 @@ def write_rules(rs):
     subprocess.run([BIN, "apply"], timeout=20)
     quota_rebase()
 
+def sec_read():
+    out = {}
+    try:
+        for l in open(SECF):
+            p = l.rstrip("\n").split("|")
+            if len(p) >= 4: out[p[0]] = dict(allow=p[1], maxc=int(p[2] or 0), rate=int(p[3] or 0))
+    except (FileNotFoundError, ValueError): pass
+    return out
+
+def sec_file(cur):
+    os.makedirs(D, exist_ok=True)
+    with open(SECF + ".tmp", "w") as f:
+        for k, v in cur.items(): f.write("%s|%s|%d|%d\n" % (k, v["allow"], v["maxc"], v["rate"]))
+    os.replace(SECF + ".tmp", SECF)
+
+def sec_save(lport, d, run=True):
+    raw = d.get("allow") or []
+    if isinstance(raw, str): raw = re.split(r"[\s,]+", raw)
+    raw = [x.strip() for x in raw if x and x.strip()]
+    if len(raw) > 200: raise ValueError("Too many IPs")
+    nets = []
+    for x in raw:
+        try: n = ipaddress.ip_network(x, strict=False)
+        except Exception: raise ValueError("Invalid IP or network")
+        if n.version != 4: raise ValueError("Invalid IP or network")
+        nets.append(x if "/" in x else str(n.network_address))
+    try: maxc = int(d.get("maxc") or 0); rate = int(d.get("rate") or 0)
+    except Exception: raise ValueError("Numbers out of range")
+    if not (0 <= maxc <= 1000000 and 0 <= rate <= 100000000): raise ValueError("Numbers out of range")
+    cur = sec_read(); k = str(lport)
+    if nets or maxc > 0 or rate > 0: cur[k] = dict(allow=",".join(nets), maxc=maxc, rate=rate)
+    else: cur.pop(k, None)
+    sec_file(cur)
+    if run: subprocess.run([BIN, "apply"], timeout=20)
+
+TUNF = D + "/tunnels.conf"
+
+def tunnels():
+    out = {}
+    try:
+        for l in open(TUNF):
+            p = l.rstrip("\n").split("|")
+            if len(p) >= 9: out[p[1]] = dict(id=int(p[0]), ip=p[1], port=int(p[2]), mtu=int(p[3]), active=p[8] == "1")
+    except (FileNotFoundError, ValueError): pass
+    return out
+
+def peer(t): return "10.66.%d.2" % t["id"]
+
+def eff_ip(ip):   # where traffic for this foreign IP really goes (the tunnel address when the tunnel is switched on)
+    t = tunnels().get(ip)
+    return peer(t) if t and t["active"] else ip
+
+def tunnel_info():
+    now = time.time(); out = []
+    for t in tunnels().values():
+        d = dict(t, up=False, age=None, rx=0, tx=0, peer=peer(t))
+        try:
+            ln = subprocess.run(["wg", "show", "drwg%d" % t["id"], "dump"], capture_output=True, text=True, timeout=5).stdout.splitlines()
+            if len(ln) > 1:
+                f = ln[1].split("\t"); hs = int(f[4]); d.update(rx=int(f[5]), tx=int(f[6]))
+                if hs: d.update(age=int(now - hs), up=now - hs < 240)
+        except Exception: pass
+        out.append(d)
+    return out
+
+def tun_cmd(*a, t=180):
+    try: r = subprocess.run([BIN, "tunnel", *a], capture_output=True, text=True, timeout=t)
+    except Exception: raise ValueError("Command failed")
+    if r.returncode:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        raise ValueError(re.sub(r"^error: ", "", msg[-1])[:200] if msg else "Command failed")
+    return r.stdout
+
+def summarize(v):
+    ok = [x for x in v if x is not None]; n = len(v)
+    if not ok: return dict(ok=False, loss=100)
+    j = sum(abs(a - b) for a, b in zip(ok, ok[1:])) / (len(ok) - 1) if len(ok) > 1 else 0
+    return dict(ok=True, min=round(min(ok)), avg=round(sum(ok) / len(ok)), max=round(max(ok)), jitter=round(j, 1), loss=round(100 * (n - len(ok)) / n))
+
+def tcp_series(ip, port, n=8):
+    v = []
+    for _ in range(n):
+        s = time.time()
+        try: socket.create_connection((ip, port), 2).close(); v.append((time.time() - s) * 1000)
+        except Exception: v.append(None)
+        time.sleep(0.1)
+    return summarize(v)
+
+def transport_test(ip, port):
+    # Compares the plain forward with the encrypted tunnel: TCP connect time, jitter and loss to the same foreign port.
+    ports = [r["dport"] for r in read_rules() if r["ip"] == ip and r["proto"] != "udp"]
+    port = port or (ports[0] if ports else 443)
+    t = tunnels().get(ip); res = dict(ip=ip, port=port, direct=None, tunnel=None, verdict="no_tunnel")
+    with ThreadPoolExecutor(2) as ex:
+        fd = ex.submit(tcp_series, ip, port)
+        ft = ex.submit(tcp_series, peer(t), port) if t else None
+        res["direct"] = fd.result()
+        if t: res["tunnel"] = dict(tcp=ft.result())
+    if t:
+        up = next((x["up"] for x in tunnel_info() if x["ip"] == ip), False); w = res["tunnel"]["tcp"]; d = res["direct"]
+        if not w["ok"]: res["verdict"] = "wg_nosvc" if up else "wg_down"
+        elif not d["ok"]: res["verdict"] = "wg"
+        else:
+            sd = d["avg"] + 15 * d["loss"]; sw = w["avg"] + 15 * w["loss"]
+            res["verdict"] = "wg" if sw <= sd * 1.3 + 10 else "direct"
+    return res
+
 def counters():
     c = {}
     try: out = subprocess.run(["iptables", "-t", "nat", "-nvxL", "DRC_PRE"], capture_output=True, text=True, timeout=5).stdout
@@ -281,7 +652,16 @@ def validate(d):
     return dict(name=name or "fw%d" % lport, proto=proto, lport=lport, ip=ip, dport=dport)
 
 def split_ports(v):
-    return [x for x in re.split(r"[,\s\u060c;]+", str(v or "")) if x]
+    out = []
+    for x in re.split(r"[,\s\u060c;]+", str(v or "")):
+        if not x: continue
+        m = re.fullmatch(r"(\d+)-(\d+)", x)
+        if m:   # range such as 2000-2010
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > b or b - a >= 50: raise ValueError("Invalid port range (max 50 ports)")
+            out += [str(p) for p in range(a, b + 1)]
+        else: out.append(x)
+    return out
 
 def validate_many(d):
     # "lport" may hold several ports ("8899,2044"). All-or-nothing: if one is invalid, nothing is added.
@@ -327,7 +707,7 @@ def sampler():
 
 # ------------------------------------------------------ monitor / watchdog
 def probe(r):
-    return r, tcp_ms(r["ip"], r["dport"])
+    return r, tcp_ms(eff_ip(r["ip"]), r["dport"])
 
 def monitor():
     time.sleep(5)
@@ -373,7 +753,7 @@ def watchdog():
 
 # ------------------------------------------------------------ views / ops
 def state():
-    c = counters(); rs = []; qd = jload(QUOTA); sb = jload(SUBF); bk = blocked()
+    c = counters(); rs = []; qd = jload(QUOTA); sb = jload(SUBF); bk = blocked(); sec = sec_read(); tun = tunnels()
     for r in read_rules():
         pk = by = 0
         for p in (["tcp", "udp"] if r["proto"] == "both" else [r["proto"]]):
@@ -381,7 +761,7 @@ def state():
         h = HEALTH.get("%d/%s" % (r["lport"], r["proto"]))
         st = "unknown" if not h or h["ok"] is None else ("up" if h["ok"] else "down")
         e = qd.get(str(r["lport"]), {}); by = int(e.get("used", by))
-        rs.append(dict(r, packets=pk, bytes=by, limit=int(e.get("limit", 0)), blocked=str(r["lport"]) in bk, sub=str(r["lport"]) in sb, status=st, ms=h["ms"] if h else None,
+        rs.append(dict(r, packets=pk, bytes=by, limit=int(e.get("limit", 0)), blocked=str(r["lport"]) in bk, sub=str(r["lport"]) in sb, sec=sec.get(str(r["lport"]), {}), enc=bool(tun.get(r["ip"], {}).get("active")), status=st, ms=h["ms"] if h else None,
                        hist=list(h["hist"]) if h else [], since=h["since"] if h else None))
     return {"rules": rs, "host": socket.gethostname(), "sys": dict(SYS), "ip_forward": sysval("net.ipv4.ip_forward") == "1",
             "cc": sysval("net.ipv4.tcp_congestion_control"), "now": time.time(), "ver": "__DR_VERSION__"}
@@ -407,6 +787,8 @@ def health_check():
     except Exception: pass
     add("ok" if sysval("net.ipv4.tcp_congestion_control") == "bbr" else "warn", "TCP congestion control: " + sysval("net.ipv4.tcp_congestion_control"), "Menu 5 (Optimize) enables BBR")
     if SYS.get("disk_total") and SYS["disk_used"] / SYS["disk_total"] > 0.9: add("warn", "Disk is over 90% full")
+    for t in tunnel_info():
+        add("ok" if t["up"] else "warn", "WireGuard tunnel to %s: %s" % (t["ip"], "linked" if t["up"] else "no handshake"), "Run the setup script on the foreign server, or check that UDP %d is open" % t["port"])
     for r in read_rules():
         h = HEALTH.get("%d/%s" % (r["lport"], r["proto"]))
         if r["proto"] == "udp": add("ok", "%s: UDP cannot be probed" % r["name"])
@@ -418,7 +800,7 @@ def health_check():
 def make_backup():
     b = io.BytesIO()
     with tarfile.open(fileobj=b, mode="w:gz") as t:
-        for n in ("rules.conf", "default_ip", "quota.json", "sub.json", "web.json", "web.crt", "web.key"):
+        for n in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf", "web.json", "web.crt", "web.key"):
             if os.path.exists(D + "/" + n): t.add(D + "/" + n, arcname=n)
     return b.getvalue()
 
@@ -426,9 +808,10 @@ def restore(data):
     n = 0
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
         for m in t.getmembers():
-            if m.name in ("rules.conf", "default_ip", "quota.json", "sub.json") and m.isfile() and m.size < 1000000:
-                open(D + "/" + m.name, "wb").write(t.extractfile(m).read()); n += 1
+            if m.name in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf") and m.isfile() and m.size < 1000000:
+                open(D + "/" + m.name, "wb").write(t.extractfile(m).read()); os.chmod(D + "/" + m.name, 0o600); n += 1
     if not n: raise ValueError("No forwards found in this file")
+    subprocess.run([BIN, "tunnel", "sync"], timeout=120)
     subprocess.run([BIN, "apply"], timeout=20)
 
 # ------------------------------------------------- quota / sub link / domain
@@ -510,6 +893,8 @@ def quota_set(lport, limit=None, reset=False):
 
 def forget(lport):
     k = str(lport)
+    cur = sec_read()
+    if k in cur: cur.pop(k); sec_file(cur)
     with QLOCK:
         q = jload(QUOTA); q.pop(k, None); jsave(QUOTA, q)
         s = jload(SUBF); s.pop(k, None); jsave(SUBF, s)
@@ -520,19 +905,54 @@ def forget(lport):
 def sub_html(name, used, lim, left, pct, off):
     tone = "er" if off else ("wa" if lim and pct >= 90 else "ok")
     st = "حجم تمام شده — سرویس قطع است" if off else ("حجم رو به پایان است" if tone == "wa" else "سرویس فعال است")
-    page = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    page = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#07060f">
 <meta name="robots" content="noindex,nofollow"><meta http-equiv="refresh" content="60"><title>وضعیت حجم</title><style>
-:root{color-scheme:dark;--bg:#070707;--card:#111;--line:#ffffff18;--tx:#fafafa;--mu:#8e8e8e;--ok:#22c55e;--wa:#f59e0b;--er:#ef4444}
-@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#f2f2f2;--card:#fff;--line:#0000001a;--tx:#0a0a0a;--mu:#6b6b6b}}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--tx);font:15px/1.6 -apple-system,"Segoe UI",Tahoma,sans-serif;padding:16px}
-.c{width:100%;max-width:420px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:26px}.ok{--t:var(--ok)}.wa{--t:var(--wa)}.er{--t:var(--er)}
-h1{margin:0;font-size:18px}small{color:var(--mu)}.st{display:flex;gap:8px;align-items:center;margin:16px 0;font-size:14px}.st i{width:9px;height:9px;border-radius:50%;background:var(--t)}
-.bar{height:10px;border-radius:99px;background:var(--line);overflow:hidden;direction:ltr}.bar b{display:block;height:100%;background:var(--t)}
-.g{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px;text-align:center}.g div{border:1px solid var(--line);border-radius:12px;padding:12px 4px}
-.g span{display:block;color:var(--mu);font-size:12px;margin-bottom:4px}.g b{font-size:15px;direction:ltr;display:inline-block}footer{margin-top:16px;color:var(--mu);font-size:12px;text-align:center}
-</style></head><body data-t="dark"><main class="c @TONE@"><h1>@NAME@</h1><small>وضعیت مصرف حجم</small><div class="st"><i></i>@ST@</div>@BAR@
+:root{--bg:#07060f;--card:rgba(14,12,24,.82);--line:rgba(255,255,255,.09);--tx:#f6f5ff;--mu:#8d8aa5;--ok:#22c55e;--wa:#f59e0b;--er:#ef4444;--ac:#8b5cf6;--ac2:#6366f1}
+*{box-sizing:border-box}html,body{margin:0}
+body{min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--tx);font:15px/1.7 -apple-system,"Segoe UI",Vazirmatn,Tahoma,sans-serif;padding:18px;overflow-x:hidden}
+.aur{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.aur i{position:absolute;border-radius:50%;filter:blur(90px);opacity:.5}
+.a1{width:60vw;height:60vw;left:-18vw;top:-24vw;background:radial-gradient(circle,rgba(139,92,246,.55),transparent 66%);animation:f1 24s ease-in-out infinite alternate}
+.a2{width:48vw;height:48vw;right:-14vw;top:24vh;background:radial-gradient(circle,rgba(99,102,241,.5),transparent 66%);animation:f2 30s ease-in-out infinite alternate}
+.a3{width:40vw;height:40vw;left:22vw;bottom:-20vw;background:radial-gradient(circle,rgba(236,72,153,.38),transparent 66%);animation:f3 36s ease-in-out infinite alternate}
+@keyframes f1{to{transform:translate(9vw,6vh) scale(1.15)}}
+@keyframes f2{to{transform:translate(-8vw,-6vh) scale(1.18)}}
+@keyframes f3{to{transform:translate(-6vw,-8vh) scale(1.1)}}
+.stars{position:absolute;inset:0;opacity:.6;background-image:radial-gradient(1.2px 1.2px at 12% 22%,#fff9,transparent),radial-gradient(1px 1px at 38% 10%,#fff7,transparent),radial-gradient(1.3px 1.3px at 64% 28%,#fff8,transparent),radial-gradient(1px 1px at 84% 14%,#fff6,transparent),radial-gradient(1.2px 1.2px at 6% 66%,#fff7,transparent),radial-gradient(1px 1px at 92% 70%,#fff5,transparent),radial-gradient(1.2px 1.2px at 30% 86%,#fff7,transparent)}
+.c{position:relative;z-index:1;width:100%;max-width:430px;background:var(--card);border-radius:24px;padding:30px 28px 24px;backdrop-filter:blur(20px);box-shadow:0 30px 80px rgba(0,0,0,.55);animation:pop .7s cubic-bezier(.16,1,.3,1) both}
+.c::before{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:linear-gradient(135deg,rgba(139,92,246,.55),rgba(255,255,255,.06) 40%,rgba(139,92,246,.22));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude;pointer-events:none}
+@keyframes pop{from{opacity:0;transform:translateY(18px) scale(.96)}to{opacity:1;transform:none}}
+.ok{--t:var(--ok)}.wa{--t:var(--wa)}.er{--t:var(--er)}
+.hd{display:flex;align-items:center;gap:13px;margin-bottom:20px}
+.mk{width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--ac2),var(--ac));display:grid;place-items:center;flex:none;box-shadow:0 6px 22px -6px rgba(139,92,246,.7);animation:pulse 3.5s ease-in-out infinite}
+.mk svg{width:22px;height:22px}
+h1{margin:0;font-size:17px;letter-spacing:.01em}small{color:var(--mu)}
+.st{display:flex;gap:8px;align-items:center;margin:0 0 18px;font-size:13.5px;color:var(--t)}.st i{width:9px;height:9px;border-radius:50%;background:var(--t);box-shadow:0 0 10px var(--t);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.bar{height:12px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;direction:ltr;box-shadow:inset 0 1px 3px rgba(0,0,0,.4)}
+.bar b{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--ac2),var(--t));box-shadow:0 0 14px color-mix(in srgb,var(--t) 55%,transparent);animation:grow 1.3s cubic-bezier(.2,.7,.2,1) .15s both;position:relative;overflow:hidden}
+.bar b::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);animation:shine 2.4s ease-in-out infinite}
+@keyframes grow{from{width:0}}
+@keyframes shine{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+.g{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:20px;text-align:center}
+.g div{border:1px solid var(--line);border-radius:14px;padding:13px 4px;background:rgba(255,255,255,.03)}
+.g span{display:block;color:var(--mu);font-size:11.5px;margin-bottom:5px}
+.g b{font-size:15px;direction:ltr;display:inline-block;font-variant-numeric:tabular-nums}
+footer{margin-top:20px;padding-top:16px;border-top:1px solid var(--line);color:var(--mu);font-size:12px;display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap}
+footer a{color:var(--mu);text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:.2s}
+footer a:hover{color:var(--tx)}
+footer svg{width:13px;height:13px;fill:currentColor}
+.dot{width:3px;height:3px;border-radius:50%;background:var(--mu);opacity:.6}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
+</style></head><body>
+<div class="aur" aria-hidden="true"><i class="a1"></i><i class="a2"></i><i class="a3"></i><i class="stars"></i></div>
+<main class="c @TONE@">
+<div class="hd"><span class="mk"><svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.5h6L9.5 22 19 9.5h-6.2z" fill="none" stroke="#fbbf24" stroke-width="1.8" stroke-linejoin="round"/></svg></span><div><h1>@NAME@</h1><small>وضعیت مصرف حجم</small></div></div>
+<div class="st"><i></i>@ST@</div>@BAR@
 <div class="g"><div><span>مصرف‌شده</span><b>@USED@</b></div><div><span>کل حجم</span><b>@LIM@</b></div><div><span>باقی‌مانده</span><b>@LEFT@</b></div></div>
-<footer>آخرین بروزرسانی: @TIME@ · هر ۶۰ ثانیه خودکار تازه می‌شود</footer></main></body></html>"""
+<footer><span>آخرین بروزرسانی: @TIME@ · هر ۶۰ ثانیه خودکار تازه می‌شود</span><i class="dot"></i><a href="https://github.com/behymin12345-hash/DR-CPanel" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55v-2.17c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.66.41.36.78 1.05.78 2.13v3.16c0 .3.21.67.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>GitHub</a><i class="dot"></i><a href="https://t.me/DR_Gojo_Satoruu" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24"><path d="M9.04 15.51l-.38 5.32c.54 0 .78-.23 1.06-.51l2.55-2.44 5.28 3.87c.97.53 1.66.25 1.92-.9L23.9 4.4c.31-1.42-.51-1.98-1.45-1.63L2.9 10.2c-1.38.53-1.36 1.3-.24 1.65l4.69 1.46L18.3 6.9c.51-.34.98-.15.6.19l-9.86 8.42z"/></svg><span dir="ltr">@DR_Gojo_Satoruu</span></a></footer></main></body></html>"""
     rep = {"@TONE@": tone, "@NAME@": html.escape(name), "@ST@": st, "@USED@": hbytes(used),
            "@LIM@": hbytes(lim) if lim else "نامحدود", "@LEFT@": hbytes(left) if lim else "—",
            "@BAR@": '<div class="bar"><b style="width:%d%%"></b></div>' % pct if lim else "", "@TIME@": time.strftime("%F %H:%M")}
@@ -625,6 +1045,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/state": return self.out(200, state())
         if p == "/api/logs": return self.out(200, list(LOGS)[::-1])
         if p == "/api/health": return self.out(200, health_check())
+        if p == "/api/tunnels": return self.out(200, {"tunnels": tunnel_info(), "wg": bool(shutil.which("wg"))})
+        if p == "/api/tunnel/script":
+            m = re.search(r"ip=([\d.]+)", self.path)
+            try: return self.out(200, {"script": tun_cmd("script", m.group(1) if m else "", t=20)})
+            except ValueError as e: return self.out(400, {"error": str(e)})
         if p == "/api/sub":
             m = re.search(r"lport=(\d+)", self.path); k = m.group(1) if m else ""
             if k not in {str(r["lport"]) for r in read_rules()}: return self.out(404, {"error": "No such rule"})
@@ -669,7 +1094,7 @@ class H(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/login": return self.login(self.body())
             if not self.authed(): return self.out(401, {"error": "auth"})
-            d = self.body(3000000 if self.path == "/api/restore" else 20000 if self.path == "/api/cert" else 4096)
+            d = self.body(3000000 if self.path == "/api/restore" else 20000 if self.path in ("/api/cert", "/api/security") else 4096)
             if self.path == "/api/logout":
                 SESS.pop(self.token(), None)
                 return self.out(200, {"ok": True}, extra=[("Set-Cookie", "drc=; Max-Age=0; Path=/")])
@@ -693,6 +1118,32 @@ class H(BaseHTTPRequestHandler):
                 elif a == "delete": s.pop(k, None)
                 else: raise ValueError("Bad action")
                 jsave(SUBF, s); t = s.get(k, ""); return self.out(200, {"token": t, "path": "/sub/" + t if t else ""})
+            if self.path in ("/api/tunnel", "/api/tunnel/test"):
+                try: ip = str(ipaddress.IPv4Address(str(d.get("ip", "")).strip()))
+                except Exception: raise ValueError("Invalid IP")
+                if self.path.endswith("/test"): return self.out(200, transport_test(ip, int(d.get("port") or 0)))
+                a = d.get("action")
+                with LOCK:
+                    if a == "add": tun_cmd("add", ip, str(int(d.get("port") or 51820)))
+                    elif a in ("use", "direct", "del"): tun_cmd(a, ip)
+                    else: raise ValueError("Bad action")
+                log("info", "Tunnel %s: %s" % (a, ip)); return self.out(200, {"ok": True})
+            if self.path == "/api/rules/bulk":
+                ks = {int(x) for x in d.get("lports", [])}
+                with LOCK:
+                    rs = read_rules(); keep = [r for r in rs if r["lport"] not in ks]
+                    if len(keep) == len(rs): return self.out(404, {"error": "No such rule"})
+                    write_rules(keep)
+                    for k in ks: forget(k)
+                log("info", "Removed %d forwards" % (len(rs) - len(keep))); return self.out(200, {"ok": True})
+            if self.path == "/api/security":
+                ks = [int(x) for x in (d.get("lports") or [d.get("lport", 0)])][:50]
+                if not ks or not set(ks) <= {r["lport"] for r in read_rules()}: return self.out(404, {"error": "No such rule"})
+                with LOCK:
+                    for k in ks[:-1]: sec_save(k, d, False)
+                    sec_save(ks[-1], d)
+                log("info", "Security updated for %s" % ", ".join(":%d" % k for k in ks))
+                return self.out(200, {"ok": True})
             if self.path == "/api/domain":
                 if d.get("remove"): do_nodomain()
                 else: do_domain(d.get("domain", ""), d.get("email", ""))
@@ -703,7 +1154,7 @@ class H(BaseHTTPRequestHandler):
                 rs = read_rules(); i = int(m.group(1)) - 1
                 if not 0 <= i < len(rs): return self.out(404, {"error": "No such rule"})
                 r = rs[i]
-                return self.out(200, {"ms": None if r["proto"] == "udp" else tcp_ms(r["ip"], r["dport"]), "udp": r["proto"] == "udp"})
+                return self.out(200, {"ms": None if r["proto"] == "udp" else tcp_ms(eff_ip(r["ip"]), r["dport"]), "udp": r["proto"] == "udp"})
             if self.path == "/api/settings/telegram":
                 kw = {"tg_chat": str(d.get("chat", "")).strip()[:64], "tg_api": str(d.get("api", "")).strip().rstrip("/")[:200]}
                 if kw["tg_api"] and not kw["tg_api"].startswith("http"): raise ValueError("API address must start with https://")
@@ -775,65 +1226,122 @@ PYEOF
 <!doctype html>
 <html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#07060f">
 <title>DR-CPanel</title>
 <script>try{if(localStorage.getItem("drl")==="en"){document.documentElement.lang="en";document.documentElement.dir="ltr"}}catch(e){}</script>
 <style>
-:root{--bg:#050505;--panel:#0a0a0a;--gl:#1a1a1a;--fx:255,255,255;--line:#ffffff14;--line2:#ffffff26;--tx:#fafafa;--mu:#8a8a8f;--pr:#3b82f6;--ok:#22c55e;--er:#ef4444;--wa:#f59e0b;--f:#0c0c0c;--sunk:#ffffff0d;--sh:0 1px 0 #ffffff0a inset,0 20px 60px #00000066}
-body[data-t=light]{--bg:#f4f4f5;--panel:#fff;--gl:#e7e7ea;--fx:0,0,0;--line:#00000014;--line2:#00000026;--tx:#09090b;--mu:#71717a;--f:#fff;--sunk:#0000000a;--sh:0 1px 0 #fff inset,0 20px 50px #0000001a}
+:root{--bg:#07060f;--panel:#0c0b16;--gl:#1d1b2e;--fx:255,255,255;--acr:var(--fx);--line:#ffffff12;--line2:#ffffff24;--tx:#f6f5ff;--mu:#8d8aa5;--pr:#8b5cf6;--ok:#22c55e;--er:#ef4444;--wa:#f59e0b;--f:#100e1c;--sunk:#ffffff0a;--sh:0 1px 0 #ffffff08 inset,0 18px 50px #00000080}
+body[data-t=light]{--bg:#f3f2fa;--panel:#ffffff;--gl:#e4e2f0;--fx:20,16,44;--line:#00000010;--line2:#00000022;--tx:#12101f;--mu:#6f6c85;--f:#ffffff;--sunk:#00000008;--sh:0 1px 0 #fff inset,0 18px 44px #1d164038}
 *{box-sizing:border-box}
-body{--ac:var(--tx);--acf:var(--bg)}
-body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased;transition:background .3s,color .3s;overflow-x:hidden}
-body::before{content:"";position:fixed;top:0;bottom:0;left:-250px;right:0;z-index:-2;pointer-events:none;background:repeating-linear-gradient(90deg,transparent 0 118px,rgba(var(--fx),.045) 118px 250px);-webkit-mask:linear-gradient(to bottom,transparent 30%,#000 100%);mask:linear-gradient(to bottom,transparent 30%,#000 100%);animation:drift 40s linear infinite}
-body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(900px 380px at 50% -8%,color-mix(in srgb,var(--ac) 13%,transparent),transparent 70%),linear-gradient(to top,rgba(var(--fx),.10),transparent 38%)}
+body{--ac:var(--tx);--acf:var(--bg);--acg:#c8c8ce;--acp:#8b5cf6}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased;transition:background .3s,color .3s;overflow-x:hidden;-webkit-tap-highlight-color:transparent}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid color-mix(in srgb,var(--ac) 70%,transparent);outline-offset:2px}
+::selection{background:color-mix(in srgb,var(--ac) 32%,transparent)}
+/* ---------------- galaxy lighting ---------------- */
+#aur{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+#aur .a{position:absolute;border-radius:50%;filter:blur(90px);mix-blend-mode:screen;opacity:.55;will-change:transform}
+#aur .a1{width:58vw;height:58vw;left:-16vw;top:-22vw;background:radial-gradient(circle,color-mix(in srgb,var(--ac) 60%,transparent),transparent 66%);animation:au1 26s ease-in-out infinite alternate}
+#aur .a2{width:46vw;height:46vw;right:-12vw;top:16vh;background:radial-gradient(circle,color-mix(in srgb,var(--acg) 52%,transparent),transparent 66%);animation:au2 32s ease-in-out infinite alternate}
+#aur .a3{width:40vw;height:40vw;left:24vw;bottom:-20vw;background:radial-gradient(circle,color-mix(in srgb,var(--acp) 46%,transparent),transparent 66%);animation:au3 38s ease-in-out infinite alternate}
+body[data-t=light] #aur .a{mix-blend-mode:normal;opacity:.22;filter:blur(110px)}
+#aur .st{position:absolute;inset:0;opacity:.7;background-image:
+ radial-gradient(1.2px 1.2px at 12% 22%,#ffffffcc,transparent),
+ radial-gradient(1px 1px at 34% 8%,#ffffff9c,transparent),
+ radial-gradient(1.4px 1.4px at 62% 30%,#ffffffb8,transparent),
+ radial-gradient(1px 1px at 82% 12%,#ffffff8c,transparent),
+ radial-gradient(1.2px 1.2px at 90% 44%,#ffffffaa,transparent),
+ radial-gradient(1px 1px at 22% 58%,#ffffff7a,transparent),
+ radial-gradient(1.3px 1.3px at 48% 74%,#ffffff9c,transparent),
+ radial-gradient(1px 1px at 70% 60%,#ffffff6e,transparent),
+ radial-gradient(1.1px 1.1px at 8% 82%,#ffffff90,transparent),
+ radial-gradient(1px 1px at 94% 78%,#ffffff80,transparent);
+ animation:twk 7s ease-in-out infinite alternate}
+body[data-t=light] #aur .st{display:none}
+@keyframes twk{from{opacity:.35}to{opacity:.85}}
+@keyframes au1{to{transform:translate(10vw,7vh) scale(1.14)}}
+@keyframes au2{to{transform:translate(-9vw,-6vh) scale(1.2)}}
+@keyframes au3{to{transform:translate(-7vw,-9vh) scale(1.12)}}
+body::before{content:"";position:fixed;top:0;bottom:0;left:-250px;right:0;z-index:-2;pointer-events:none;background:repeating-linear-gradient(90deg,transparent 0 118px,rgba(var(--fx),.04) 118px 250px);-webkit-mask:linear-gradient(to bottom,transparent 30%,#000 100%);mask:linear-gradient(to bottom,transparent 30%,#000 100%);animation:drift 40s linear infinite}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(1000px 420px at 50% -10%,color-mix(in srgb,var(--ac) 14%,transparent),transparent 70%),linear-gradient(to top,rgba(var(--fx),.08),transparent 38%)}
 @keyframes drift{to{transform:translateX(250px)}}
 @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-@keyframes pop{from{opacity:0;transform:scale(.96) translateY(8px)}to{opacity:1;transform:none}}
+@keyframes pop{from{opacity:0;transform:scale(.94) translateY(10px)}to{opacity:1;transform:none}}
+@keyframes tin{from{opacity:0;transform:translateY(16px) scale(.95)}to{opacity:1;transform:none}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-@keyframes glow{0%,100%{box-shadow:0 0 0 0 #fbbf2400,0 10px 30px #00000055}50%{box-shadow:0 0 0 8px #fbbf2412,0 10px 34px #ef444424}}
-button,input,select,textarea{font:inherit;color:inherit}
+@keyframes glow{0%,100%{box-shadow:0 0 0 0 transparent,0 8px 26px -6px rgba(var(--acr),.55)}50%{box-shadow:0 0 26px 2px rgba(var(--acr),.28),0 10px 30px -6px rgba(var(--acr),.6)}}
 .ic{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
-.mk{width:42px;height:42px;border-radius:13px;background:var(--tx);display:grid;place-items:center;flex:none;animation:glow 5s ease-in-out infinite}.mk svg{width:22px;height:22px}
-.layout{min-height:100vh}
-.top{direction:ltr;display:flex;align-items:center;justify-content:space-between;gap:12px;max-width:1240px;margin:0 auto;padding:22px 28px 18px;animation:rise .5s both}
-.brand{display:flex;align-items:center;gap:12px;min-width:0}.brand .dr{height:26px;width:auto;flex:none;filter:drop-shadow(0 2px 10px #3b82f650)}
+.fi{width:15px;height:15px;fill:currentColor;flex:none}
+.mk{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,var(--acg),var(--ac));display:grid;place-items:center;flex:none;animation:glow 4.5s ease-in-out infinite;box-shadow:0 6px 22px -6px rgba(var(--acr),.65)}.mk svg{width:22px;height:22px}
+.layout{min-height:100vh;display:flex;flex-direction:column}
+/* ---------------- header / tabs ---------------- */
+.top{direction:ltr;display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;max-width:1240px;margin:0 auto;padding:22px 28px 18px;animation:rise .5s both}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}.brand .dr{height:26px;width:auto;flex:none;filter:drop-shadow(0 2px 12px rgba(var(--acr),.55))}
 .brand .tt{line-height:1.25;min-width:0}.brand .tt b{display:block;font-size:15px;letter-spacing:.02em}.brand .tt small{display:block;color:var(--mu);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tools{display:flex;gap:10px}
 .ibtn{display:inline-flex;align-items:center;gap:8px;height:42px;padding:0 16px;border-radius:14px;border:1px solid var(--line2);background:var(--sunk);color:var(--mu);cursor:pointer;transition:.2s;backdrop-filter:blur(12px)}
-.ibtn:hover{color:var(--tx);border-color:var(--tx);transform:translateY(-1px)}.ibtn.sq{padding:0;width:42px;justify-content:center}
+.ibtn:hover{color:var(--tx);border-color:color-mix(in srgb,var(--ac) 55%,var(--line2));transform:translateY(-1px);box-shadow:0 6px 18px -8px rgba(var(--acr),.5)}.ibtn.sq{padding:0;width:42px;justify-content:center}
 .tabs{display:flex;justify-content:center;padding:4px 16px 8px;animation:rise .55s .05s both}
-.seg{display:flex;gap:4px;padding:5px;border-radius:18px;background:var(--panel);border:1px solid var(--line2);box-shadow:var(--sh);max-width:100%;overflow-x:auto;scrollbar-width:none}.seg::-webkit-scrollbar{display:none}
-.nav{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;background:0;border:0;color:var(--mu);padding:10px 18px;border-radius:13px;cursor:pointer;transition:.22s}
-.nav:hover{color:var(--tx);background:var(--sunk)}.nav.on{background:var(--ac);color:var(--acf);font-weight:600;box-shadow:0 6px 18px color-mix(in srgb,var(--ac) 28%,transparent)}
-main{max-width:1240px;margin:0 auto;padding:6px 28px 60px}
+.seg{position:relative;display:flex;gap:4px;padding:5px;border-radius:18px;background:color-mix(in srgb,var(--panel) 82%,transparent);border:1px solid var(--line2);box-shadow:var(--sh);max-width:100%;overflow-x:auto;scrollbar-width:none;backdrop-filter:blur(14px)}.seg::-webkit-scrollbar{display:none}
+.ind{position:absolute;top:5px;bottom:5px;left:0;width:0;border-radius:13px;background:linear-gradient(135deg,var(--acg),var(--ac));box-shadow:0 6px 20px -4px rgba(var(--acr),.65),inset 0 1px 0 rgba(255,255,255,.25);transition:transform .38s cubic-bezier(.3,.9,.25,1),width .38s cubic-bezier(.3,.9,.25,1);z-index:0}
+.nav{position:relative;z-index:1;display:inline-flex;align-items:center;gap:8px;white-space:nowrap;background:0;border:0;color:var(--mu);padding:10px 18px;border-radius:13px;cursor:pointer;transition:color .22s,background .22s}
+.nav:hover{color:var(--tx);background:var(--sunk)}.nav.on{color:var(--acf);font-weight:600}
+main{width:100%;max-width:1240px;margin:0 auto;padding:6px 28px 26px;flex:1}
 section{animation:rise .5s both}
-.sec{display:flex;align-items:center;gap:14px;color:var(--mu);font-size:12px;font-weight:600;margin:26px 0 12px}.sec::after{content:"";flex:1;height:1px;background:var(--line)}
-.panel{direction:ltr;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:var(--gl);border:1px solid var(--line2);border-radius:24px;overflow:hidden;box-shadow:var(--sh);animation:rise .6s both}
+.sec{display:flex;align-items:center;gap:14px;color:var(--mu);font-size:12px;font-weight:600;margin:26px 0 12px}.sec::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent)}
+/* ---------------- cards / panels ---------------- */
+.panel{direction:ltr;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:var(--gl);border-radius:24px;overflow:hidden;box-shadow:var(--sh);animation:rise .6s both;position:relative}
+.panel::before{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:linear-gradient(135deg,rgba(var(--acr),.5),rgba(var(--fx),.09) 38%,rgba(var(--acr),.16) 60%,rgba(var(--fx),.1));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude;pointer-events:none}
 .panel.two{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
-.cell{background:var(--panel);padding:22px 24px;direction:ltr;text-align:left;transition:background .25s}.cell:hover{background:color-mix(in srgb,var(--panel) 92%,var(--tx))}
-.hd{display:flex;align-items:baseline;gap:8px}.v{font-size:34px;font-weight:700;letter-spacing:-.03em;line-height:1.1}.v small{font-size:15px;font-weight:500;color:var(--mu);margin-left:2px;letter-spacing:0}.v.sm{font-size:20px;letter-spacing:-.01em}
+.cell{background:color-mix(in srgb,var(--panel) 90%,transparent);padding:22px 24px;direction:ltr;text-align:left;transition:background .25s;backdrop-filter:blur(10px)}.cell:hover{background:color-mix(in srgb,var(--panel) 84%,var(--ac) 5%)}
+.hd{display:flex;align-items:baseline;gap:8px}.v{font-size:34px;font-weight:700;letter-spacing:-.03em;line-height:1.1;font-variant-numeric:tabular-nums;text-shadow:0 0 22px rgba(var(--acr),.28)}
+body[data-t=light] .v{text-shadow:none}
+.v small{font-size:15px;font-weight:500;color:var(--mu);margin-left:2px;letter-spacing:0;text-shadow:none}.v.sm{font-size:20px;letter-spacing:-.01em}
 .l{color:var(--mu);font-size:13px}.s{color:var(--mu);font-size:12px;margin-top:14px;direction:ltr}
 .pb{height:11px;margin-top:22px;direction:ltr;background:var(--line2);-webkit-mask:repeating-linear-gradient(90deg,#000 0 12px,transparent 12px 16px);mask:repeating-linear-gradient(90deg,#000 0 12px,transparent 12px 16px)}
-.pb i{display:block;height:100%;width:0;background:var(--ac);transition:width .9s cubic-bezier(.2,.7,.2,1)}
-.hist{display:flex;gap:4px;align-items:flex-end;height:64px;margin-top:16px;direction:ltr}.hist i{flex:1;min-height:6px;background:var(--line2);border-radius:3px;transition:height .6s cubic-bezier(.2,.7,.2,1)}.hist i:last-child{background:var(--ac)}
+.pb i{display:block;height:100%;width:0;background:linear-gradient(90deg,color-mix(in srgb,var(--ac) 60%,transparent),var(--ac));box-shadow:0 0 12px rgba(var(--acr),.5);transition:width .9s cubic-bezier(.2,.7,.2,1)}
+.hist{display:flex;gap:4px;align-items:flex-end;height:64px;margin-top:16px;direction:ltr}.hist i{flex:1;min-height:6px;background:rgba(var(--acr),.24);border-radius:3px;transition:height .6s cubic-bezier(.2,.7,.2,1)}
+.hist i:last-child{background:linear-gradient(to top,var(--acg),var(--ac));box-shadow:0 0 12px rgba(var(--acr),.55)}
+/* ---------------- buttons ---------------- */
 .btn{border:1px solid var(--line2);background:var(--sunk);color:var(--tx);padding:8px 16px;border-radius:12px;cursor:pointer;transition:.18s}
-.btn:hover{border-color:var(--tx);transform:translateY(-1px)}.btn:active{transform:scale(.97)}.btn.p{background:var(--ac);color:var(--acf);border-color:var(--ac);font-weight:600}.btn.on{border-color:var(--ac);box-shadow:inset 0 0 0 1px var(--ac)}
-.btn.d{color:var(--er)}.btn.d:hover{border-color:var(--er)}.btn:disabled{opacity:.45;cursor:default;transform:none}
+.btn:hover{border-color:color-mix(in srgb,var(--ac) 55%,var(--line2));transform:translateY(-1px);box-shadow:0 6px 16px -8px rgba(var(--acr),.55)}.btn:active{transform:scale(.97)}
+.btn.p{background:linear-gradient(135deg,var(--acg),var(--ac));color:var(--acf);border-color:transparent;font-weight:600;box-shadow:0 5px 20px -6px rgba(var(--acr),.65),inset 0 1px 0 rgba(255,255,255,.22)}
+.btn.p:hover{box-shadow:0 9px 28px -6px rgba(var(--acr),.75),inset 0 1px 0 rgba(255,255,255,.26)}
+.btn.on{border-color:var(--ac);box-shadow:inset 0 0 0 1px var(--ac),0 0 16px -6px rgba(var(--acr),.6)}
+.btn.d{color:var(--er)}.btn.d:hover{border-color:var(--er);box-shadow:0 6px 16px -8px rgba(239,68,68,.6)}.btn:disabled{opacity:.45;cursor:default;transform:none;box-shadow:none}
 h1{font-size:19px;margin:22px 0 16px;letter-spacing:-.01em}
-.card{background:var(--panel);border:1px solid var(--line2);border-radius:22px;padding:22px;margin-bottom:16px;box-shadow:var(--sh);animation:rise .55s both}
+.card{position:relative;background:color-mix(in srgb,var(--panel) 88%,transparent);border-radius:22px;padding:22px;margin-bottom:16px;box-shadow:var(--sh);animation:rise .55s both;backdrop-filter:blur(12px)}
+.card::before,.box::before{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:linear-gradient(135deg,rgba(var(--acr),.5),rgba(var(--fx),.08) 40%,rgba(var(--acr),.14) 62%,rgba(var(--fx),.1));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude;pointer-events:none}
+.card:hover{box-shadow:var(--sh),0 0 36px -10px rgba(var(--acr),.3)}
 .bar{display:flex;justify-content:space-between;align-items:center;margin:22px 0 14px}.bar h2,.bar h1{margin:0}
+/* ---------------- tables ---------------- */
 table{width:100%;border-collapse:collapse}th,td{padding:13px 12px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
-th{color:var(--mu);font-weight:500;font-size:12px}tr:last-child td{border:0}tbody tr{transition:background .15s}tbody tr:hover td{background:rgba(var(--fx),.025)}
+th{color:var(--mu);font-weight:500;font-size:12px}tr:last-child td{border:0}tbody tr{transition:background .15s}tbody tr:hover td{background:rgba(var(--fx),.03)}
 .ltr{direction:ltr;text-align:right;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
 .tbl{overflow-x:auto}.tag{padding:2px 10px;border-radius:20px;font-size:11px;background:var(--sunk);border:1px solid var(--line2);text-transform:uppercase}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:20px;font-size:12px}.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
-.pill.up{background:#22c55e1f;color:var(--ok)}.pill.up::before{animation:pulse 2s infinite}.pill.down{background:#ef44441f;color:var(--er)}.pill.unknown{background:var(--sunk);color:var(--mu)}
-.mb{height:4px;border-radius:4px;background:var(--line2);margin-top:5px;min-width:110px;overflow:hidden}.mb i{display:block;height:100%;transition:width .6s}
+.pill.up{background:#22c55e1f;color:var(--ok);box-shadow:0 0 14px -4px rgba(34,197,94,.45)}.pill.up::before{animation:pulse 2s infinite;box-shadow:0 0 8px currentColor}
+.pill.down{background:#ef44441f;color:var(--er);box-shadow:0 0 14px -4px rgba(239,68,68,.5)}.pill.unknown{background:var(--sunk);color:var(--mu)}
+.mb{height:4px;border-radius:4px;background:var(--line2);margin-top:5px;min-width:110px;overflow:hidden}.mb i{display:block;height:100%;transition:width .6s;box-shadow:0 0 8px rgba(var(--acr),.4)}
+.cp{cursor:copy;transition:color .15s}.cp::after{content:"⧉";opacity:0;font-size:11px;margin-inline-start:7px;transition:.15s;color:var(--ac)}.cp:hover{color:var(--tx)}.cp:hover::after{opacity:.75}
 .empty{text-align:center;color:var(--mu);padding:34px}
-.modal{position:fixed;inset:0;background:#000a;backdrop-filter:blur(6px);display:none;place-items:center;padding:16px;z-index:20}.modal.on{display:grid;animation:rise .2s both}
-.box{background:var(--panel);border:1px solid var(--line2);border-radius:24px;padding:24px;width:100%;max-width:470px;max-height:92vh;overflow:auto;box-shadow:var(--sh);animation:pop .3s cubic-bezier(.2,.7,.2,1) both}
+/* ---------------- search ---------------- */
+.srch{position:relative;display:flex;align-items:center;gap:9px;margin:2px 2px 14px;background:var(--f);border:1px solid var(--line2);border-radius:14px;padding:0 13px;transition:.2s;max-width:380px}
+.srch:focus-within{border-color:var(--ac);box-shadow:0 0 0 4px color-mix(in srgb,var(--ac) 15%,transparent),0 0 20px -8px rgba(var(--acr),.6)}
+.srch>.ic{color:var(--mu);width:16px;height:16px}
+.srch input{border:0;background:0;padding:10px 2px;width:100%;direction:rtl;text-align:right}
+.srch input:focus{box-shadow:none;border:0}
+html[dir=ltr] .srch input{direction:ltr;text-align:left}
+.srch .clr{position:absolute;inset-inline-end:7px;width:24px;height:24px;display:grid;place-items:center;border:0;background:0;color:var(--mu);border-radius:8px;cursor:pointer;transition:.15s}.srch .clr:hover{color:var(--tx);background:var(--sunk)}
+/* ---------------- modal / inputs ---------------- */
+.modal{position:fixed;inset:0;background:rgba(4,3,10,.62);backdrop-filter:blur(10px);display:none;place-items:center;padding:16px;z-index:20}.modal.on{display:grid;animation:rise .2s both}
+body[data-t=light] .modal{background:rgba(29,22,64,.32)}
+.box{position:relative;background:color-mix(in srgb,var(--panel) 92%,transparent);border-radius:24px;padding:24px;width:100%;max-width:470px;max-height:92vh;overflow:auto;box-shadow:var(--sh);animation:pop .38s cubic-bezier(.16,1,.3,1) both;backdrop-filter:blur(18px)}
 .box h3{margin:0 0 14px;font-size:17px}label{display:block;color:var(--mu);font-size:12px;margin:12px 0 5px}
 input,select,textarea{width:100%;background:var(--f);border:1px solid var(--line2);color:var(--tx);border-radius:13px;padding:11px 13px;direction:ltr;text-align:left;transition:.18s}
-input:focus,select:focus,textarea:focus{outline:0;border-color:var(--ac);box-shadow:0 0 0 4px color-mix(in srgb,var(--ac) 18%,transparent)}.row{display:flex;gap:10px}.row>*{flex:1}.acts{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--ac);box-shadow:0 0 0 4px color-mix(in srgb,var(--ac) 16%,transparent),0 0 20px -8px rgba(var(--acr),.55)}
+.row{display:flex;gap:10px}.row>*{flex:1}.acts{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}
+.grp{cursor:pointer;background:color-mix(in srgb,var(--ac) 7%,transparent)}.grp td{font-weight:600}.sub td{background:rgba(var(--fx),.025)}.sub td:first-child{opacity:.35}
 .hint{color:var(--mu);font-size:12px;margin-top:6px}
 .hl{display:flex;gap:12px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line)}.hl:last-child{border:0}
 .hl b{font-size:16px;line-height:1.3}.hl .ok{color:var(--ok)}.hl .warn{color:var(--wa)}.hl .err{color:var(--er)}.hl code{display:block;direction:ltr;text-align:left;color:var(--mu);font-size:12px;margin-top:2px}
@@ -842,39 +1350,51 @@ input:focus,select:focus,textarea:focus{outline:0;border-color:var(--ac);box-sha
 .trk{stroke:var(--line2);stroke-width:9;fill:none}.arc{stroke-width:9;fill:none;stroke-linecap:round;transition:stroke-dasharray .6s}.mid{position:absolute;inset:0;display:grid;place-items:center;font-size:21px;font-weight:700}
 .qn{flex:1;display:grid;gap:6px}.qn div{display:flex;justify-content:space-between;gap:8px}.qn span{color:var(--mu)}.qn b{direction:ltr}
 .pre{display:flex;flex-wrap:wrap;gap:8px}.qs{padding:10px 12px;border-radius:12px;margin:0 0 12px;font-size:13px;background:var(--sunk)}.qs.er{color:var(--er);background:#ef444419}
-.by{display:block;text-align:center;color:var(--mu);font-size:11.5px;direction:ltr;text-decoration:none;transition:.2s}.by:hover{color:var(--tx)}
+/* ---------------- footer ---------------- */
+.foot{width:100%;max-width:1240px;margin:0 auto;padding:14px 28px 30px;display:flex;justify-content:center;animation:rise .6s .1s both}
+.fin{display:flex;align-items:center;gap:14px;flex-wrap:wrap;justify-content:center;color:var(--mu);font-size:12.5px}
+.fgl{display:inline-flex;align-items:center;gap:7px;color:var(--mu);text-decoration:none;transition:.2s;direction:ltr}
+.fgl:hover{color:var(--tx);transform:translateY(-1px)}
+.fgl .fi{filter:drop-shadow(0 0 7px rgba(var(--acr),.45))}
+.fd{width:3px;height:3px;border-radius:50%;background:var(--mu);opacity:.55;flex:none}
+.fver{direction:ltr;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;opacity:.7}
+/* ---------------- login ---------------- */
 #login{min-height:100vh;display:grid;place-items:center;padding:20px}
-#login .lbox{width:100%;max-width:420px;background:var(--panel);border:1px solid var(--line2);border-radius:28px;box-shadow:var(--sh);overflow:hidden;animation:pop .6s cubic-bezier(.2,.7,.2,1) both}
-#login .lin{padding:36px 30px 28px}#login .hero{text-align:center;margin-bottom:26px}#login .hero .mk{width:62px;height:62px;border-radius:19px;margin:0 auto 16px}#login .hero .mk svg{width:32px;height:32px}
-#login .hero .dr{height:30px;width:auto;display:block;margin:0 auto 6px;filter:drop-shadow(0 2px 12px #3b82f655)}#login .hero h2{margin:0;font-size:19px;letter-spacing:.01em}#login .hero p{margin:4px 0 0;color:var(--mu);font-size:13px}
+#login .lbox{position:relative;width:100%;max-width:420px;background:color-mix(in srgb,var(--panel) 86%,transparent);border-radius:28px;box-shadow:var(--sh);overflow:hidden;animation:pop .6s cubic-bezier(.16,1,.3,1) both;backdrop-filter:blur(22px)}
+#login .lbox::before{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:linear-gradient(135deg,rgba(var(--acr),.55),rgba(var(--fx),.08) 40%,rgba(var(--acr),.2));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude;pointer-events:none}
+#login .lin{padding:36px 30px 28px;position:relative}#login .hero{text-align:center;margin-bottom:26px}#login .hero .mk{width:62px;height:62px;border-radius:19px;margin:0 auto 16px}#login .hero .mk svg{width:32px;height:32px}
+#login .hero .dr{height:30px;width:auto;display:block;margin:0 auto 6px;filter:drop-shadow(0 2px 14px rgba(var(--acr),.55))}#login .hero h2{margin:0;font-size:19px;letter-spacing:.01em}#login .hero p{margin:4px 0 0;color:var(--mu);font-size:13px}
 #login label{margin:0 0 7px}
-.pwf{position:relative}.pwf input{padding:15px 48px 15px 16px;border-radius:16px;font-size:15px}.pwf .lk{position:absolute;left:auto;right:16px;top:50%;transform:translateY(-50%);color:var(--mu);pointer-events:none}
-.pwf input{padding-right:46px;padding-left:46px}.pwf .lk{right:auto;left:16px}.pwf input{padding-left:44px;padding-right:46px}
-.pwf .eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:36px;height:36px;display:grid;place-items:center;border:0;background:0;color:var(--mu);border-radius:10px;cursor:pointer;transition:.18s}.pwf .eye:hover{color:var(--tx);background:var(--sunk)}
+.pwf{position:relative}.pwf input{padding:15px 46px;border-radius:16px;font-size:15px}
+.pwf .lk{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--mu);pointer-events:none}
+.pwf .eye{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:36px;height:36px;display:grid;place-items:center;border:0;background:0;color:var(--mu);border-radius:10px;cursor:pointer;transition:.18s}.pwf .eye:hover{color:var(--tx);background:var(--sunk)}
 #login .go{width:100%;margin-top:14px;padding:14px;border-radius:16px;font-size:15px;display:flex;align-items:center;justify-content:center;gap:10px}#login .go .ic{transition:transform .2s;transform:scaleX(-1)}#login .go:hover .ic{transform:scaleX(-1) translateX(5px)}
-#login .ft{border-top:1px solid var(--line);padding:16px;background:rgba(var(--fx),.02)}
-#toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);display:grid;gap:8px;z-index:30}
-.t{background:var(--panel);border:1px solid var(--line2);border-radius:14px;padding:11px 18px;box-shadow:var(--sh);animation:pop .3s both}.t.e{border-color:var(--er)}.t.s{border-color:var(--ok)}
+#login .ft{border-top:1px solid var(--line);padding:15px;background:rgba(var(--fx),.02);display:flex;align-items:center;justify-content:center;gap:14px}
+#login .lgl{position:fixed;top:18px;inset-inline-end:18px;z-index:2}
+/* ---------------- toast ---------------- */
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);display:grid;gap:8px;z-index:30;width:max-content;max-width:92vw}
+.t{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line2);border-radius:14px;padding:11px 18px;box-shadow:var(--sh);animation:tin .3s cubic-bezier(.16,1,.3,1) both;backdrop-filter:blur(14px);cursor:pointer}
+.t.s{border-color:#22c55e55;box-shadow:var(--sh),0 8px 28px -8px rgba(34,197,94,.4)}
+.t.e{border-color:#ef444455;box-shadow:var(--sh),0 8px 28px -8px rgba(239,68,68,.45)}
 .hide{display:none!important}details summary{cursor:pointer;color:var(--mu);margin-top:14px}
-@media(max-width:800px){.top{padding:16px 16px 12px}.brand .tt small{max-width:150px}.ibtn span{display:none}.ibtn{padding:0;width:42px;justify-content:center}.tabs{justify-content:flex-start;padding:4px 12px 6px}main{padding:6px 14px 40px}.v{font-size:28px}.cell{padding:18px}.row{flex-direction:column}.qh{flex-direction:column;align-items:flex-start}}
+@media(max-width:800px){.top{padding:16px 16px 12px}.brand .tt small{max-width:150px}.ibtn span{display:none}.ibtn{padding:0;width:42px;justify-content:center}.tabs{justify-content:flex-start;padding:4px 12px 6px}main{padding:6px 14px 20px}.foot{padding:14px 14px 24px}.v{font-size:28px}.cell{padding:18px}.row{flex-direction:column}.qh{flex-direction:column;align-items:flex-start}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
-
-#login .lgl{position:fixed;top:18px;right:18px;z-index:2}
+#login .sws{margin:0}
 .sws{display:flex;flex-wrap:wrap;gap:14px;margin:16px 2px 6px}
 .sw{position:relative;display:inline-block;width:34px;height:34px;border-radius:50%;border:0;padding:0;background:var(--c);cursor:pointer;transition:transform .18s,box-shadow .18s;box-shadow:inset 0 0 0 1px rgba(var(--fx),.2)}
 .sw:hover{transform:scale(1.14)}.sw[data-c=mono]{background:linear-gradient(135deg,#fafafa 50%,#18181b 50%)}
 .sw.cu{margin:0;background:conic-gradient(#ef4444,#f59e0b,#22c55e,#06b6d4,#3b82f6,#8b5cf6,#ec4899,#ef4444)}
-.sw.on{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--c)}
+.sw.on{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--c),0 0 18px -2px rgba(var(--acr),.55)}
 .sw input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;padding:0;border:0;border-radius:50%}
-#boot{position:fixed;inset:0;z-index:50;display:grid;place-items:center;background:var(--bg);overflow:hidden;transition:opacity .6s,transform .6s,filter .6s;animation:fin .4s both}
-#boot::before{content:"";position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0 118px,rgba(var(--fx),.045) 118px 250px);-webkit-mask:linear-gradient(to bottom,transparent 30%,#000 100%);mask:linear-gradient(to bottom,transparent 30%,#000 100%)}
-#boot::after{content:"";position:absolute;inset:0;background:radial-gradient(700px 380px at 50% 40%,color-mix(in srgb,var(--ac) 17%,transparent),transparent 70%),linear-gradient(to top,rgba(var(--fx),.09),transparent 40%)}
+/* ---------------- boot ---------------- */
+#boot{position:fixed;inset:0;z-index:50;display:grid;place-items:center;background:color-mix(in srgb,var(--bg) 62%,transparent);backdrop-filter:blur(20px);overflow:hidden;transition:opacity .6s,transform .6s,filter .6s;animation:fin .4s both}
 #boot.out{opacity:0;transform:scale(1.06);filter:blur(8px);pointer-events:none}
 .bwrap{position:relative;z-index:1;display:grid;justify-items:center;width:min(340px,86vw);direction:ltr;text-align:center}
 .ring{position:relative;width:118px;height:118px;display:grid;place-items:center;margin-bottom:22px}
+.ring::before{content:"";position:absolute;inset:-26px;border-radius:50%;background:radial-gradient(circle,rgba(var(--acr),.28),transparent 68%);animation:pulse 3s ease-in-out infinite}
 .ring .rg{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);overflow:visible}
 .ring .r0{fill:none;stroke:var(--line2);stroke-width:2}
-.ring .r1{fill:none;stroke:var(--ac);stroke-width:3;stroke-linecap:round;stroke-dasharray:289;stroke-dashoffset:289;transition:stroke-dashoffset .8s cubic-bezier(.3,.7,.2,1);filter:drop-shadow(0 0 5px color-mix(in srgb,var(--ac) 65%,transparent))}
+.ring .r1{fill:none;stroke:var(--ac);stroke-width:3;stroke-linecap:round;stroke-dasharray:289;stroke-dashoffset:289;transition:stroke-dashoffset .8s cubic-bezier(.3,.7,.2,1);filter:drop-shadow(0 0 6px rgba(var(--acr),.75))}
 .ring .sp{transform-origin:50px 50px;animation:spin 1.3s linear infinite;transition:opacity .4s}
 .ring .sp circle{fill:none;stroke:var(--ac);stroke-width:1.6;stroke-linecap:round;stroke-dasharray:24 265;opacity:.55}
 #boot.done .sp{opacity:0}
@@ -885,45 +1405,48 @@ input:focus,select:focus,textarea:focus{outline:0;border-color:var(--ac);box-sha
 @keyframes fin{from{opacity:0}to{opacity:1}}
 @keyframes sweep{from{transform:translateX(-120%)}to{transform:translateX(300%)}}
 @keyframes pulseok{0%{transform:scale(1)}40%{transform:scale(1.12)}100%{transform:scale(1)}}
-.bwrap .dr{height:34px;width:auto;margin-bottom:6px;filter:drop-shadow(0 2px 12px color-mix(in srgb,var(--pr) 45%,transparent))}
+.bwrap .dr{height:34px;width:auto;margin-bottom:6px;filter:drop-shadow(0 2px 14px rgba(var(--acr),.5))}
 .bt{font-weight:700;font-size:14px;letter-spacing:.34em;text-indent:.34em}
 .bs{color:var(--mu);font-size:13px;margin:10px 0 28px;min-height:20px}.bs b{color:var(--tx);font-weight:600;margin-inline-start:8px;font-variant-numeric:tabular-nums}
 .bsteps{display:grid;gap:12px;width:100%}
-.st{display:flex;align-items:center;gap:12px;color:var(--mu);font-size:12.5px;transition:color .3s}
-.st .tk{width:17px;height:17px;border-radius:50%;border:1.5px solid var(--line2);display:grid;place-items:center;flex:none;transition:.3s;font-style:normal}
-.st .tk svg{width:10px;height:10px;stroke:var(--acf);fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;opacity:0;transform:scale(.4);transition:.3s}
-.st .lb{flex:none;width:124px;text-align:left}
-.st i{flex:1;height:3px;border-radius:3px;background:var(--line2);position:relative;overflow:hidden}
-.st b{position:absolute;inset:0 auto 0 0;width:0;background:var(--ac);border-radius:3px;transition:width .5s}
-.st.run{color:var(--tx)}.st.run .tk{border-color:var(--ac)}.st.run b{width:38%;animation:sweep 1.1s ease-in-out infinite}
-.st.ok{color:var(--tx)}.st.ok .tk{background:var(--ac);border-color:var(--ac)}.st.ok .tk svg{opacity:1;transform:none}.st.ok b{width:100%;animation:none}
+.bst{display:flex;align-items:center;gap:12px;color:var(--mu);font-size:12.5px;transition:color .3s}
+.bst .tk{width:17px;height:17px;border-radius:50%;border:1.5px solid var(--line2);display:grid;place-items:center;flex:none;transition:.3s;font-style:normal}
+.bst .tk svg{width:10px;height:10px;stroke:var(--acf);fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;opacity:0;transform:scale(.4);transition:.3s}
+.bst .lb{flex:none;width:124px;text-align:left}
+.bst i{flex:1;height:3px;border-radius:3px;background:var(--line2);position:relative;overflow:hidden}
+.bst b{position:absolute;inset:0 auto 0 0;width:0;background:linear-gradient(90deg,var(--acg),var(--ac));border-radius:3px;transition:width .5s;box-shadow:0 0 8px rgba(var(--acr),.5)}
+.bst.run{color:var(--tx)}.bst.run .tk{border-color:var(--ac)}.bst.run b{width:38%;animation:sweep 1.1s ease-in-out infinite}
+.bst.ok{color:var(--tx)}.bst.ok .tk{background:linear-gradient(135deg,var(--acg),var(--ac));border-color:transparent}.bst.ok .tk svg{opacity:1;transform:none}.bst.ok b{width:100%;animation:none}
 html[dir=ltr] th,html[dir=ltr] td{text-align:left}
 html[dir=ltr] .ltr{text-align:left}
 html[dir=ltr] #login .go .ic{transform:none}
 html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 </style></head><body>
+<div id="aur" aria-hidden="true"><i class="a a1"></i><i class="a a2"></i><i class="a a3"></i><i class="st"></i></div>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
 <linearGradient id="gBolt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#ef4444"/></linearGradient>
 <linearGradient id="gDR" x1="0" y1="0" x2="1" y2="1"><stop offset="0" style="stop-color:var(--tx)"/><stop offset="1" style="stop-color:var(--pr)"/></linearGradient>
 <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13.5 2 5 13.5h6L9.5 22 19 9.5h-6.2z" fill="url(#gBolt)"/></symbol>
 <symbol id="i-dr" viewBox="0 0 76 36"><g transform="skewX(-9) translate(5 0)" fill="none" stroke="url(#gDR)" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h13c10 0 15 6 15 14s-5 14-15 14H4z"/><path d="M43 32V4h12c7 0 10 4 10 8.5S62 21 55 21H43"/><path d="M54 21l11 11"/></g></symbol>
+<symbol id="i-gh" viewBox="0 0 24 24"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55v-2.17c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.66.41.36.78 1.05.78 2.13v3.16c0 .3.21.67.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></symbol>
+<symbol id="i-tg" viewBox="0 0 24 24"><path d="M9.04 15.51l-.38 5.32c.54 0 .78-.23 1.06-.51l2.55-2.44 5.28 3.87c.97.53 1.66.25 1.92-.9L23.9 4.4c.31-1.42-.51-1.98-1.45-1.63L2.9 10.2c-1.38.53-1.36 1.3-.24 1.65l4.69 1.46L18.3 6.9c.51-.34.98-.15.6.19l-9.86 8.42z"/></symbol>
 </defs></svg>
 <div id="boot"><div class="bwrap">
 <div class="ring"><svg class="rg" viewBox="0 0 100 100"><circle class="r0" cx="50" cy="50" r="46"/><circle class="r1" id="b_r" cx="50" cy="50" r="46"/><g class="sp"><circle cx="50" cy="50" r="46"/></g></svg><i class="mk"><svg><use href="#i-bolt"/></svg></i></div>
 <svg class="dr" viewBox="0 0 76 36" aria-label="DR"><use href="#i-dr"/></svg><div class="bt">CPANEL</div>
 <div class="bs"><span id="b_s">در حال بارگذاری…</span><b id="b_p">0%</b></div>
-<div class="bsteps"><div class="st"><em class="tk"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></em><span class="lb">احراز هویت</span><i><b></b></i></div><div class="st"><em class="tk"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></em><span class="lb">داده‌های سرور</span><i><b></b></i></div><div class="st"><em class="tk"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></em><span class="lb">رابط کاربری</span><i><b></b></i></div></div></div></div>
+<div class="bsteps"><div class="bst"><em class="tk"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></em><span class="lb">احراز هویت</span><i><b></b></i></div><div class="bst"><em class="tk"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></em><span class="lb">داده‌های سرور</span><i><b></b></i></div><div class="bst"><em class="tk"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></em><span class="lb">رابط کاربری</span><i><b></b></i></div></div></div></div>
 <div id="login" class="hide"><button class="ibtn lng lgl" type="button" title="زبان"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9S14.5 18.3 12 21c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z"/></svg><span class="lc">EN</span></button><div class="lbox"><div class="lin">
 <div class="hero"><i class="mk"><svg><use href="#i-bolt"/></svg></i><svg class="dr" viewBox="0 0 76 36" aria-label="DR"><use href="#i-dr"/></svg><h2>CPanel</h2><p>ورود به پنل مدیریت تانل</p></div>
 <label for="pw">رمز عبور</label>
 <div class="pwf"><svg class="ic lk" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus spellcheck="false" autocapitalize="off"><button class="eye" id="eye" type="button" title="نمایش رمز"><svg class="ic" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
 <button class="btn p go" id="lb" type="button">ورود<svg class="ic" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
-</div><div class="ft"><a class="by" href="https://t.me/DR_Gojo_Satoruu" target="_blank" rel="noopener">Telegram @DR_Gojo_Satoruu</a></div></div></div>
+</div><div class="ft"><a class="fgl" href="https://github.com/behymin12345-hash/DR-CPanel" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-gh"/></svg>GitHub</a><i class="fd"></i><a class="fgl" href="https://t.me/DR_Gojo_Satoruu" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-tg"/></svg>@DR_Gojo_Satoruu</a></div></div></div>
 
 <div class="layout hide" id="app">
 <header class="top"><div class="brand"><i class="mk"><svg><use href="#i-bolt"/></svg></i><svg class="dr" viewBox="0 0 76 36" aria-label="DR"><use href="#i-dr"/></svg><div class="tt"><b>CPanel</b><small><span id="host"></span> · <span id="ver"></span></small></div></div>
 <div class="tools"><button class="ibtn lng" type="button" title="زبان"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9S14.5 18.3 12 21c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z"/></svg><span class="lc">EN</span></button><button class="ibtn" id="thm" title="تم"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18a9 9 0 0 0 0-18z" fill="currentColor"/></svg><span>ظاهر</span></button><button class="ibtn sq" id="out" title="خروج"><svg class="ic" viewBox="0 0 24 24"><path d="M9 4H5v16h4M16 8l4 4-4 4M20 12H9"/></svg></button></div></header>
-<nav class="tabs"><div class="seg"><button class="nav on" data-p="dash"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>داشبورد</span></button><button class="nav" data-p="tun"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg><span>تانل‌ها</span></button><button class="nav" data-p="health"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg><span>بررسی سلامت</span></button><button class="nav" data-p="logs"><svg class="ic" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7"/></svg><span>لاگ‌ها</span></button><button class="nav" data-p="set"><svg class="ic" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span>تنظیمات</span></button></div></nav>
+<nav class="tabs"><div class="seg"><i class="ind" id="ind" aria-hidden="true"></i><button class="nav on" data-p="dash"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>داشبورد</span></button><button class="nav" data-p="tun"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg><span>تانل‌ها</span></button><button class="nav" data-p="trans"><svg class="ic" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span>ترنسپورت</span></button><button class="nav" data-p="health"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg><span>بررسی سلامت</span></button><button class="nav" data-p="logs"><svg class="ic" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7"/></svg><span>لاگ‌ها</span></button><button class="nav" data-p="set"><svg class="ic" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span>تنظیمات</span></button></div></nav>
 <main>
 <section id="p_dash">
 <div class="sec">سرور</div>
@@ -944,11 +1467,22 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="cell"><div class="hd"><b class="v sm" id="t_fw">—</b></div><div class="s" id="t_cc">—</div></div>
 </div>
 <div class="sec">وضعیت تانل‌ها</div>
-<div class="card"><div class="tbl"><table><thead><tr><th>نام</th><th>مسیر</th><th>وضعیت</th><th>پینگ</th><th>نمودار</th><th>سرعت</th></tr></thead><tbody id="tb_d"></tbody></table></div></div></section>
+<div class="card"><div class="srch"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q_d" placeholder="جستجو (نام، پورت، آی‌پی)…" autocomplete="off"><button class="clr hide" id="q_dx" type="button" title="پاک کردن"><svg class="ic" style="width:13px;height:13px" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div><div class="tbl"><table><thead><tr><th>نام</th><th>مسیر</th><th>وضعیت</th><th>پینگ</th><th>نمودار</th><th>سرعت</th></tr></thead><tbody id="tb_d"></tbody></table></div></div></section>
 
 <section id="p_tun" class="hide"><div class="bar"><h1 style="margin:0">تانل‌ها</h1><button class="btn p" id="add">+ افزودن تانل</button></div>
-<div class="card"><div class="tbl"><table><thead><tr><th>#</th><th>نام</th><th>پروتکل</th><th>پورت ورودی</th><th>مقصد</th><th>وضعیت</th><th>پینگ</th><th>حجم (مصرف / سقف)</th><th></th></tr></thead><tbody id="tb_m"></tbody></table></div></div></section>
+<div class="card"><div class="srch"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q_s" placeholder="جستجو (نام، پورت، آی‌پی)…" autocomplete="off"><button class="clr hide" id="q_sx" type="button" title="پاک کردن"><svg class="ic" style="width:13px;height:13px" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div><div class="tbl"><table><thead><tr><th>#</th><th>نام</th><th>پروتکل</th><th>پورت ورودی</th><th>مقصد</th><th>وضعیت</th><th>پینگ</th><th>حجم (مصرف / سقف)</th><th></th></tr></thead><tbody id="tb_m"></tbody></table></div></div></section>
 
+<section id="p_trans" class="hide"><div class="bar"><h1 style="margin:0">ترنسپورت</h1></div>
+<div class="card"><h2 style="margin-top:0;font-size:16px">تانل رمزنگاری‌شده (WireGuard)</h2>
+<div class="hint" style="margin:0 0 12px">ارتباط سرور ایران و سرور خارج را در هسته لینوکس رمزنگاری می‌کند (ChaCha20، سرعت بالا). فورواردها، حجم، سلامت و امنیت تانل بدون تغییر کار می‌کنند. فقط یک دستور روی سرور خارج اجرا می‌شود. ابتدا تانل را بساز، دستور را روی سرور خارج بزن، بعد با «تست» مقایسه کن و «فعال‌سازی» را بزن.</div>
+<div style="overflow-x:auto"><table><thead><tr><th>سرور خارج</th><th>پورت UDP</th><th>وضعیت لینک</th><th>ترافیک</th><th>مسیر فورواردها</th><th></th></tr></thead><tbody id="tb_t"></tbody></table></div>
+<div class="row" style="margin-top:14px"><div><label>IP سرور خارج</label><input id="t_i" list="t_dl" placeholder="1.2.3.4" autocomplete="off"><datalist id="t_dl"></datalist></div><div><label>پورت UDP</label><input id="t_udp" value="51820" inputmode="numeric"></div><div style="flex:0 0 auto;align-self:end"><button class="btn p" id="t_add">ساخت تانل</button></div></div></div>
+<div class="card" id="t_sc" style="display:none;margin-top:16px"><h2 style="margin-top:0;font-size:16px">این دستور را روی سرور خارج (root) اجرا کن</h2>
+<div class="hint" style="margin:0 0 10px">فقط یک‌بار. بعد از اجرا حدود ۱۰ ثانیه صبر کن تا وضعیت لینک «متصل» شود. این متن شامل کلید خصوصی سرور خارج است؛ آن را جایی منتشر نکن.</div>
+<textarea id="t_sx" rows="9" readonly style="font-size:12px"></textarea><div class="acts"><button class="btn p" id="t_cp">کپی</button></div></div>
+<div class="card" style="margin-top:16px"><h2 style="margin-top:0;font-size:16px">تست ترنسپورت</h2>
+<div class="hint" style="margin:0 0 12px">مسیر مستقیم و تانل رمزنگاری‌شده را با هم مقایسه می‌کند (تأخیر، نوسان و ازدست‌رفتن بسته) و بهترین را پیشنهاد می‌دهد.</div>
+<div class="row"><div><label>سرور خارج</label><select id="t_ti"></select></div><div><label>پورت سرویس روی سرور خارج (خالی = خودکار)</label><input id="t_tp" inputmode="numeric"></div><div style="flex:0 0 auto;align-self:end"><button class="btn p" id="t_run">اجرای تست</button></div></div><div id="t_res" style="margin-top:12px"></div></div></section>
 <section id="p_health" class="hide"><div class="bar"><h1 style="margin:0">بررسی سلامت</h1><button class="btn p" id="hrun">اجرای بررسی</button></div><div class="card" id="hl"><div class="empty">برای شروع «اجرای بررسی» را بزنید</div></div></section>
 <section id="p_logs" class="hide"><h1>لاگ‌ها</h1><div class="card"><div class="lg" id="lg"></div></div></section>
 
@@ -973,7 +1507,15 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="card"><h2 style="margin-top:0;font-size:16px">بکاپ و بازیابی</h2>
 <div class="hint" style="margin:0 0 10px">بکاپ شامل تانل‌ها، تنظیمات پنل، رمز و گواهی است. بازیابی فقط لیست تانل‌ها را برمی‌گرداند.</div>
 <div class="acts" style="margin:0"><button class="btn p" id="k_d">دانلود بکاپ</button><button class="btn" id="k_r">بازیابی از فایل</button><input id="k_f" type="file" accept=".gz,.tgz" class="hide"></div></div></section>
-</main></div>
+</main>
+<footer class="foot"><div class="fin">
+<a class="fgl" href="https://t.me/DR_Gojo_Satoruu" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-tg"/></svg><span>@DR_Gojo_Satoruu</span></a>
+<i class="fd"></i>
+<a class="fgl" href="https://github.com/behymin12345-hash/DR-CPanel" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-gh"/></svg><span>GitHub · DR-CPanel</span></a>
+<i class="fd"></i>
+<span class="fver" id="fver">v2.7.0</span>
+</div></footer>
+</div>
 
 <div class="modal" id="m"><div class="box"><h3>افزودن تانل جدید</h3>
 <div class="row"><div><label>پورت ورودی (این سرور)</label><input id="f_l" placeholder="8899,2044" dir="ltr" autocomplete="off"></div><div><label>پروتکل</label><select id="f_p"><option>tcp</option><option>udp</option><option>both</option></select></div></div>
@@ -984,12 +1526,19 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="acts"><button class="btn p" id="q_ok">ذخیره</button><button class="btn" id="q_x">بستن</button><button class="btn d" id="q_r">ریست مصرف</button></div></div></div>
 <div class="modal" id="sm"><div class="box"><h3 id="s_t">لینک کاربر</h3><div class="hint" style="margin:0 0 10px">صفحه‌ای فقط‌خواندنی که کاربر بدون ورود به پنل، حجم مصرف‌شده و باقی‌مانده‌اش را می‌بیند. آدرس آن حدس‌زدنی نیست.</div><div id="s_b"></div>
 <div class="acts"><button class="btn" id="s_x">بستن</button></div></div></div>
+<div class="modal" id="cm"><div class="box"><h3 id="c_t">امنیت تانل</h3><div class="hint" style="margin:0 0 10px">این محدودیت‌ها فقط روی پورت همین تانل اعمال می‌شوند و ترافیک را دست‌نخورده عبور می‌دهند.</div>
+<label>آی‌پی‌های مجاز (هر خط یا با کاما؛ خالی = همه)</label><textarea id="c_a" rows="3" class="ltr" placeholder="1.2.3.4 / 5.6.0.0/16"></textarea>
+<div class="row" style="margin-top:10px"><div><label>حداکثر اتصال همزمان هر آی‌پی (۰ = خاموش)</label><input id="c_m" type="number" min="0"></div><div><label>اتصال جدید در دقیقه برای هر آی‌پی (۰ = خاموش)</label><input id="c_r" type="number" min="0"></div></div>
+<div class="qs er" id="c_w" style="display:none;margin-top:10px">فقط آی‌پی‌های داخل لیست به این پورت می‌رسند. مطمئن شو آی‌پی مشتری‌ها داخل لیست است.</div>
+<div class="acts"><button class="btn p" id="c_ok">ذخیره</button><button class="btn" id="c_x">بستن</button></div></div></div>
 <div id="toast"></div>
 <script>
-const $=id=>document.getElementById(id);let prev=null,timer=null,page="dash";
+const $=id=>document.getElementById(id);let prev=null,timer=null,page="dash",SP={};
 let LANG="fa";try{LANG=localStorage.getItem("drl")==="en"?"en":"fa"}catch(e){}
 const EN={"ورود به پنل مدیریت تانل": "Sign in to the tunnel manager", "رمز عبور": "Password", "نمایش رمز": "Show password", "ورود": "Sign in", "تم": "Theme", "ظاهر": "Appearance", "خروج": "Sign out", "داشبورد": "Dashboard", "تانل‌ها": "Tunnels", "بررسی سلامت": "Health check", "لاگ‌ها": "Logs", "تنظیمات": "Settings", "سرور": "Server", "دیسک": "Disk", "تانل": "Tunnels", "ترافیک کل": "Total traffic", "سرعت لحظه‌ای": "Live speed", "وضعیت تانل‌ها": "Tunnel status", "نام": "Name", "مسیر": "Route", "وضعیت": "Status", "پینگ": "Ping", "نمودار": "Chart", "سرعت": "Speed", "+ افزودن تانل": "+ Add tunnel", "پروتکل": "Protocol", "پورت ورودی": "Listen port", "مقصد": "Destination", "حجم (مصرف / سقف)": "Quota (used / limit)", "اجرای بررسی": "Run check", "برای شروع «اجرای بررسی» را بزنید": "Press “Run check” to start", "تلگرام (اعلان قطع/وصل و منابع)": "Telegram (up/down and resource alerts)", "آدرس API تلگرام (اختیاری — برای سرور ایران با پروکسی/ورکر)": "Telegram API address (optional — for Iran servers via proxy/worker)", "ذخیره": "Save", "ارسال پیام تست": "Send test message", "دامنه و HTTPS": "Domain & HTTPS", "دامنه (باید به IP همین سرور اشاره کند)": "Domain (must point to this server's IP)", "ایمیل (اختیاری)": "Email (optional)", "برای گرفتن گواهی Let's Encrypt پورت ۸۰ باید آزاد باشد. تمدید خودکار انجام می‌شود. لینک کاربران هم روی همین دامنه و HTTPS کار می‌کند.": "To get a Let's Encrypt certificate, port 80 must be free. Renewal is automatic. User links also work on this domain over HTTPS.", "دریافت گواهی و فعال‌سازی": "Get certificate & enable", "حذف دامنه": "Remove domain", "یا گواهی خودم را وارد می‌کنم": "Or I'll enter my own certificate", "نصب گواهی": "Install certificate", "تغییر رمز": "Change password", "رمز فعلی": "Current password", "رمز جدید (حداقل ۸ کاراکتر)": "New password (min. 8 characters)", "بکاپ و بازیابی": "Backup & restore", "بکاپ شامل تانل‌ها، تنظیمات پنل، رمز و گواهی است. بازیابی فقط لیست تانل‌ها را برمی‌گرداند.": "The backup includes tunnels, panel settings, password and certificate. Restore only brings back the tunnel list.", "دانلود بکاپ": "Download backup", "بازیابی از فایل": "Restore from file", "افزودن تانل جدید": "Add new tunnel", "پورت ورودی (این سرور)": "Listen port (this server)", "IP سرور خارج": "Foreign server IP", "پورت مقصد (خالی = برابر)": "Destination port (empty = same)", "نام (اختیاری)": "Name (optional)", "انصراف": "Cancel", "حجم تانل": "Tunnel quota", "حجم تانل —": "Tunnel quota —", "بستن": "Close", "ریست مصرف": "Reset usage", "لینک کاربر": "User link", "صفحه‌ای فقط‌خواندنی که کاربر بدون ورود به پنل، حجم مصرف‌شده و باقی‌مانده‌اش را می‌بیند. آدرس آن حدس‌زدنی نیست.": "A read-only page where the user can see used and remaining data without signing in to the panel. Its address is not guessable.", "خطا": "Error", "آنلاین": "online", "قطع": "offline", "نامشخص": "unknown", "آنلاین ·": "online ·", "هنوز تانلی نساخته‌اید": "No tunnels yet", "حجم تمام": "Quota reached", "تست": "Test", "حجم": "Quota", "لینک": "Link", "حذف": "Delete", "UDP قابل تست نیست": "UDP can't be tested", "مقصد پاسخ نمی‌دهد": "Destination is not responding", "اتصال موفق ·": "Connected ·", "این تانل حذف شود؟": "Delete this tunnel?", "حذف شد": "Deleted", "تانل اضافه شد": "Tunnel added", "در حال بررسی…": "Checking…", "لاگی ثبت نشده": "No logs yet", "•••••• (ذخیره شده — برای تغییر وارد کنید)": "•••••• (saved — enter a new one to change)", "فعال: https://": "Active: https://", "بدون دامنه: گواهی self-signed (مرورگر هشدار می‌دهد)": "No domain: self-signed certificate (the browser will warn)", "HTTPS خاموش است": "HTTPS is off", "اگر سرور ایران به تلگرام دسترسی ندارد، آدرس یک پروکسی/ورکر سازگار با Bot API را در فیلد API بگذارید.": "If the Iran server can't reach Telegram, put the address of a Bot API–compatible proxy/worker in the API field.", "ذخیره شد": "Saved", "پیام تست ارسال شد": "Test message sent", "ارسال ناموفق:": "Send failed:", "رمز تغییر کرد": "Password changed", "لیست تانل‌ها با محتوای این بکاپ جایگزین شود؟": "Replace the tunnel list with this backup's contents?", "بازیابی شد": "Restored", "رمز را وارد کنید": "Enter the password", "مصرف": "Used", "سقف": "Limit", "نامحدود": "Unlimited", "باقی‌مانده": "Remaining", "حجم تمام شده و تانل قطع است. با بالا بردن سقف یا ریست مصرف، خودکار وصل می‌شود.": "The quota is used up and the tunnel is cut off. Raising the limit or resetting usage reconnects it automatically.", "مقدار دلخواه": "Custom amount", "افزودن به سقف:": "Add to limit:", "سقف حجم ذخیره شد": "Quota limit saved", "سقف حجم برداشته شد": "Quota limit removed", "مصرف این تانل صفر شود؟": "Reset this tunnel's usage to zero?", "مصرف صفر شد": "Usage reset", "لینک کاربر —": "User link —", "کپی لینک": "Copy link", "لینک جدید": "New link", "حذف لینک": "Delete link", "ساخت لینک": "Create link", "کپی شد": "Copied", "لینک قبلی از کار می‌افتد. ادامه؟": "The old link will stop working. Continue?", "لینک حذف شود؟": "Delete the link?", "دامنه را وارد کنید": "Enter a domain", "گواهی گرفته می‌شود و پنل ری‌استارت می‌شود. ادامه؟": "A certificate will be issued and the panel will restart. Continue?", "در حال دریافت گواهی؛ تا دو دقیقه صبر کنید…": "Getting the certificate; wait up to two minutes…", "فعال شد؛ در حال انتقال به دامنه…": "Enabled; redirecting to the domain…", "دامنه حذف شود و گواهی self-signed برگردد؟": "Remove the domain and go back to the self-signed certificate?", "انجام شد؛ پنل ری‌استارت می‌شود": "Done; the panel is restarting", "گواهی نصب شد؛ پنل ری‌استارت می‌شود": "Certificate installed; the panel is restarting", "رنگ‌بندی و ظاهر": "Colors & appearance", "رنگ اصلی پنل را انتخاب کنید؛ روی دکمه‌ها، تب فعال، نوارها و نمودارها اعمال می‌شود.": "Pick the panel's main color. It applies to buttons, the active tab, meters and charts.", "زبان": "Language", "در حال بارگذاری…": "Loading…", "احراز هویت": "Authentication", "داده‌های سرور": "Server metrics", "رابط کاربری": "Interface"};
 const FA={"Wrong password": "رمز اشتباه است", "Too many attempts, try later": "تلاش‌های زیاد؛ بعداً امتحان کنید", "Too many requests": "درخواست‌های زیاد؛ کمی صبر کنید", "Current password is wrong": "رمز فعلی اشتباه است", "New password must be at least 8 characters": "رمز جدید باید حداقل ۸ کاراکتر باشد", "A forward on this port already exists": "برای این پورت قبلاً تانل ساخته شده", "Invalid IP": "آی‌پی نامعتبر است", "Invalid port": "پورت نامعتبر است", "Port out of range": "پورت خارج از محدوده است", "Invalid protocol": "پروتکل نامعتبر است", "Invalid domain": "دامنه نامعتبر است", "Invalid email": "ایمیل نامعتبر است", "This port is used by the web panel": "این پورت توسط خود پنل استفاده می‌شود", "No such rule": "چنین تانلی وجود ندارد", "Server error": "خطای سرور", "Bad request": "درخواست نامعتبر", "Too large": "حجم داده زیاد است", "Bad action": "عملیات نامعتبر", "Port 80 is busy: Let's Encrypt needs it for a moment": "پورت ۸۰ اشغال است؛ Let's Encrypt لحظه‌ای به آن نیاز دارد", "API address must start with https://": "آدرس API باید با https:// شروع شود", "No forwards found in this file": "در این فایل تانلی پیدا نشد", "Certificate and key are invalid or do not match": "گواهی و کلید نامعتبر یا ناهمخوان‌اند", "Certificate and key must be PEM text": "گواهی و کلید باید متن PEM باشند"};
+Object.assign(EN,{"ترنسپورت":"Transport","تانل رمزنگاری‌شده (WireGuard)":"Encrypted tunnel (WireGuard)","سرور خارج":"Foreign server","پورت UDP":"UDP port","وضعیت لینک":"Link status","ترافیک":"Traffic","مسیر فورواردها":"Forwards via","متصل":"Linked","بدون handshake":"No handshake","مستقیم":"Direct","ساخت تانل":"Create tunnel","دستور سرور خارج":"Foreign setup script","برگشت به مستقیم":"Back to direct","فعال‌سازی":"Activate","کپی":"Copy","کپی شد":"Copied","انجام شد":"Done","هنوز تانلی ساخته نشده":"No tunnels yet","تست ترنسپورت":"Transport test","اجرای تست":"Run test","پاسخ می‌دهد":"Responds","بی‌پاسخ":"No answer","میانگین":"Average","کمترین / بیشترین":"Min / Max","نوسان":"Jitter","ازدست‌رفتن":"Loss","حذف همه":"Delete all","این تانل حذف شود؟ فورواردها به حالت مستقیم برمی‌گردند.":"Remove this tunnel? Its forwards go back to direct.","همه پورت‌های این سرور حذف شوند؟":"Delete every port of this server?","در حال تست… (حدود ۲۰ ثانیه)":"Testing… (about 20 s)","در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…":"Creating (installing WireGuard can take a moment)…","این دستور را روی سرور خارج (root) اجرا کن":"Run this on the foreign server (root)","IP سرور خارج":"Foreign server IP","حذف شد":"Deleted","امنیت تانل ذخیره شد":"Tunnel security saved","امنیت تانل":"Tunnel security","امنیت":"Security","این محدودیت‌ها فقط روی پورت همین تانل اعمال می‌شوند و ترافیک را دست‌نخورده عبور می‌دهند.":"These limits apply only to this tunnel's port and pass traffic through untouched.","آی‌پی‌های مجاز (هر خط یا با کاما؛ خالی = همه)":"Allowed IPs (one per line or comma-separated; empty = anyone)","حداکثر اتصال همزمان هر آی‌پی (۰ = خاموش)":"Max simultaneous connections per IP (0 = off)","اتصال جدید در دقیقه برای هر آی‌پی (۰ = خاموش)":"New connections per minute per IP (0 = off)","فقط آی‌پی‌های داخل لیست به این پورت می‌رسند. مطمئن شو آی‌پی مشتری‌ها داخل لیست است.":"Only the listed IPs can reach this port. Make sure your clients' IPs are in the list.","پورت":"port","جستجو (نام، پورت، آی‌پی)…":"Search name, port, IP…","موردی پیدا نشد":"No matches found","پاک کردن":"Clear","نشست منقضی شد":"Session expired — sign in again"});
+Object.assign(FA,{"Invalid IP or network":"آی‌پی یا شبکه نامعتبر است","Too many IPs":"تعداد آی‌پی‌ها زیاد است","Numbers out of range":"عدد خارج از محدوده است","Session expired — sign in again":"نشست منقضی شد — دوباره وارد شوید"});
 const RE=new RegExp(Object.keys(EN).sort((a,b)=>b.length-a.length).map(k=>k.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|"),"g");
 const TX=s=>{s=String(s);return LANG==="en"?s.replace(RE,m=>EN[m]):(FA[s]||s)};
 const cf=s=>confirm(TX(s));
@@ -1000,57 +1549,114 @@ function tAttr(el){for(const a of["placeholder","title"]){if(!el.hasAttribute(a)
 function tAll(r){if(r.nodeType===1)tAttr(r);walk(r,tNode);r.querySelectorAll&&r.querySelectorAll("[placeholder],[title]").forEach(tAttr)}
 new MutationObserver(ms=>{if(LANG!=="en")return;for(const m of ms){if(m.type==="characterData")tNode(m.target);else if(m.type==="attributes")tAttr(m.target);else m.addedNodes.forEach(n=>{if(n.nodeType===3)tNode(n);else if(n.nodeType===1)tAll(n)})}}).observe(document.body,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:["placeholder","title"]});
 function setLang(l){LANG=l==="en"?"en":"fa";try{localStorage.setItem("drl",LANG)}catch(e){}const d=document.documentElement;d.lang=LANG;d.dir=LANG==="en"?"ltr":"rtl";tAll(document.body);
- document.querySelectorAll(".lng .lc").forEach(e=>e.textContent=LANG==="en"?"FA":"EN");document.querySelectorAll("[data-l]").forEach(b=>b.classList.toggle("on",b.dataset.l===LANG));buildSw();bootDraw()}
-let ACC="mono";try{ACC=localStorage.getItem("drc")||"mono"}catch(e){}
-const ACS=[["mono","سفید","Mono"],["#3b82f6","آبی","Blue"],["#8b5cf6","بنفش","Violet"],["#ec4899","صورتی","Pink"],["#ef4444","قرمز","Red"],["#f97316","نارنجی","Orange"],["#f59e0b","زرد","Amber"],["#22c55e","سبز","Green"],["#06b6d4","فیروزه\u200cای","Cyan"]];
+ document.querySelectorAll(".lng .lc").forEach(e=>e.textContent=LANG==="en"?"FA":"EN");document.querySelectorAll("[data-l]").forEach(b=>b.classList.toggle("on",b.dataset.l===LANG));buildSw();bootDraw();requestAnimationFrame(moveInd)}
+let ACC="#8b5cf6";try{ACC=localStorage.getItem("drc")||"#8b5cf6"}catch(e){}
+const ACS=[["mono","سفید","Mono"],["#8b5cf6","بنفش","Violet"],["#6366f1","ایندیگو","Indigo"],["#3b82f6","آبی","Blue"],["#06b6d4","فیروزه‌ای","Cyan"],["#22c55e","سبز","Green"],["#f59e0b","زرد","Amber"],["#ef4444","قرمز","Red"],["#ec4899","صورتی","Pink"]];
 const fgc=h=>{const n=parseInt(h.slice(1),16),r=n>>16,g=n>>8&255,b=n&255;return(r*299+g*587+b*114)/1000>155?"#0a0a0a":"#fff"};
+const mix=(a,b,t)=>{const A=parseInt(a.slice(1),16),B=parseInt(b.slice(1),16),c=i=>Math.round(((A>>i&255)*(1-t)+(B>>i&255)*t));return"#"+[16,8,0].map(i=>c(i).toString(16).padStart(2,"0")).join("")};
+const ACG={"mono":"#c8c8ce","#8b5cf6":"#6366f1","#6366f1":"#3b82f6","#3b82f6":"#06b6d4","#06b6d4":"#3b82f6","#22c55e":"#06b6d4","#f59e0b":"#ef4444","#ef4444":"#f97316","#ec4899":"#8b5cf6"};
 function markSw(){document.querySelectorAll("#sws .sw").forEach(e=>{if(e.classList.contains("cu")){const cu=!ACS.some(a=>a[0]===ACC);e.classList.toggle("on",cu);e.style.setProperty("--c",cu?ACC:"var(--tx)")}else e.classList.toggle("on",e.dataset.c===ACC)})}
 function setAc(c){ACC=/^#[0-9a-f]{6}$/i.test(c)?c:"mono";try{localStorage.setItem("drc",ACC)}catch(e){}const st=document.body.style;
- if(ACC==="mono")["--ac","--acf","--pr"].forEach(k=>st.removeProperty(k));else{st.setProperty("--ac",ACC);st.setProperty("--acf",fgc(ACC));st.setProperty("--pr",ACC)}markSw()}
-function buildSw(){const en=LANG==="en";$("sws").innerHTML=ACS.map(([v,f,e])=>`<button class="sw" type="button" data-c="${v}" style="--c:${v==="mono"?"var(--tx)":v}" title="${en?e:f}"></button>`).join("")+`<label class="sw cu" title="${en?"Custom":"دلخواه"}"><input type="color" id="ac_c" value="${/^#/.test(ACC)?ACC:"#3b82f6"}"></label>`;markSw()}
+ if(ACC==="mono"){["--ac","--acf","--pr","--acr"].forEach(k=>st.removeProperty(k));st.setProperty("--acg",ACG.mono);st.setProperty("--acp","#8b5cf6")}
+ else{const g=ACG[ACC]||mix(ACC,"#6366f1",.4);st.setProperty("--ac",ACC);st.setProperty("--acf",fgc(ACC));st.setProperty("--pr",ACC);st.setProperty("--acg",g);st.setProperty("--acp",mix(ACC,"#ec4899",.45));
+  const n=parseInt(ACC.slice(1),16);st.setProperty("--acr",(n>>16&255)+","+(n>>8&255)+","+(n&255))}
+ markSw()}
+function buildSw(){const en=LANG==="en";$("sws").innerHTML=ACS.map(([v,f,e])=>`<button class="sw" type="button" data-c="${v}" style="--c:${v==="mono"?"var(--tx)":v}" title="${en?e:f}"></button>`).join("")+`<label class="sw cu" title="${en?"Custom":"دلخواه"}"><input type="color" id="ac_c" value="${/^#/.test(ACC)?ACC:"#8b5cf6"}"></label>`;markSw()}
 const B={el:$("boot"),shown:0,target:0,t:0,min:1200,iv:0},PCT=[12,46,78,100];
-function bootDraw(){const n=B.shown;B.el.querySelectorAll(".st").forEach((e,i)=>{e.className="st"+(i<n?" ok":i===n?" run":"")});$("b_r").style.strokeDashoffset=289*(1-PCT[n]/100);$("b_s").textContent=TX("در حال بارگذاری…");$("b_p").textContent=PCT[n]+"%";B.el.classList.toggle("done",n>=3)}
+function bootDraw(){const n=B.shown;B.el.querySelectorAll(".bst").forEach((e,i)=>{e.className="bst"+(i<n?" ok":i===n?" run":"")});$("b_r").style.strokeDashoffset=289*(1-PCT[n]/100);$("b_s").textContent=TX("در حال بارگذاری…");$("b_p").textContent=PCT[n]+"%";B.el.classList.toggle("done",n>=3)}
 function bootOut(){clearInterval(B.iv);B.el.classList.add("out");setTimeout(()=>B.el.classList.add("hide"),650)}
 function bootStart(n,min){B.shown=B.target=n;B.t=Date.now();B.min=min;B.el.classList.remove("hide","out");bootDraw();clearInterval(B.iv);B.iv=setInterval(()=>{if(B.shown<B.target){B.shown++;bootDraw()}else if(B.shown>=3&&Date.now()-B.t>=B.min)bootOut()},380)}
 function bootGo(n){if(n>B.target)B.target=n}
 function bootFast(){if(B.el.classList.contains("hide")||B.el.classList.contains("out"))return;clearInterval(B.iv);B.shown=B.target=3;bootDraw();setTimeout(bootOut,220)}
 
+/* ---------------- sliding tab indicator ---------------- */
+function moveInd(){const s=document.querySelector(".seg"),a=s&&s.querySelector(".nav.on"),i=$("ind");if(!a||!i)return;i.style.width=a.offsetWidth+"px";i.style.transform="translateX("+a.offsetLeft+"px)"}
+window.addEventListener("resize",moveInd);
+
+/* ---------------- helpers ---------------- */
 const nv=t=>{const i=t.indexOf(" ");return t.slice(0,i)+"<small>"+t.slice(i+1)+"</small>"};
 const HD=Array(22).fill(0),HU=Array(22).fill(0);function hist(id,a,v){a.push(v);if(a.length>22)a.shift();const m=Math.max(...a,1);$(id).innerHTML=a.map(x=>`<i style="height:${Math.max(8,x/m*100)}%"></i>`).join("")}
 const hb=b=>{const u=["B","KB","MB","GB","TB"];let i=0;b=b||0;while(b>=1024&&i<4){b/=1024;i++}return b.toFixed(i?1:0)+" "+u[i]};
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const toast=(t,k)=>{const e=document.createElement("div");e.className="t "+(k||"");e.textContent=TX(t);$("toast").appendChild(e);setTimeout(()=>e.remove(),3500)};
+function animNum(el,to,fmt){const A=el._an||(el._an={v:0});if(A.raf)cancelAnimationFrame(A.raf);const from=A.v,t0=performance.now(),D=520;
+ const step=t=>{const p=Math.min(1,(t-t0)/D),e=1-Math.pow(1-p,3);A.v=from+(to-from)*e;el.innerHTML=fmt(A.v);if(p<1)A.raf=requestAnimationFrame(step)};A.raf=requestAnimationFrame(step)}
+const toast=(t,k)=>{const e=document.createElement("div");e.className="t "+(k||"");e.textContent=TX(t);e.onclick=()=>e.remove();$("toast").appendChild(e);setTimeout(()=>e.remove(),3500)};
 async function api(p,m,b){const r=await fetch("/api/"+p,{method:m||"GET",headers:{"Content-Type":"application/json"},body:b?JSON.stringify(b):undefined});
- let j={};try{j=await r.json()}catch(e){}if(r.status===401&&p!=="login"){show(false);throw new Error("auth")}if(!r.ok)throw new Error(j.error||"خطا");return j}
-function show(on){$("app").classList.toggle("hide",!on);$("login").classList.toggle("hide",on);clearInterval(timer);if(on){bootGo(1);load().then(()=>bootGo(3));timer=setInterval(tick,3000)}else{bootFast();$("pw").focus()}}
+ let j={};try{j=await r.json()}catch(e){}if(r.status===401&&p!=='login'){show(false);throw new Error("نشست منقضی شد")}if(!r.ok)throw new Error(j.error||"خطا");return j}
+function show(on){if(!on&&!$("login").classList.contains("hide")){clearInterval(timer);return}
+ $("app").classList.toggle("hide",!on);$("login").classList.toggle("hide",on);clearInterval(timer);
+ if(on){bootGo(1);load().then(()=>bootGo(3));timer=setInterval(tick,3000);requestAnimationFrame(moveInd)}else{bootFast();$("pw").focus()}}
 function tick(){load();if(page==="logs")logs()}
 async function load(){try{render(await api("state"))}catch(e){}}
-function nav(p){page=p;document.querySelectorAll(".nav[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p===p));
- ["dash","tun","health","logs","set"].forEach(x=>$("p_"+x).classList.toggle("hide",x!==p));if(p==="logs")logs();if(p==="set")settings()}
+function nav(p){page=p;document.querySelectorAll(".nav[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p===p));moveInd();
+ ["dash","tun","trans","health","logs","set"].forEach(x=>{const el=$("p_"+x);el.classList.toggle("hide",x!==p);if(x===p){el.style.animation="none";void el.offsetWidth;el.style.animation=""}});
+ if(p==="trans")trLoad();if(p==="logs")logs();if(p==="set")settings()}
 document.querySelectorAll(".nav[data-p]").forEach(b=>b.onclick=()=>nav(b.dataset.p));
 function spark(h){const v=(h||[]).map(x=>x==null?-1:x);if(v.length<2)return"";const m=Math.max(...v,1),w=84,H=22,st=w/(v.length-1);
- return `<svg width="${w}" height="${H}">`+v.map((x,i)=>x<0?`<line x1="${i*st}" x2="${i*st}" y1="3" y2="${H}" stroke="#ff5d6c" stroke-width="2"/>`:"").join("")+
- `<polyline fill="none" stroke="#4f8cff" stroke-width="1.6" points="${v.map((x,i)=>x<0?"":(i*st).toFixed(1)+","+(H-2-(x/m)*(H-4)).toFixed(1)).filter(Boolean).join(" ")}"/></svg>`}
+ return `<svg width="${w}" height="${H}">`+v.map((x,i)=>x<0?`<line x1="${i*st}" x2="${i*st}" y1="3" y2="${H}" style="stroke:var(--er)" stroke-width="2"/>`:"").join("")+
+ `<polyline fill="none" style="stroke:var(--ac)" stroke-width="1.6" points="${v.map((x,i)=>x<0?"":(i*st).toFixed(1)+","+(H-2-(x/m)*(H-4)).toFixed(1)).filter(Boolean).join(" ")}"/></svg>`}
 const pill=s=>`<span class="pill ${s}">${{up:"آنلاین",down:"قطع",unknown:"نامشخص"}[s]}</span>`;
 function bar(id,p){$("b_"+id).style.width=Math.min(100,p)+"%"}
-function render(s){
- const y=s.sys||{};$("host").textContent=s.host;$("ver").textContent="v"+s.ver;
- $("c_cpu").innerHTML=(y.cpu||0).toFixed(0)+"<small>%</small>";bar("cpu",y.cpu||0);$("s_load").textContent="load "+(y.load||0).toFixed(2)+" · up "+Math.floor((y.up||0)/86400)+"d "+Math.floor((y.up||0)%86400/3600)+"h";
- const rp=100*(y.ram_used||0)/(y.ram_total||1);$("c_ram").innerHTML=rp.toFixed(0)+"<small>%</small>";bar("ram",rp);$("s_ram").textContent=hb(y.ram_used)+" / "+hb(y.ram_total);
- const dp=100*(y.disk_used||0)/(y.disk_total||1);$("c_dsk").innerHTML=dp.toFixed(0)+"<small>%</small>";bar("dsk",dp);$("s_dsk").textContent=hb(y.disk_used)+" / "+hb(y.disk_total);
- let nd=0,nu=0;if(prev&&prev.t&&y.t>prev.t){nd=(y.rx-prev.rx)/(y.t-prev.t);nu=(y.tx-prev.tx)/(y.t-prev.t)}
- $("c_dn").innerHTML=nv(hb(nd)+"/s");$("c_up").innerHTML=nv(hb(nu)+"/s");hist("h_dn",HD,nd);hist("h_up",HU,nu);$("s_dn").textContent="peak "+hb(Math.max(...HD))+"/s · total "+hb(y.rx);$("s_up").textContent="peak "+hb(Math.max(...HU))+"/s · total "+hb(y.tx);
- let sp={},all=0;if(prev&&prev.now){const dt=s.now-prev.now;s.rules.forEach(r=>{const o=prev.m[r.lport+r.proto];if(o!=null&&dt>0){sp[r.lport+r.proto]=Math.max(0,(r.bytes-o)/dt);all+=sp[r.lport+r.proto]}})}
+
+/* ---------------- tunnel search + click-to-copy ---------------- */
+const FLT={d:"",m:""};
+const fmatch=(r,q)=>!q||(r.name+" "+r.ip+" "+r.lport+" "+r.dport+" "+r.proto).toLowerCase().includes(q);
+function wireSearch(inp,btn,key,redraw){if(!inp)return;
+ inp.addEventListener("input",()=>{FLT[key]=inp.value.trim().toLowerCase();btn.classList.toggle("hide",!FLT[key]);redraw()});
+ btn.onclick=()=>{inp.value="";FLT[key]="";btn.classList.add("hide");redraw();inp.focus()};
+ inp.addEventListener("keydown",e=>{if(e.key==="Escape"){inp.value="";FLT[key]="";btn.classList.add("hide");redraw()}})}
+wireSearch($("q_d"),$("q_dx"),"d",()=>drawDash());
+wireSearch($("q_s"),$("q_sx"),"m",()=>drawTunAll(true));
+document.addEventListener("click",async e=>{const c=e.target.closest("[data-cp]");if(!c)return;
+ const v=c.dataset.cp;try{await navigator.clipboard.writeText(v)}catch(x){const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{document.execCommand("copy")}catch(y){}t.remove()}
+ toast("کپی شد","s")});
+
+/* ---------------- render ---------------- */
+const ms=r=>r.ms==null?"—":r.ms+" ms";
+function drawDash(){const s=window.LAST;if(!s)return;const rs=s.rules.filter(r=>fmatch(r,FLT.d));
+ $("tb_d").innerHTML=rs.length?rs.map(r=>`<tr><td>${esc(r.name)}</td><td class="ltr cp" data-cp="${r.ip}:${r.dport}" title="کپی">${r.lport} → ${r.ip}:${r.dport}</td><td>${pill(r.status)}</td><td class="ltr">${ms(r)}</td><td>${spark(r.hist)}</td><td class="ltr">${hb(SP[r.lport+r.proto]||0)}/s</td></tr>`).join(""):`<tr><td colspan="6" class="empty">${s.rules.length?"موردی پیدا نشد":"هنوز تانلی نساخته‌اید"}</td></tr>`}
+const qcr=r=>{const p=r.limit?Math.min(100,100*r.bytes/r.limit):0,c=r.blocked||p>=90?"var(--er)":p>=70?"var(--wa)":"var(--ok)";return `<div class="ltr">${hb(r.bytes)} / ${r.limit?hb(r.limit):"∞"}</div>${r.limit?`<div class="mb"><i style="width:${p}%;background:${c}"></i></div>`:""}`};
+const ruleSig=r=>[r.name,r.proto,r.lport,r.ip,r.dport,r.status,r.blocked?1:0,r.sub?1:0,r.sec&&(r.sec.allow||r.sec.maxc||r.sec.rate)?1:0,r.enc?1:0].join("|");
+let TSIG="";
+function rowH(r,i,sub){return `<tr${sub?' class="sub"':''}><td>${sub?"":i+1}</td><td>${esc(r.name)}</td><td><span class="tag">${r.proto}</span></td><td class="ltr">${r.lport}</td><td class="ltr cp" data-cp="${r.ip}:${r.dport}" title="کپی">${r.ip}:${r.dport}</td><td>${r.blocked?'<span class="pill down">حجم تمام</span>':pill(r.status)}</td><td class="ltr" data-ms="${i}">${ms(r)}</td><td data-qc="${i}">${qcr(r)}</td><td><button class="btn" onclick="tst(${i+1},this)">تست</button> <button class="btn" onclick="qopen(${i})">حجم</button> <button class="btn" onclick="secopen(${i})">${r.sec&&(r.sec.allow||r.sec.maxc||r.sec.rate)?"🛡 ":""}امنیت</button> <button class="btn" onclick="sopen(${i})">${r.sub?"🔗 ":""}لینک</button> <button class="btn d" onclick="del(${i+1})">حذف</button></td></tr>`}
+function drawTunAll(force){const s=window.LAST;if(!s)return;const q=FLT.m;
+ const sig=s.rules.map(ruleSig).join(";")+"#"+q;
+ if(!force&&sig===TSIG)return;TSIG=sig;let h="";
+ if(q){const idx=[];s.rules.forEach((r,i)=>{if(fmatch(r,q))idx.push(i)});
+  h=idx.length?idx.map(i=>rowH(s.rules[i],i,false)).join(""):`<tr><td colspan="9" class="empty">${s.rules.length?"موردی پیدا نشد":"هنوز تانلی نساخته‌اید"}</td></tr>`}
+ else{const G=new Map();s.rules.forEach((r,i)=>{if(!G.has(r.ip))G.set(r.ip,[]);G.get(r.ip).push(i)});
+  G.forEach((ix,ip)=>{
+   if(ix.length<2){h+=rowH(s.rules[ix[0]],ix[0],false);return}
+   const g=ix.map(i=>s.rules[i]),open=OPEN.has(ip),by=g.reduce((a,r)=>a+r.bytes,0),lim=g.every(r=>r.limit)?g.reduce((a,r)=>a+r.limit,0):0;
+   const dn=g.filter(r=>r.blocked||r.status==="down").length,up=g.filter(r=>r.status==="up").length,m=g.filter(r=>r.ms!=null);
+   const st=dn?`<span class="pill down">${dn}/${g.length} قطع</span>`:up===g.length?pill("up"):pill("unknown");
+   const pr=[...new Set(g.map(r=>r.proto))].map(p=>`<span class="tag">${p}</span>`).join(" "),pt=g.slice(0,6).map(r=>r.lport).join(", ")+(g.length>6?" +"+(g.length-6):"");
+   h+=`<tr class="grp" onclick="tg('${ip}')"><td>${open?"▾":"▸"}</td><td>${g.length} پورت${g[0].enc?" 🔒":""}</td><td>${pr}</td><td class="ltr">${pt}</td><td class="ltr cp" data-cp="${ip}" title="کپی">${ip}</td><td>${st}</td><td class="ltr" data-gms="${ip}">${m.length?Math.round(m.reduce((a,r)=>a+r.ms,0)/m.length)+" ms":"—"}</td><td data-gqc="${ip}">${qcr({bytes:by,limit:lim,blocked:false})}</td><td><button class="btn" onclick="event.stopPropagation();gtst('${ip}',this)">تست</button> <button class="btn" onclick="event.stopPropagation();secopen(0,'${ip}')">امنیت</button> <button class="btn d" onclick="event.stopPropagation();gdel('${ip}')">حذف همه</button></td></tr>`;
+   if(open)ix.forEach(i=>{h+=rowH(s.rules[i],i,true)})})}
+ $("tb_m").innerHTML=h||`<tr><td colspan="9" class="empty">هنوز تانلی نساخته‌اید</td></tr>`}
+function patchTun(){const s=window.LAST;if(!s)return;const tb=$("tb_m");if(!tb)return;
+ s.rules.forEach((r,i)=>{const a=tb.querySelector(`[data-ms="${i}"]`);if(a)a.innerHTML=ms(r);
+  const b=tb.querySelector(`[data-qc="${i}"]`);if(b)b.innerHTML=qcr(r)});
+ const G=new Map();s.rules.forEach(r=>{if(!G.has(r.ip))G.set(r.ip,[]);G.get(r.ip).push(r)});
+ G.forEach((g,ip)=>{if(g.length<2)return;
+  const a=tb.querySelector(`[data-gms="${ip}"]`);if(a){const m=g.filter(r=>r.ms!=null);a.innerHTML=m.length?Math.round(m.reduce((x,y)=>x+y.ms,0)/m.length)+" ms":"—"}
+  const b=tb.querySelector(`[data-gqc="${ip}"]`);if(b)b.innerHTML=qcr({bytes:g.reduce((x,y)=>x+y.bytes,0),limit:g.every(r=>r.limit)?g.reduce((x,y)=>x+y.limit,0):0,blocked:false})})}
+function render(s){window.LAST=s;
+ const y=s.sys||{};$("host").textContent=s.host;$("ver").textContent="v"+s.ver;$("fver").textContent="v"+s.ver;
+ animNum($("c_cpu"),y.cpu||0,v=>v.toFixed(0)+"<small>%</small>");bar("cpu",y.cpu||0);$("s_load").textContent="load "+(y.load||0).toFixed(2)+" · up "+Math.floor((y.up||0)/86400)+"d "+Math.floor((y.up||0)%86400/3600)+"h";
+ const rp=100*(y.ram_used||0)/(y.ram_total||1);animNum($("c_ram"),rp,v=>v.toFixed(0)+"<small>%</small>");bar("ram",rp);$("s_ram").textContent=hb(y.ram_used)+" / "+hb(y.ram_total);
+ const dp=100*(y.disk_used||0)/(y.disk_total||1);animNum($("c_dsk"),dp,v=>v.toFixed(0)+"<small>%</small>");bar("dsk",dp);$("s_dsk").textContent=hb(y.disk_used)+" / "+hb(y.disk_total);
+ let nd=0,nu=0;if(prev&&prev.t&&y.t>prev.t){nd=Math.max(0,(y.rx-prev.rx)/(y.t-prev.t));nu=Math.max(0,(y.tx-prev.tx)/(y.t-prev.t))}
+ animNum($("c_dn"),nd,v=>nv(hb(v)+"/s"));animNum($("c_up"),nu,v=>nv(hb(v)+"/s"));hist("h_dn",HD,nd);hist("h_up",HU,nu);
+ $("s_dn").textContent="peak "+hb(Math.max(...HD))+"/s · total "+hb(y.rx);$("s_up").textContent="peak "+hb(Math.max(...HU))+"/s · total "+hb(y.tx);
+ SP={};let all=0;if(prev&&prev.now){const dt=s.now-prev.now;s.rules.forEach(r=>{const o=prev.m[r.lport+r.proto];if(o!=null&&dt>0){SP[r.lport+r.proto]=Math.max(0,(r.bytes-o)/dt);all+=SP[r.lport+r.proto]}})}
  prev={now:s.now,t:y.t,rx:y.rx,tx:y.tx,m:Object.fromEntries(s.rules.map(r=>[r.lport+r.proto,r.bytes]))};
  const up=s.rules.filter(r=>r.status==="up").length,dn=s.rules.filter(r=>r.status==="down").length;
  $("t_n").textContent=s.rules.length;$("t_ud").textContent=up+" آنلاین · "+dn+" قطع";
- $("t_b").textContent=hb(s.rules.reduce((a,r)=>a+r.bytes,0));$("t_p").textContent=s.rules.reduce((a,r)=>a+r.packets,0)+" packets";$("t_s").textContent=hb(all)+"/s";
+ animNum($("t_b"),s.rules.reduce((a,r)=>a+r.bytes,0),v=>hb(v));$("t_p").textContent=s.rules.reduce((a,r)=>a+r.packets,0)+" packets";
+ animNum($("t_s"),all,v=>nv(hb(v)+"/s"));
  $("t_fw").innerHTML=`<span style="color:var(${s.ip_forward?"--ok":"--er"})">●</span> IP Forward: ${s.ip_forward?"ON":"OFF"}`;$("t_cc").textContent="TCP: "+s.cc.toUpperCase();
- const ms=r=>r.ms==null?"—":r.ms+" ms";
- $("tb_d").innerHTML=s.rules.length?s.rules.map(r=>`<tr><td>${esc(r.name)}</td><td class="ltr">:${r.lport} → ${r.ip}:${r.dport}</td><td>${pill(r.status)}</td><td class="ltr">${ms(r)}</td><td>${spark(r.hist)}</td><td class="ltr">${hb(sp[r.lport+r.proto]||0)}/s</td></tr>`).join(""):`<tr><td colspan="6" class="empty">هنوز تانلی نساخته‌اید</td></tr>`;
- const qc=r=>{const p=r.limit?Math.min(100,100*r.bytes/r.limit):0,c=r.blocked||p>=90?"var(--er)":p>=70?"var(--wa)":"var(--ok)";return `<div class="ltr">${hb(r.bytes)} / ${r.limit?hb(r.limit):"∞"}</div>${r.limit?`<div class="mb"><i style="width:${p}%;background:${c}"></i></div>`:""}`};
- window.RULES=s.rules;
- $("tb_m").innerHTML=s.rules.length?s.rules.map((r,i)=>`<tr><td>${i+1}</td><td>${esc(r.name)}</td><td><span class="tag">${r.proto}</span></td><td class="ltr">${r.lport}</td><td class="ltr">${r.ip}:${r.dport}</td><td>${r.blocked?'<span class="pill down">حجم تمام</span>':pill(r.status)}</td><td class="ltr">${ms(r)}</td><td>${qc(r)}</td><td><button class="btn" onclick="tst(${i+1},this)">تست</button> <button class="btn" onclick="qopen(${i})">حجم</button> <button class="btn" onclick="sopen(${i})">${r.sub?"🔗 ":""}لینک</button> <button class="btn d" onclick="del(${i+1})">حذف</button></td></tr>`).join(""):`<tr><td colspan="9" class="empty">هنوز تانلی نساخته‌اید</td></tr>`}
+ drawDash();drawTunAll();patchTun()}
 async function tst(n,b){b.disabled=true;try{const r=await api("test/"+n,"POST",{});toast(r.udp?"UDP قابل تست نیست":r.ms==null?"مقصد پاسخ نمی‌دهد":"اتصال موفق · "+r.ms+" ms",r.udp?"":r.ms==null?"e":"s")}catch(e){toast(e.message,"e")}b.disabled=false}
 async function del(n){if(!cf("این تانل حذف شود؟"))return;try{await api("rules/"+n,"DELETE");toast("حذف شد","s");load()}catch(e){toast(e.message,"e")}}
 $("add").onclick=()=>$("m").classList.add("on");$("f_x").onclick=()=>$("m").classList.remove("on");
@@ -1058,6 +1664,27 @@ $("f_ok").onclick=async()=>{try{await api("rules","POST",{lport:$("f_l").value,p
  $("m").classList.remove("on");["f_l","f_d","f_n"].forEach(i=>$(i).value="");toast("تانل اضافه شد","s");load()}catch(e){toast(e.message,"e")}};
 $("hrun").onclick=async()=>{$("hl").innerHTML='<div class="empty">در حال بررسی…</div>';try{const r=await api("health");
  $("hl").innerHTML=r.map(i=>`<div class="hl"><b class="${i.level}">${{ok:"✔",warn:"!",err:"✘"}[i.level]}</b><div>${esc(i.msg)}${i.fix&&i.level!=="ok"?`<code>${esc(i.fix)}</code>`:""}</div></div>`).join("")}catch(e){toast(e.message,"e")}};
+const OPEN=new Set();
+function tg(ip){OPEN.has(ip)?OPEN.delete(ip):OPEN.add(ip);drawTunAll(true)}
+async function gtst(ip,b){b.disabled=true;try{const ix=window.LAST.rules.map((r,i)=>[r,i]).filter(([r])=>r.ip===ip&&r.proto!=="udp");const res=await Promise.all(ix.map(([r,i])=>api("test/"+(i+1),"POST",{})));const ok=res.filter(x=>x.ms!=null).length;toast(ok+" از "+res.length+" پورت پاسخ می‌دهند",ok===res.length?"s":"e")}catch(e){toast(e.message,"e")}b.disabled=false}
+async function gdel(ip){const g=window.LAST.rules.filter(r=>r.ip===ip);if(!cf("همه پورت‌های این سرور حذف شوند؟"))return;try{await api("rules/bulk","POST",{lports:g.map(r=>r.lport)});toast("حذف شد","s");load()}catch(e){toast(e.message,"e")}}
+let TUNS=[];const tage=a=>a==null?"—":a<90?a+"s":Math.round(a/60)+"m";
+async function trLoad(){try{const r=await api("tunnels");TUNS=r.tunnels;const cur=$("t_ti").value;
+ $("tb_t").innerHTML=TUNS.length?TUNS.map(t=>`<tr><td class="ltr">${t.ip}</td><td class="ltr">${t.port}</td><td>${t.up?'<span class="pill up">متصل</span>':'<span class="pill down">بدون handshake</span>'} <span class="hint">${tage(t.age)}</span></td><td class="ltr">↓${hb(t.rx)} ↑${hb(t.tx)}</td><td>${t.active?'<span class="pill up">🔒 تانل</span>':'<span class="pill unknown">مستقیم</span>'}</td><td><button class="btn" onclick="trAct('script','${t.ip}')">دستور سرور خارج</button> <button class="btn" onclick="trAct('${t.active?"direct":"use"}','${t.ip}')">${t.active?"برگشت به مستقیم":"فعال‌سازی"}</button> <button class="btn d" onclick="trAct('del','${t.ip}')">حذف</button></td></tr>`).join(""):'<tr><td colspan="6" class="empty">هنوز تانلی ساخته نشده</td></tr>';
+ const ips=[...new Set((window.LAST?window.LAST.rules:[]).map(r=>r.ip))];$("t_dl").innerHTML=ips.map(i=>`<option value="${i}">`).join("");
+ $("t_ti").innerHTML=[...new Set([...TUNS.map(t=>t.ip),...ips])].map(i=>`<option>${i}</option>`).join("");if(cur)$("t_ti").value=cur}catch(e){toast(e.message,"e")}}
+async function trAct(a,ip){try{
+ if(a==="script"){const r=await api("tunnel/script?ip="+ip);$("t_sx").value=r.script;$("t_sc").style.display="block";$("t_sc").scrollIntoView({behavior:"smooth"});return}
+ if(a==="del"&&!cf("این تانل حذف شود؟ فورواردها به حالت مستقیم برمی‌گردند."))return;
+ await api("tunnel","POST",{action:a,ip});toast("انجام شد","s");await load();trLoad()}catch(e){toast(e.message,"e")}}
+$("t_add").onclick=async()=>{const b=$("t_add");b.disabled=true;try{toast("در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…","");const ip=$("t_i").value.trim();await api("tunnel","POST",{action:"add",ip,port:+$("t_udp").value||51820});await trLoad();await trAct("script",ip)}catch(e){toast(e.message,"e")}b.disabled=false};
+$("t_cp").onclick=async()=>{try{await navigator.clipboard.writeText($("t_sx").value)}catch(e){$("t_sx").select();document.execCommand("copy")}toast("کپی شد","s")};
+const TV={no_tunnel:["برای مقایسه ابتدا یک تانل رمزنگاری‌شده بساز. فعلاً فقط مسیر مستقیم تست شد.","warn"],wg_down:["لینک WireGuard برقرار نشده: یا دستور سمت سرور خارج هنوز اجرا نشده، یا UDP این مسیر بسته است. فعلاً مستقیم را نگه دار.","err"],wg_nosvc:["لینک WireGuard وصل است ولی این پورت از داخل تانل جواب نمی‌دهد. سرویس باید روی همه آی‌پی‌ها گوش بدهد، نه فقط آی‌پی عمومی.","err"],wg:["WireGuard مناسب است: پایدار و سریع، و ترافیک رمزنگاری می‌شود. «فعال‌سازی» را بزن.","ok"],direct:["در این مسیر مستقیم بهتر جواب می‌دهد (تأخیر یا افت بسته‌ی تانل بیشتر است). اگر رمزنگاری مهم‌تر است می‌توانی تانل را فعال کنی.","warn"]};
+$("t_run").onclick=async()=>{const b=$("t_run");b.disabled=true;$("t_res").innerHTML='<div class="empty">در حال تست… (حدود ۲۰ ثانیه)</div>';
+ try{const r=await api("tunnel/test","POST",{ip:$("t_ti").value,port:+$("t_tp").value||0});
+  const row=(n,x)=>!x?"":`<tr><td>${n}</td><td>${x.ok?'<span class="pill up">پاسخ می‌دهد</span>':'<span class="pill down">بی‌پاسخ</span>'}</td><td class="ltr">${x.ok?x.avg+" ms":"—"}</td><td class="ltr">${x.ok?x.min+" / "+x.max:"—"}</td><td class="ltr">${x.ok?x.jitter+" ms":"—"}</td><td class="ltr">${x.loss}%</td></tr>`;
+  const v=TV[r.verdict];
+  $("t_res").innerHTML=`<div style="overflow-x:auto"><table><thead><tr><th>مسیر (پورت ${r.port})</th><th>وضعیت</th><th>میانگین</th><th>کمترین / بیشترین</th><th>نوسان</th><th>ازدست‌رفتن</th></tr></thead><tbody>${row("مستقیم (بدون رمزنگاری)",r.direct)}${row("WireGuard (رمزنگاری‌شده)",r.tunnel&&r.tunnel.tcp)}</tbody></table></div><div class="hl" style="margin-top:12px"><b class="${v[1]}">${{ok:"✔",warn:"!",err:"✘"}[v[1]]}</b><div>${v[0]}</div></div>`}catch(e){$("t_res").innerHTML="";toast(e.message,"e")}b.disabled=false};
 async function logs(){try{const r=await api("logs");$("lg").innerHTML=r.length?r.map(l=>`<div class="${l.l}">${new Date(l.t*1000).toLocaleString("sv")} [${l.l}] ${esc(l.m)}</div>`).join(""):'<div class="empty">لاگی ثبت نشده</div>'}catch(e){}}
 async function settings(){try{const s=await api("settings");$("g_c").value=s.tg_chat;$("g_a").value=s.tg_api;$("g_t").value="";$("g_t").placeholder=s.has_token?"•••••• (ذخیره شده — برای تغییر وارد کنید)":"123456:ABC…";
  $("d_h").textContent=s.domain?"فعال: https://"+s.domain+":"+s.port:(s.tls?"بدون دامنه: گواهی self-signed (مرورگر هشدار می‌دهد)":"HTTPS خاموش است");$("g_h").textContent="اگر سرور ایران به تلگرام دسترسی ندارد، آدرس یک پروکسی/ورکر سازگار با Bot API را در فیلد API بگذارید."}catch(e){}}
@@ -1077,11 +1704,12 @@ $("eye").onclick=()=>{const p=$("pw");p.type=p.type==="password"?"text":"passwor
 $("out").onclick=async()=>{await api("logout","POST",{}).catch(()=>{});show(false)};
 
 document.body.dataset.t=localStorage.getItem("drt")||"dark";
-$("thm").onclick=()=>{const t=document.body.dataset.t==="dark"?"light":"dark";document.body.dataset.t=t;localStorage.setItem("drt",t)};
+function syncThemeColor(){const m=document.querySelector('meta[name="theme-color"]');if(m)m.content=document.body.dataset.t==="dark"?"#07060f":"#f3f2fa"}
+$("thm").onclick=()=>{const t=document.body.dataset.t==="dark"?"light":"dark";document.body.dataset.t=t;localStorage.setItem("drt",t);syncThemeColor()};
 const GB=1024**3,TB=1024**4;let QR=null,QW=0,SR=null;
-function qopen(i){QR=window.RULES[i];QW=QR.limit||0;$("q_t").textContent="حجم تانل — "+QR.name;$("qm").classList.add("on");qdraw()}
+function qopen(i){QR=window.LAST.rules[i];QW=QR.limit||0;$("q_t").textContent="حجم تانل — "+QR.name;$("qm").classList.add("on");qdraw()}
 function qdraw(){const r=QR,u=r.bytes,w=QW,p=w?Math.min(1,u/w):0,col=!w?"var(--mu)":p>=.9?"var(--er)":p>=.7?"var(--wa)":"var(--ok)";
- $("q_b").innerHTML=`<div class="qh"><div class="ringw"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="arc" cx="60" cy="60" r="52" pathLength="1000" stroke="${col}" stroke-dasharray="${Math.round(p*1000)} 1000"/></svg><div class="mid">${w?Math.round(p*100)+"%":"∞"}</div></div>
+ $("q_b").innerHTML=`<div class="qh"><div class="ringw"><svg viewBox="0 0 120 120"><circle class="trk" cx="60" cy="60" r="52"/><circle class="arc" cx="60" cy="60" r="52" pathLength="1000" stroke="${col}" style="filter:drop-shadow(0 0 5px color-mix(in srgb,${col} 55%,transparent))" stroke-dasharray="${Math.round(p*1000)} 1000"/></svg><div class="mid">${w?Math.round(p*100)+"%":"∞"}</div></div>
  <div class="qn"><div><span>مصرف</span><b>${hb(u)}</b></div><div><span>سقف</span><b>${w?hb(w):"نامحدود"}</b></div><div><span>باقی‌مانده</span><b>${w?hb(Math.max(0,w-u)):"—"}</b></div></div></div>
  ${r.blocked?'<div class="qs er">حجم تمام شده و تانل قطع است. با بالا بردن سقف یا ریست مصرف، خودکار وصل می‌شود.</div>':""}
  <div class="pre">${[[0,"نامحدود"],[50*GB,"50 GB"],[100*GB,"100 GB"],[500*GB,"500 GB"],[TB,"1 TB"],[2*TB,"2 TB"]].map(([v,l])=>`<button class="btn${v===w?" on":""}" data-v="${v}">${l}</button>`).join("")}</div>
@@ -1094,7 +1722,12 @@ $("q_b").onchange=e=>{if(e.target.id==="q_n")qdraw()};
 $("q_x").onclick=()=>$("qm").classList.remove("on");
 $("q_ok").onclick=async()=>{try{await api("quota","POST",{lport:QR.lport,limit:QW});toast(QW?"سقف حجم ذخیره شد":"سقف حجم برداشته شد","s");$("qm").classList.remove("on");load()}catch(e){toast(e.message,"e")}};
 $("q_r").onclick=async()=>{if(!cf("مصرف این تانل صفر شود؟"))return;try{await api("quota","POST",{lport:QR.lport,reset:true});toast("مصرف صفر شد","s");$("qm").classList.remove("on");load()}catch(e){toast(e.message,"e")}};
-async function sopen(i){SR=window.RULES[i];$("s_t").textContent="لینک کاربر — "+SR.name;$("sm").classList.add("on");sdraw(await api("sub?lport="+SR.lport))}
+let CRS=[];
+function secopen(i,ip){CRS=ip?window.LAST.rules.filter(r=>r.ip===ip):[window.LAST.rules[i]];const s=CRS[0].sec||{};$("c_t").textContent="امنیت تانل — "+(ip?ip+" ("+CRS.length+" پورت)":CRS[0].name);$("c_a").value=(s.allow||"").split(",").filter(Boolean).join("\n");$("c_m").value=s.maxc||0;$("c_r").value=s.rate||0;$("c_w").style.display=s.allow?"block":"none";$("cm").classList.add("on")}
+$("c_a").oninput=()=>{$("c_w").style.display=$("c_a").value.trim()?"block":"none"};
+$("c_x").onclick=()=>$("cm").classList.remove("on");
+$("c_ok").onclick=async()=>{const a=$("c_a").value.split(/[\s,]+/).filter(Boolean);try{await api("security","POST",{lports:CRS.map(r=>r.lport),allow:a,maxc:+$("c_m").value||0,rate:+$("c_r").value||0});toast("امنیت تانل ذخیره شد","s");$("cm").classList.remove("on");load()}catch(e){toast(e.message,"e")}};
+async function sopen(i){SR=window.LAST.rules[i];$("s_t").textContent="لینک کاربر — "+SR.name;$("sm").classList.add("on");sdraw(await api("sub?lport="+SR.lport))}
 function sdraw(j){$("s_b").innerHTML=j.token?`<input id="s_u" readonly value="${esc(location.origin+j.path)}"><div class="acts"><button class="btn p" data-s="copy">کپی لینک</button><button class="btn" data-s="rotate">لینک جدید</button><button class="btn d" data-s="delete">حذف لینک</button></div>`:`<div class="acts" style="margin:0"><button class="btn p" data-s="create">ساخت لینک</button></div>`}
 $("s_b").onclick=async e=>{const b=e.target.closest("button");if(!b)return;const a=b.dataset.s;try{
  if(a==="copy"){const el=$("s_u");try{await navigator.clipboard.writeText(el.value)}catch(x){el.select();document.execCommand("copy")}toast("کپی شد","s");return}
@@ -1107,7 +1740,8 @@ $("d_r").onclick=async()=>{if(!cf("دامنه حذف شود و گواهی self-s
 $("c_s").onclick=async()=>{try{await api("cert","POST",{cert:$("c_c").value,key:$("c_k").value});toast("گواهی نصب شد؛ پنل ری‌استارت می‌شود","s");setTimeout(()=>location.reload(),4500)}catch(e){toast(e.message,"e")}};
 document.querySelectorAll(".lng").forEach(b=>b.onclick=()=>setLang(LANG==="en"?"fa":"en"));document.querySelectorAll("[data-l]").forEach(b=>b.onclick=()=>setLang(b.dataset.l));
 $("sws").onclick=e=>{const b=e.target.closest(".sw[data-c]");if(b)setAc(b.dataset.c)};$("sws").oninput=e=>{if(e.target.id==="ac_c")setAc(e.target.value)};
-setAc(ACC);setLang(LANG);bootStart(0,900);
+document.addEventListener("click",e=>{const m=e.target.closest(".modal");if(m&&e.target===m)m.classList.remove("on")});
+setAc(ACC);setLang(LANG);syncThemeColor();bootStart(0,900);
 api("state").then(()=>{bootGo(1);show(true)}).catch(()=>show(false));
 </script></body></html>
 HTMLEOF
@@ -1403,11 +2037,13 @@ uninstall() {
   banner; echo "  ${C_BLD}Uninstall${C_RST}"; echo
   confirm "Remove all forwards, the web panel, the boot service and this tool?" || return
   web_remove >/dev/null 2>&1
-  local spec t parent chain
-  for spec in "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD"; do
+  local spec t parent chain fip
+  for fip in $(cut -d'|' -f2 "$TUN" 2>/dev/null); do tun_del "$fip" >/dev/null 2>&1; done
+  for spec in "mangle PREROUTING DRC_SEC" "mangle FORWARD DRC_MSS" "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD"; do
     set -- $spec; t=$1; parent=$2; chain=$3
     iptables -t "$t" -D "$parent" -j "$chain" 2>/dev/null
     iptables -t "$t" -F "$chain" 2>/dev/null
+    [[ $chain == DRC_SEC ]] && sec_cleanup
     iptables -t "$t" -X "$chain" 2>/dev/null
   done
   if command -v systemctl >/dev/null 2>&1; then
@@ -1417,6 +2053,41 @@ uninstall() {
   confirm "Also delete saved settings in $CONF_DIR?" && rm -rf "$CONF_DIR"
   rm -f "$SYSCTL_FWD" "$SYSCTL_OPT" "$BIN"
   ok "Uninstalled."; exit 0
+}
+
+security_menu() {
+  banner; echo "  ${C_BLD}Tunnel security${C_RST}"; echo
+  [[ -s $CONF ]] || { info "No forwards configured yet."; return; }
+  printf "  ${C_BLD}%-3s %-16s %-7s %-10s %-9s %s${C_RST}\n" "#" NAME LISTEN "ALLOWED" "MAX/IP" "NEW/MIN"
+  local i=0 name proto lport ip dport al
+  while IFS='|' read -r name proto lport ip dport; do
+    [[ -z $name ]] && continue
+    i=$((i+1)); sec_get "$lport"
+    al=any; [[ -n $SEC_ALLOW ]] && al="$(tr ',' '\n' <<< "$SEC_ALLOW" | grep -c .) IPs"
+    printf "  %-3s %-16s %-7s %-10s %-9s %s\n" "$i" "$name" "$lport" "$al" "$((SEC_MAXC))" "$((SEC_RATE))"
+  done < "$CONF"
+  echo; info "0 = off.  Allowed IPs empty = anyone can connect."
+  local n; read -rp "  Tunnel number to edit (Enter = back): " n
+  [[ -z $n ]] && return
+  [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $(wc -l < "$CONF") )) || { err "Invalid number."; return; }
+  lport=$(sed -n "${n}p" "$CONF" | cut -d'|' -f3)
+  sec_get "$lport"
+  echo; info "Editing port $lport. Press Enter to keep the current value."
+  local a m r x bad=""
+  read -rp "  Allowed IPs, comma separated, CIDR ok [${SEC_ALLOW:-any}] (- = allow all): " a
+  if [[ -z $a ]]; then a=$SEC_ALLOW; elif [[ $a == "-" ]]; then a=""; fi
+  a=${a// /}
+  for x in ${a//,/ }; do valid_cidr "$x" || bad=$x; done
+  [[ -z $bad ]] || { err "Invalid IP/CIDR: $bad"; return; }
+  read -rp "  Max simultaneous connections per IP [$SEC_MAXC] (0 = off): " m; m=${m:-$SEC_MAXC}
+  read -rp "  Max NEW connections per minute per IP [$SEC_RATE] (0 = off): " r; r=${r:-$SEC_RATE}
+  [[ $m =~ ^[0-9]+$ && $r =~ ^[0-9]+$ ]] || { err "Numbers only."; return; }
+  if [[ -n $a ]]; then
+    warn "Only the listed IPs will reach port $lport. Make sure your clients' IPs are in the list."
+    confirm "Apply?" || return
+  fi
+  sec_set "$lport" "$a" "$m" "$r"
+  apply_rules; ok "Security updated for port $lport."
 }
 
 main_menu() {
@@ -1433,6 +2104,8 @@ main_menu() {
     echo "   8) Status"
     echo "   9) Web panel             install and manage the web UI"
     echo "  10) Uninstall"
+    echo "  11) Tunnel security      IP allow-list, connection and rate limits"
+    echo "  12) Encrypted transport  WireGuard link to the foreign server"
     echo "   0) Exit"
     echo
     read -rp "  Select an option: " c
@@ -1448,6 +2121,8 @@ main_menu() {
       8) status; pause;;
       9) web_menu; pause;;
       10) uninstall;;
+      11) security_menu; pause;;
+      12) tunnel_menu; pause;;
       0) exit 0;;
     esac
   done
@@ -1460,8 +2135,9 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case "${1:-}" in
     apply) apply_rules;;
     list)  list_rules;;
+    tunnel) shift; tunnel_cli "$@";;
     update) bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh);;
     "")    main_menu;;
-    *)     echo "Usage: $0 [apply|list|update]"; exit 1;;
+    *)     echo "Usage: $0 [apply|list|update|tunnel]"; exit 1;;
   esac
 fi
