@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
 #
 # Usage:  sudo bash dr-cpanel.sh        (interactive menu)
-#         dr-cpanel apply | list        (non-interactive, used by systemd)
+#         dr-cpanel apply | list | update   (non-interactive; apply is used by systemd)
 
 set -u
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 CONF_DIR="/etc/dr-cpanel"
 BLK="$CONF_DIR/blocked"             # ports cut off by their quota (written by the web panel)
 CONF="$CONF_DIR/rules.conf"          # lines: name|proto|listen_port|dest_ip|dest_port
@@ -172,7 +172,6 @@ WEB_DIR="/usr/local/lib/dr-cpanel"
 WEB_PY="$WEB_DIR/web.py"
 WEB_UI="$WEB_DIR/index.html"
 WEB_UNIT="/etc/systemd/system/dr-cpanel-web.service"
-WEB_CFG="$CONF_DIR/web.json"
 WEB_CFG="$CONF_DIR/web.json"
 
 web_write_files() {
@@ -1439,7 +1438,8 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case "${1:-}" in
     apply) apply_rules;;
     list)  list_rules;;
+    update) bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh);;
     "")    main_menu;;
-    *)     echo "Usage: $0 [apply|list]"; exit 1;;
+    *)     echo "Usage: $0 [apply|list|update]"; exit 1;;
   esac
 fi
