@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # DR-CPanel installer / updater
 # Usage:  bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh)
+#         bash <(curl -fsSL .../install.sh) join '<https://IRAN:8443/join/<token>>'   (run on the KHAREJ server)
 set -euo pipefail
 
 REPO="behymin12345-hash/DR-CPanel"
 BRANCH="main"
 URL="https://raw.githubusercontent.com/$REPO/$BRANCH/dr-cpanel.sh"
 BIN="/usr/local/bin/dr-cpanel"
+
+JOIN_LINK=""
+if [[ ${1:-} == join ]]; then
+  JOIN_LINK="${2:-}"
+  [[ -n $JOIN_LINK ]] || { echo "Usage: bash install.sh join '<join link from the Iran panel>'"; exit 1; }
+fi
 
 G='\033[1;32m'; Y='\033[1;33m'; C='\033[1;36m'; R='\033[1;31m'; B='\033[1m'; N='\033[0m'
 ok()  { echo -e "  ${G}✔${N} $*"; }
@@ -71,6 +78,12 @@ else
 fi
 
 echo
+if [[ -n $JOIN_LINK ]]; then
+  echo -e "  ${G}${B}Joining the Iran tunnel ...${N}"
+  echo
+  sleep 1
+  exec "$BIN" join "$JOIN_LINK"
+fi
 echo -e "  ${G}${B}Done. Starting DR-CPanel v$VER ...${N}"
 echo
 sleep 1

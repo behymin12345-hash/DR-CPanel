@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,10 +10,17 @@
 
 set -u
 
-VERSION="2.8.0"
+VERSION="2.9.0"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
-TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active
+TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active|preset|type|join_token|name|token_expiry|transport|carrier_port
+                                   # type: fwd=classic forward (Iran dials out), dir=direct (Iran dials out), rev=reverse (kharej dials in);
+                                   # foreign_ip is "pending" for a rev tunnel until the kharej side fetches its join link;
+                                   # transport: udp|tcp|ws|wss|kcp|quic - how the WG packets travel (empty/udp = kernel WG over UDP);
+                                   # for the other transports a gost carrier carries them: the LISTENING side runs
+                                   # drc-goss<id> (relay+TR on carrier_port), the DIALING side runs drc-gosc<id> which feeds WG
+                                   # from a local UDP port 30000+id*37, so the WG Endpoint becomes 127.0.0.1 on the dialing side
+REV="$CONF_DIR/reverse.conf"       # reverse forwards: foreign_ip|listen_port_on_foreign|dest_port_on_iran|proto
 BLK="$CONF_DIR/blocked"             # ports cut off by their quota (written by the web panel)
 CONF="$CONF_DIR/rules.conf"          # lines: name|proto|listen_port|dest_ip|dest_port
 DEF_IP_FILE="$CONF_DIR/default_ip"
@@ -136,8 +143,123 @@ sec_apply() {   # lport proto-list : build the security rules for one tunnel (ma
 # rules.conf keeps the real foreign IP. Once a link is switched on ("active"), apply_rules DNATs to the link
 # address instead, so counters, quotas, health checks and the security rules keep working unchanged.
 
-tun_row()    { [[ -s $TUN ]] && awk -F'|' -v ip="$1" '$2==ip{print;exit}' "$TUN"; }
-tun_target() { local r; r=$(tun_row "$1"); if [[ -n $r && ${r##*|} == 1 ]]; then echo "10.66.${r%%|*}.2"; else echo "$1"; fi; }
+tun_row()    { [[ -s $TUN ]] && awk -F'|' -v ip="$1" '$2==ip||$1==ip{print;exit}' "$TUN"; }   # matches the foreign IP or the tunnel id
+tun_target() { local r; r=$(tun_row "$1"); if [[ -n $r && $(cut -d'|' -f9 <<<"$r") == 1 ]]; then echo "10.66.${r%%|*}.2"; else echo "$1"; fi; }
+tun_token()  { od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'; }
+
+# ------------------------------------------------------- multi-transport carrier
+# Like BackPack, every tunnel picks how it crosses the Iran<->abroad path. The encrypted
+# core is always WireGuard; the transport is the carrier that moves its UDP packets:
+#   udp  plain kernel WG (fastest, the default)      tcp  simple TCP relay when UDP is blocked
+#   ws   WebSocket over plain HTTP (passes HTTP-only filters/CDN)
+#   wss  WebSocket inside TLS (looks like HTTPS; self-signed cert is automatic)
+#   kcp  UDP + KCP (error correction for lossy paths)   quic real QUIC session (TLS 1.3)
+# Carriers are carried by gost v3, installed as /usr/local/bin/drc-gost.
+GOST_VER="3.3.3"
+tr_valid() { [[ $1 =~ ^(udp|tcp|ws|wss|kcp|quic)$ ]]; }
+tr_mtu()   { case $1 in tcp) echo 1380;; ws) echo 1360;; wss) echo 1340;; kcp) echo 1330;; quic) echo 1350;; *) echo 1420;; esac; }
+tr_proto() { case $1 in kcp|quic) echo udp;; *) echo tcp;; esac; }   # what the carrier port itself speaks
+tr_carrier_port() {   # id [port] : the carrier port on the LISTENING side (default: derived from the tunnel id, never collides)
+  local p=${2:-}
+  [[ $p =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )) && { echo "$p"; return; }
+  echo $((20000 + ${1:-1} * 37))
+}
+tr_local_port() { echo $((30000 + ${1:-1} * 37)); }   # local UDP feed port on the DIALING side
+
+gost_have() { [[ -x /usr/local/bin/drc-gost ]]; }
+
+gost_install() {   # install gost v3 as /usr/local/bin/drc-gost (sha256-verified against the release checksums)
+  gost_have && { echo "/usr/local/bin/drc-gost"; return 0; }
+  local arch tmp want
+  case $(uname -m) in
+    x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; armv7l) arch=armv7;; i686|i386) arch=386;;
+    *) echo "error: unsupported architecture $(uname -m) for the gost carrier" >&2; return 1;;
+  esac
+  tmp=$(mktemp -d) || return 1
+  echo "Downloading gost v$GOST_VER (${arch})..." >&2
+  curl -fsSL --retry 2 --retry-delay 2 -o "$tmp/g.tgz" \
+    "https://github.com/go-gost/gost/releases/download/v$GOST_VER/gost_${GOST_VER}_linux_${arch}.tar.gz" \
+    && curl -fsSL --retry 2 -o "$tmp/s.txt" \
+    "https://github.com/go-gost/gost/releases/download/v$GOST_VER/checksums.txt" \
+    || { rm -rf "$tmp"; echo "error: could not download gost (is GitHub reachable?)" >&2; return 1; }
+  want=$(awk -v f="gost_${GOST_VER}_linux_${arch}.tar.gz" '$2==f{print $1}' "$tmp/s.txt")
+  if [[ -n $want ]] && ! (cd "$tmp" && echo "$want  g.tgz" | sha256sum -c >/dev/null 2>&1); then
+    rm -rf "$tmp"; echo "error: gost checksum FAILED - download is broken, not installing" >&2; return 1
+  fi
+  tar xzf "$tmp/g.tgz" -C "$tmp" gost 2>/dev/null || tar xzf "$tmp/g.tgz" -C "$tmp"
+  install -m 755 "$tmp/gost" /usr/local/bin/drc-gost || { rm -rf "$tmp"; echo "error: could not install gost" >&2; return 1; }
+  rm -rf "$tmp"; echo "/usr/local/bin/drc-gost"
+}
+
+gost_unit_client() {   # id local_udp_port wg_port carrier_port host tr token : the DIALING side feeds WG through the carrier
+  local sec=""; [[ $6 == wss ]] && sec="?secure=false"
+  cat > "/etc/systemd/system/drc-gosc$1.service" <<EOF
+[Unit]
+Description=DR-CPanel transport carrier (tunnel $1, client)
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/drc-gost -L "udp://127.0.0.1:$2/127.0.0.1:$3?keepalive=true" -F "relay+$6://$7@$5:$4$sec"
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+gost_unit_server() {   # id carrier_port tr token : the LISTENING side accepts the carrier and hands it to the local WG port
+  cat > "/etc/systemd/system/drc-goss$1.service" <<EOF
+[Unit]
+Description=DR-CPanel transport carrier (tunnel $1, server)
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/drc-gost -L "relay+$3://$4@:${2}"
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+gost_side_up() {   # id : start the gost carrier THIS (Iran) side needs - no-op for plain UDP
+  local r id fip port mtu _5 _6 ipub _8 _9 _10 ty tok _13 _14 tr cport lp
+  r=$(awk -F'|' -v i="$1" '$1==i{print;exit}' "$TUN"); [[ -n $r ]] || return 0
+  IFS='|' read -r id fip port mtu _5 _6 ipub _8 _9 _10 ty tok _13 _14 tr cport <<< "$r"
+  tr=${tr:-udp}; [[ $tr != udp ]] || return 0
+  gost_have || gost_install >/dev/null 2>&1 || { echo "error: gost carrier is not installed" >&2; return 1; }
+  if [[ ${#tok} -lt 16 ]]; then   # every carried tunnel needs a shared carrier token
+    tok=$(tun_token); [[ ${#tok} -ge 16 ]] || { echo "error: no entropy for the carrier token" >&2; return 1; }
+    awk -F'|' -v OFS='|' -v i="$id" -v v="$tok" '$1==i{$12=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+  fi
+  cport=$(tr_carrier_port "$id" "$cport"); lp=$(tr_local_port "$id")
+  if [[ $ty == rev ]]; then   # Iran listens: the kharej dials the carrier port
+    gost_unit_server "$id" "$cport" "$tr" "$tok"
+    iptables -I INPUT -p "$(tr_proto "$tr")" --dport "$cport" -m comment --comment "drc-gost$id" -j ACCEPT 2>/dev/null || true
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then ufw allow "$cport/$(tr_proto "$tr")" >/dev/null 2>&1 || true; fi
+    systemctl daemon-reload >/dev/null 2>&1; systemctl enable --now "drc-goss$id" >/dev/null 2>&1
+  else                        # Iran dials: the local gost feeds WG from 127.0.0.1:<local port>
+    gost_unit_client "$id" "$lp" "$port" "$cport" "$fip" "$tr" "$tok"
+    systemctl daemon-reload >/dev/null 2>&1; systemctl enable --now "drc-gosc$id" >/dev/null 2>&1
+  fi
+}
+
+gost_side_down() {   # id : stop the carrier of this side and clear its firewall rule
+  systemctl disable --now "drc-goss$1" "drc-gosc$1" >/dev/null 2>&1
+  rm -f "/etc/systemd/system/drc-goss$1.service" "/etc/systemd/system/drc-gosc$1.service"
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1
+  local r tr cport
+  r=$(awk -F'|' -v i="$1" '$1==i{print;exit}' "$TUN")
+  if [[ -n $r ]]; then
+    tr=$(cut -d'|' -f15 <<< "$r"); cport=$(tr_carrier_port "$1" "$(cut -d'|' -f16 <<< "$r")")
+    local n=0
+    while iptables -D INPUT -p "$(tr_proto "${tr:-udp}")" --dport "$cport" -m comment --comment "drc-gost$1" -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done
+  fi
+}
+
+gost_boot() {   # after a reboot: bring every tunnel's carrier back (idempotent)
+  [[ -s $TUN ]] || return 0
+  local id
+  while IFS='|' read -r id _; do [[ -n $id ]] && gost_side_up "$id" >/dev/null 2>&1; done < "$TUN"
+}
 
 tun_need_wg() {
   if ! command -v wg-quick >/dev/null 2>&1; then
@@ -156,28 +278,41 @@ tun_need_wg() {
 }
 
 tun_write_conf() {   # id
-  local r id fip port mtu ipriv fpub
+  local r id fip port mtu ipriv _fp ipub fpub _a _pr ty tok _nm _ex tr cport ep="" post="" listen=""
   r=$(awk -F'|' -v i="$1" '$1==i{print;exit}' "$TUN")
-  IFS='|' read -r id fip port mtu ipriv _ _ fpub _ <<< "$r"
-  (( mtu >= 1200 && mtu <= 1500 )) || mtu=1420   # 0 = auto: start with a safe value
+  IFS='|' read -r id fip port mtu ipriv _fp ipub fpub _a _pr ty tok _nm _ex tr cport <<< "$r"
+  ty=${ty:-fwd}; tr=${tr:-udp}
+  (( mtu >= 1200 && mtu <= 1500 )) || mtu=$(tr_mtu "$tr")   # 0 = auto: start from the carrier's safe value
+  if [[ $ty == rev ]]; then
+    # the kharej dials IN: this side listens on the WG port (the join script dials it)
+    listen=$'ListenPort = '"$port"$'\n'
+    if [[ $tr == udp ]]; then
+      post=$'PostUp = iptables -I INPUT -p udp --dport '"$port"$' -j ACCEPT || true; iptables -I INPUT -i drwg'"$id"$' -j ACCEPT || true\nPostDown = iptables -D INPUT -p udp --dport '"$port"$' -j ACCEPT || true; iptables -D INPUT -i drwg'"$id"$' -j ACCEPT || true\n'
+    fi
+    # other transports: gost_side_up opens the carrier port itself
+  elif [[ $tr == udp ]]; then
+    valid_ip "$fip" && ep=$'Endpoint = '"$fip:$port"$'\n'
+  else
+    ep=$'Endpoint = 127.0.0.1:'"$(tr_local_port "$id")"$'\n'   # WG rides the local gost carrier
+  fi
   mkdir -p /etc/wireguard
   ( umask 077; cat > "/etc/wireguard/drwg$id.conf" <<EOF
 [Interface]
 Address = 10.66.$id.1/30
 PrivateKey = $ipriv
-MTU = $mtu
+${listen}MTU = $mtu
 Table = off
-
+${post}
 [Peer]
 PublicKey = $fpub
-Endpoint = $fip:$port
-AllowedIPs = 10.66.$id.2/32
+${ep}AllowedIPs = 10.66.$id.2/32
 PersistentKeepalive = 25
 EOF
   )
 }
 
 tun_up() {   # id
+  gost_side_up "$1" >/dev/null 2>&1 || true   # carrier first; WG retries until it is up
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable "wg-quick@drwg$1" >/dev/null 2>&1
     systemctl restart "wg-quick@drwg$1" >/dev/null 2>&1
@@ -187,30 +322,122 @@ tun_up() {   # id
 }
 
 tun_down() {   # id
+  gost_side_down "$1"
   if command -v systemctl >/dev/null 2>&1; then systemctl disable --now "wg-quick@drwg$1" >/dev/null 2>&1
   else wg-quick down "drwg$1" >/dev/null 2>&1; fi
   ip link del "drwg$1" >/dev/null 2>&1
   rm -f "/etc/wireguard/drwg$1.conf"
 }
 
-tun_add() {   # foreign_ip [udp_port] [mtu]   (mtu 0 = auto-detect once the link is up)
-  local fip=$1 port=${2:-51820} mtu=${3:-0} id=1 ipriv fpriv
+tun_add() {   # foreign_ip [udp_port] [mtu] [preset] [type fwd|dir] [name] [transport] [carrier_port]
+  local fip=$1 port=${2:-51820} mtu=${3:-0} preset=${4:-} ty=${5:-fwd} name=${6:-} tr=${7:-udp} cport=${8:-} id=1 ipriv fpriv
   valid_ip "$fip" || { echo "error: invalid IP" >&2; return 1; }
   [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { echo "error: invalid UDP port" >&2; return 1; }
   [[ $mtu =~ ^[0-9]+$ ]] && (( mtu == 0 || (mtu >= 1200 && mtu <= 1500) )) || { echo "error: invalid MTU" >&2; return 1; }
+  [[ -z $preset || $preset =~ ^(balanced|turbo|throughput|gaming)$ ]] || { echo "error: invalid preset" >&2; return 1; }
+  [[ $ty =~ ^(fwd|dir)$ ]] || { echo "error: invalid type" >&2; return 1; }
+  tr=${tr:-udp}; tr_valid "$tr" || { echo "error: invalid transport (udp tcp ws wss kcp quic)" >&2; return 1; }
+  [[ -z $cport || $cport =~ ^[0-9]+$ ]] || { echo "error: invalid carrier port" >&2; return 1; }
+  name=$(printf '%s' "$name" | sed 's/[^A-Za-z0-9._-]/_/g' | cut -c1-40)
   [[ -n $(tun_row "$fip") ]] && { echo "error: a tunnel to $fip already exists" >&2; return 1; }
   tun_need_wg || return 1
   while [[ -s $TUN ]] && cut -d'|' -f1 "$TUN" | grep -qx "$id"; do id=$((id + 1)); done
   (( id <= 200 )) || { echo "error: too many tunnels" >&2; return 1; }
   ipriv=$(wg genkey); fpriv=$(wg genkey)
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
-  ( umask 077; echo "$id|$fip|$port|$mtu|$ipriv|$fpriv|$(wg pubkey <<< "$ipriv")|$(wg pubkey <<< "$fpriv")|0" >> "$TUN" )
+  ( umask 077; echo "$id|$fip|$port|$mtu|$ipriv|$fpriv|$(wg pubkey <<< "$ipriv")|$(wg pubkey <<< "$fpriv")|0|$preset|$ty||$name||$tr|$cport" >> "$TUN" )
   tun_write_conf "$id"
   if ! tun_up "$id"; then
     tun_down "$id"; sed -i "/^$id|/d" "$TUN"
     echo "error: could not start the WireGuard interface" >&2; return 1
   fi
   apply_rules
+}
+
+tun_add_rev() {   # [udp_port] [preset] [name] [transport] [carrier_port] : pending REVERSE tunnel - the kharej joins with the one-line link
+  local port=${1:-51820} preset=${2:-turbo} name=${3:-} tr=${4:-udp} cport=${5:-} id=1 ipriv fpriv tok
+  [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { echo "error: invalid UDP port" >&2; return 1; }
+  [[ -z $preset || $preset =~ ^(balanced|turbo|throughput|gaming)$ ]] || { echo "error: invalid preset" >&2; return 1; }
+  tr=${tr:-udp}; tr_valid "$tr" || { echo "error: invalid transport (udp tcp ws wss kcp quic)" >&2; return 1; }
+  [[ -z $cport || $cport =~ ^[0-9]+$ ]] || { echo "error: invalid carrier port" >&2; return 1; }
+  if [[ -s $TUN ]] && awk -F"|" -v p="$port" '$3==p{f=1} END{exit !f}' "$TUN"; then   # rev listens on this side: the WG port must stay free
+    echo "error: another tunnel already uses UDP port $port" >&2; return 1
+  fi
+  name=$(printf '%s' "$name" | sed 's/[^A-Za-z0-9._-]/_/g' | cut -c1-40)
+  tun_need_wg || return 1
+  while [[ -s $TUN ]] && cut -d'|' -f1 "$TUN" | grep -qx "$id"; do id=$((id + 1)); done
+  (( id <= 200 )) || { echo "error: too many tunnels" >&2; return 1; }
+  tok=$(tun_token); [[ ${#tok} -ge 16 ]] || { echo "error: no entropy for the join token" >&2; return 1; }
+  ipriv=$(wg genkey); fpriv=$(wg genkey)
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  ( umask 077; echo "$id|pending|$port|0|$ipriv|$fpriv|$(wg pubkey <<< "$ipriv")|$(wg pubkey <<< "$fpriv")|0|${preset:-turbo}|rev|$tok|$name||$tr|$cport" >> "$TUN" )
+  tun_write_conf "$id"
+  tun_up "$id" || true   # this side listens right away; the kharej dials in once its join link is run
+  apply_rules
+  echo "$tok"
+}
+
+tun_link() {   # ip-or-id [new_token] : print (or rotate) the join token of a tunnel
+  local r id tok
+  r=$(tun_row "$1"); [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  id=${r%%|*}
+  if [[ -n ${2:-} ]]; then
+    awk -F'|' -v OFS='|' -v i="$id" -v v="$2" '$1==i{$12=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+    echo "$2"; return 0
+  fi
+  tok=$(cut -d'|' -f12 <<< "$r")
+  if [[ -z $tok ]]; then tok=$(tun_token) && tun_link "$id" "$tok" >/dev/null || return 1; fi
+  echo "$tok"
+}
+
+tun_join_setip() {   # token client_ip : a kharej fetched its join link - resolve a pending rev tunnel to its real IP
+  local tok=$1 cip=$2 r id
+  [[ $tok =~ ^[0-9a-f]{16,64}$ ]] || { echo "error: bad token" >&2; return 1; }
+  valid_ip "$cip" || { echo "error: bad IP" >&2; return 1; }
+  [[ -s $TUN ]] || { echo "error: unknown or expired link" >&2; return 1; }
+  r=$(awk -F'|' -v t="$tok" '$12==t{print;exit}' "$TUN")
+  [[ -n $r ]] || { echo "error: unknown or expired link" >&2; return 1; }
+  id=${r%%|*}
+  if [[ $(cut -d'|' -f2 <<< "$r") == pending ]]; then
+    awk -F'|' -v OFS='|' -v i="$id" -v v="$cip" '$1==i{$2=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+    apply_rules
+  fi
+  echo "$id"
+}
+
+tun_preset() {   # foreign_ip [preset] : read or set the per-tunnel preset ("none" clears it)
+  local r id cur
+  r=$(tun_row "$1"); [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  id=${r%%|*}; cur=$(cut -d'|' -f10 <<< "$r")
+  if [[ -z ${2:-} ]]; then echo "$cur"; return 0; fi
+  if [[ $2 == none ]]; then
+    awk -F'|' -v OFS='|' -v i="$id" -v v="" '$1==i{$10=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+    echo ""; return 0
+  fi
+  [[ $2 =~ ^(balanced|turbo|throughput|gaming)$ ]] || { echo "error: invalid preset" >&2; return 1; }
+  awk -F'|' -v OFS='|' -v i="$id" -v v="$2" '$1==i{$10=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+  if [[ $(cut -d'|' -f9 <<< "$r") == 1 ]]; then perf_apply "$2" >/dev/null 2>&1 || true; fi   # active tunnel: apply right away
+  echo "$2"
+}
+
+tun_transport() {   # ip-or-id [transport] [carrier_port] : read or set the per-tunnel transport (BackPack-style carrier switch)
+  local r id cur tr cport tok
+  r=$(tun_row "$1"); [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  id=${r%%|*}; cur=$(cut -d'|' -f15 <<< "$r"); [[ -n $cur ]] || cur=udp
+  if [[ -z ${2:-} ]]; then echo "$cur"; return 0; fi
+  tr=$2; tr_valid "$tr" || { echo "error: invalid transport (udp tcp ws wss kcp quic)" >&2; return 1; }
+  cport=${3:-}; [[ -z $cport || $cport =~ ^[0-9]+$ ]] || { echo "error: invalid carrier port" >&2; return 1; }
+  tok=$(cut -d'|' -f12 <<< "$r")
+  if [[ $tr != udp && ${#tok} -lt 16 ]]; then   # carried tunnels share a carrier token
+    tok=$(tun_token); [[ ${#tok} -ge 16 ]] || { echo "error: no entropy for the carrier token" >&2; return 1; }
+    awk -F'|' -v OFS='|' -v i="$id" -v v="$tok" '$1==i{$12=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+  fi
+  awk -F'|' -v OFS='|' -v i="$id" -v v="$tr" -v c="$cport" '$1==i{$15=v;$16=c}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
+  gost_side_down "$id"     # stop the old carrier (its unit and firewall rule go away)
+  tun_write_conf "$id"     # rewrite the WG conf: new start MTU and, when carried, the local Endpoint
+  tun_up "$id"             # WG back up (tun_up starts the new carrier too)
+  apply_rules
+  echo "$tr"
 }
 
 tun_probe_mtu() {   # id : echo the largest inner-MTU the link actually passes (binary search with DF pings)
@@ -221,6 +448,15 @@ tun_probe_mtu() {   # id : echo the largest inner-MTU the link actually passes (
     if ping -M do -s $((mid - 28)) -c1 -W1 "10.66.$id.2" >/dev/null 2>&1; then best=$mid; lo=$((mid + 1)); else hi=$((mid - 1)); fi
   done
   echo "$best"
+}
+
+tun_probe_pub() {   # ip-or-id : measure the link MTU without touching the saved config
+  local r id cur got
+  r=$(tun_row "$1"); [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  id=${r%%|*}; cur=$(cut -d'|' -f4 <<< "$r"); (( cur >= 1200 && cur <= 1500 )) || cur=1420
+  got=$(tun_probe_mtu "$id" 2>/dev/null)
+  ip link set dev "drwg$id" mtu "$cur" >/dev/null 2>&1 || true
+  echo "${got:-0}"
 }
 
 tun_automtu() {   # foreign_ip : detect the best MTU, save it and bounce the interface
@@ -238,6 +474,7 @@ tun_del() {   # foreign_ip
   [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
   tun_down "${r%%|*}"
   sed -i "/^${r%%|*}|/d" "$TUN"
+  [[ -s $REV ]] && sed -i "/^$1|/d" "$REV"   # drop this tunnel's reverse forwards too
   apply_rules
 }
 
@@ -251,6 +488,8 @@ tun_active() {   # foreign_ip 0|1   (1 = send the forwards through the tunnel)
     ping -c 2 -W 2 "10.66.$id.2" >/dev/null 2>&1 || { echo "error: the foreign end does not answer inside the tunnel" >&2; return 1; }
     local am; am=$(awk -F'|' -v i="$id" '$1==i{print $4}' "$TUN")
     if [[ $am == 0 ]]; then tun_automtu "$1" >/dev/null 2>&1 || true; fi   # MTU "auto": measure the real path once the link is live
+    local tp; tp=$(cut -d'|' -f10 <<< "$r")   # this tunnel's own performance preset
+    [[ $tp =~ ^(balanced|turbo|throughput|gaming)$ ]] && perf_apply "$tp" >/dev/null 2>&1 || true
   fi
   awk -F'|' -v OFS='|' -v ip="$1" -v v="$2" '$2==ip{$9=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
   apply_rules
@@ -264,10 +503,60 @@ tun_sync() {   # rebuild interfaces from tunnels.conf (after a restore)
   apply_rules
 }
 
+# ------------------------------------------------------ reverse forwards ----
+# Reverse = the port opens on the FOREIGN server and lands on a service of the
+# IRAN server, through the encrypted tunnel. Needed on both sides: the Iran
+# side writes the local DNAT (apply_rules), the foreign side gets the same
+# rules inside its setup script (tun_script), which the user runs again.
+
+rev_valid() {   # fip lport dport proto
+  valid_ip "$1" || { echo "error: invalid IP" >&2; return 1; }
+  valid_port "$2" && valid_port "$3" || { echo "error: invalid port" >&2; return 1; }
+  [[ $4 =~ ^(tcp|udp|both)$ ]] || { echo "error: invalid protocol" >&2; return 1; }
+  [[ -n $(tun_row "$1") ]] || { echo "error: no tunnel for $1 — create the tunnel first" >&2; return 1; }
+}
+
+rev_add() {   # foreign_ip listen_port dest_port_on_iran [proto]
+  local fip=$1 lp=$2 dp=$3 proto=${4:-tcp}
+  rev_valid "$fip" "$lp" "$dp" "$proto" || return 1
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  touch "$REV"; chmod 600 "$REV"
+  grep -q "^$fip|$lp|" "$REV" && { echo "error: this reverse port already exists for $fip" >&2; return 1; }
+  echo "$fip|$lp|$dp|$proto" >> "$REV"
+  apply_rules
+}
+
+rev_del() {   # foreign_ip listen_port
+  local fip=$1 lp=$2
+  [[ -s $REV ]] || { echo "error: no reverse forwards" >&2; return 1; }
+  grep -q "^$fip|$lp|" "$REV" || { echo "error: no such reverse forward" >&2; return 1; }
+  awk -F'|' -v f="$fip" -v l="$lp" '!($1==f && $2==l)' "$REV" > "$REV.tmp" && cat "$REV.tmp" > "$REV"; rm -f "$REV.tmp"
+  apply_rules
+}
+
+rev_list() {   # echo "foreign_ip|listen_port|dest_port|proto" rows
+  [[ -s $REV ]] && grep -v '^$' "$REV" || true
+}
+
+rev_test() {   # foreign_ip listen_port : 12 TCP probes through the loop kharej-DNAT -> Iran (BackPack-style)
+  local r id fip lp
+  r=$(tun_row "$1"); [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
+  id=${r%%|*}; valid_port "$2" || { echo "error: invalid port" >&2; return 1; }
+  grep -q "^$1|$2|" "$REV" 2>/dev/null || { echo "error: no reverse forward on port $2 for $1" >&2; return 1; }
+  local i ms ok=0 tot=0 mn=999999 mx=0
+  for i in $(seq 1 12); do
+    ms=$(tcp_time "10.66.$id.2" "$2")
+    if [[ $ms != fail ]]; then ok=$((ok + 1)); tot=$((tot + ms)); (( ms < mn )) && mn=$ms; (( ms > mx )) && mx=$ms; fi
+    sleep 0.15
+  done
+  if (( ok == 0 )); then echo "fail"; return 1; fi
+  echo "$ok/12 ok · avg $((tot / ok)) ms · min $mn · max $mx"
+}
+
 repair_wg() {   # watchdog helper: bounce every active interface whose handshake went stale
   local r id hs
   [[ -s $TUN ]] || return 0
-  while IFS='|' read -r id _ _ _ _ _ _ _ a; do
+  while IFS='|' read -r id _ _ _ _ _ _ _ a _; do
     [[ -z $id || $a != 1 ]] && continue
     hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
     if [[ ${hs:-0} -gt 0 ]]; then
@@ -279,9 +568,61 @@ repair_wg() {   # watchdog helper: bounce every active interface whose handshake
 }
 
 tun_script() {   # foreign_ip : the script to run on the foreign server
-  local r id port mtu fpriv ipub
+  local r id port mtu fpriv ipub revrules="" revn=0 rf lp dp rp p ty epdecl=""
   r=$(tun_row "$1"); [[ -n $r ]] || { echo "error: no tunnel for $1" >&2; return 1; }
-  IFS='|' read -r id _ port mtu _ fpriv ipub _ <<< "$r"
+  IFS='|' read -r id _ port mtu _ fpriv ipub _ _ _ ty _ _ _ tr cport <<< "$r"
+  ty=${ty:-fwd}; tr=${tr:-udp}
+  (( mtu >= 1200 && mtu <= 1500 )) || mtu=$(tr_mtu "$tr")   # 0 = auto: the foreign conf needs a number
+  if [[ $ty == rev ]]; then   # kharej dials in: it needs this (Iran) server's address as the WG endpoint
+    local myip; myip=$(web_pubip 2>/dev/null || true)
+    [[ -n $myip ]] && epdecl=$'Endpoint = '"$myip:$port"$'\nPersistentKeepalive = 25\n'
+  fi
+  if [[ -s $REV ]]; then   # embed the reverse forwards of THIS tunnel into the script
+    while IFS='|' read -r rf lp dp rp; do
+      [[ $rf == "$1" ]] || continue
+      for p in $(proto_list "$rp"); do
+        revrules+="iptables -t nat -A DRC_REV -p $p --dport $lp -j DNAT --to-destination 10.66.$id.1:$dp"$'\n'
+      done
+      revn=$((revn + 1))
+    done < "$REV"
+  fi
+  # when the transport is not plain UDP, the foreign side listens for the gost carrier
+  GOST_SRV=""
+  if [[ $tr != udp ]]; then
+    local cp tok
+    cp=$(tr_carrier_port "$id" "$cport")
+    tok=$(cut -d'|' -f12 <<< "$r")
+    [[ ${#tok} -ge 16 ]] || { tok=$(tun_token); awk -F'|' -v OFS='|' -v i="$id" -v v="$tok" '$1==i{$12=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"; }
+    gost_have || gost_install >/dev/null 2>&1   # this side too (for the status/preview); the foreign script installs its own copy
+    GOST_SRV="# --- transport carrier: gost listens on $(tr_proto "$tr")/$cp and hands the traffic to the local WireGuard ---
+if [[ ! -x /usr/local/bin/drc-gost ]]; then
+  garch=amd64; [[ \$(uname -m) == aarch64 || \$(uname -m) == arm64 ]] && garch=arm64; [[ \$(uname -m) == armv7l ]] && garch=armv7; [[ \$(uname -m) == i686 || \$(uname -m) == i386 ]] && garch=386
+  gtmp=\$(mktemp -d)
+  curl -fsSL --retry 2 -o \$gtmp/g.tgz \"https://github.com/go-gost/gost/releases/download/v$GOST_VER/gost_${GOST_VER}_linux_\$garch.tar.gz\" \
+    && curl -fsSL --retry 2 -o \$gtmp/s.txt \"https://github.com/go-gost/gost/releases/download/v$GOST_VER/checksums.txt\" \
+    || { echo \"gost download failed - the transport carrier needs it\"; exit 1; }
+  gwant=\$(awk -v f=\"gost_${GOST_VER}_linux_\$garch.tar.gz\" '\$2==f{print \$1}' \$gtmp/s.txt)
+  [[ -z \$gwant ]] || { (cd \$gtmp && echo \"\$gwant  g.tgz\" | sha256sum -c >/dev/null) || { echo \"gost checksum FAILED\"; exit 1; }; }
+  tar xzf \$gtmp/g.tgz -C \$gtmp gost 2>/dev/null || tar xzf \$gtmp/g.tgz -C \$gtmp
+  install -m 755 \$gtmp/gost /usr/local/bin/drc-gost && rm -rf \$gtmp
+fi
+cat > /etc/systemd/system/drc-goss$id.service <<GEOF
+[Unit]
+Description=DR-CPanel transport carrier (tunnel $id)
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/drc-gost -L \"relay+$tr://$tok@:$cp\"
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+GEOF
+iptables -I INPUT -p $(tr_proto "$tr") --dport $cp -j ACCEPT 2>/dev/null || true
+command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q \"Status: active\" && ufw allow $cp/$(tr_proto "$tr") >/dev/null 2>&1
+systemctl daemon-reload; systemctl enable --now drc-goss$id >/dev/null 2>&1
+echo \"Transport carrier: $tr on port $cp\"
+"
+  fi
   cat <<EOS
 # DR-CPanel: foreign-server side of the encrypted tunnel. Run once, as root.
 set -e
@@ -304,13 +645,13 @@ PostDown = iptables -D INPUT -p udp --dport $port -j ACCEPT || true; iptables -D
 
 [Peer]
 PublicKey = $ipub
-AllowedIPs = 10.66.$id.1/32
+${epdecl}AllowedIPs = 10.66.$id.1/32
 WGEOF
 )
 systemctl enable wg-quick@drwg$id >/dev/null 2>&1 || true
 systemctl restart wg-quick@drwg$id 2>/dev/null || { wg-quick down drwg$id 2>/dev/null; wg-quick up drwg$id; }
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow $port/udp; ufw allow in on drwg$id; fi
-# iperf3 listener on the tunnel IP: lets the panel measure the real bandwidth of this link
+${GOST_SRV}# iperf3 listener on the tunnel IP: lets the panel measure the real bandwidth of this link
 command -v iperf3 >/dev/null 2>&1 || {
   if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1 || true
   elif command -v dnf >/dev/null 2>&1; then dnf install -y -q iperf3 >/dev/null 2>&1 || true
@@ -330,21 +671,183 @@ WantedBy=multi-user.target
 IPEOF
 systemctl daemon-reload; systemctl enable --now drc-iperf >/dev/null 2>&1 || true
 fi
-echo "Done. Tunnel address on this server: 10.66.$id.2"
+# --- DR-CPanel reverse forwards: these ports on THIS server reach services on the IRAN server ---
+sysctl -q -w net.ipv4.ip_forward=1 || true
+iptables -t nat    -N DRC_REV     2>/dev/null || true; iptables -t nat    -F DRC_REV
+iptables -t nat    -C PREROUTING  -j DRC_REV 2>/dev/null || iptables -t nat -I PREROUTING 1 -j DRC_REV
+iptables -t nat    -N DRC_REVPOST 2>/dev/null || true; iptables -t nat    -F DRC_REVPOST
+iptables -t nat    -C POSTROUTING -j DRC_REVPOST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j DRC_REVPOST
+iptables -t nat    -A DRC_REVPOST -o drwg$id -j MASQUERADE
+iptables -t filter -N DRC_REVFWD  2>/dev/null || true; iptables -t filter -F DRC_REVFWD
+iptables -t filter -C FORWARD -j DRC_REVFWD 2>/dev/null || iptables -t filter -I FORWARD 1 -j DRC_REVFWD
+iptables -t filter -A DRC_REVFWD -i drwg$id -j ACCEPT
+${revrules}
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow in on drwg$id; fi
+echo "Done. Tunnel address on this server: 10.66.$id.2 · reverse forwards: $revn"
+EOS
+}
+
+tun_script_join() {   # token host client_ip : the one-line join script the panel serves at /join/<token>
+  local tok=$1 host=$2 cip=$3 r id fip port mtu fpriv ipub ty name tr cport revrules="" revn=0 rf lp dp rp p ephost
+  r=$(awk -F'|' -v t="$tok" '$12==t{print;exit}' "$TUN" 2>/dev/null)
+  [[ -n $r ]] || { echo "error: unknown or expired join link" >&2; return 1; }
+  IFS='|' read -r id fip port mtu _ fpriv ipub _ _ _ ty _ name _ tr cport <<< "$r"
+  ty=${ty:-rev}; tr=${tr:-udp}
+  if [[ $(cut -d'|' -f2 <<< "$r") == pending ]]; then
+    tun_join_setip "$tok" "$cip" >/dev/null || return 1
+    fip=$cip
+  fi
+  ephost=$host
+  if [[ $ephost == *:* ]]; then
+    [[ ${ephost##*:} =~ ^[0-9]+$ ]] && ephost=${ephost%:*}   # strip the panel port from "host:port"
+    [[ $ephost == *:* ]] && ephost="[$ephost]"                # bare IPv6 host needs brackets
+  fi
+  [[ -n $ephost ]] || ephost=$(hostname -I 2>/dev/null | awk '{print $1}')
+  if [[ -s $REV ]]; then   # reverse forwards already defined for this tunnel are baked into the join script
+    while IFS='|' read -r rf lp dp rp; do
+      [[ $rf == "$fip" ]] || continue
+      for p in $(proto_list "$rp"); do
+        revrules+="iptables -t nat -A DRC_REV -p $p --dport $lp -j DNAT --to-destination 10.66.$id.1:$dp"$'\n'
+      done
+      revn=$((revn + 1))
+    done < "$REV"
+  fi
+  local epdecl="" lp
+  lp=$(tr_local_port "$id")
+  if [[ $ty == rev ]]; then
+    if [[ $tr == udp ]]; then
+      [[ -n $ephost ]] && epdecl=$'Endpoint = '"$ephost:$port"$'
+PersistentKeepalive = 25
+'
+    else   # carried transport: WG dials the local gost feed, gost dials the Iran carrier port
+      [[ -n $ephost ]] && epdecl=$'Endpoint = 127.0.0.1:'"$lp"$'
+PersistentKeepalive = 25
+'
+    fi
+  fi
+  (( mtu >= 1200 && mtu <= 1500 )) || mtu=$(tr_mtu "$tr")
+  # when the transport is not plain UDP, the foreign side runs a gost client that feeds WG
+  GOST_CLI=""
+  if [[ $tr != udp ]]; then
+    local cp tok sec=""
+    cp=$(tr_carrier_port "$id" "$cport")
+    tok=$(cut -d'|' -f12 <<< "$r")
+    [[ $tr == wss ]] && sec="?secure=false"
+    GOST_CLI="# --- transport carrier: a gost client feeds the local WireGuard through $tr to Iran:$cp ---
+if [[ ! -x /usr/local/bin/drc-gost ]]; then
+  garch=amd64; [[ \$(uname -m) == aarch64 || \$(uname -m) == arm64 ]] && garch=arm64; [[ \$(uname -m) == armv7l ]] && garch=armv7; [[ \$(uname -m) == i686 || \$(uname -m) == i386 ]] && garch=386
+  gtmp=\$(mktemp -d)
+  curl -fsSL --retry 2 -o \$gtmp/g.tgz \"https://github.com/go-gost/gost/releases/download/v$GOST_VER/gost_${GOST_VER}_linux_\$garch.tar.gz\" \\
+    && curl -fsSL --retry 2 -o \$gtmp/s.txt \"https://github.com/go-gost/gost/releases/download/v$GOST_VER/checksums.txt\" \\
+    || { echo \"gost download failed - the transport carrier needs it\"; exit 1; }
+  gwant=\$(awk -v f=\"gost_${GOST_VER}_linux_\$garch.tar.gz\" '\$2==f{print \$1}' \$gtmp/s.txt)
+  [[ -z \$gwant ]] || { (cd \$gtmp && echo \"\$gwant  g.tgz\" | sha256sum -c >/dev/null) || { echo \"gost checksum FAILED\"; exit 1; }; }
+  tar xzf \$gtmp/g.tgz -C \$gtmp gost 2>/dev/null || tar xzf \$gtmp/g.tgz -C \$gtmp
+  install -m 755 \$gtmp/gost /usr/local/bin/drc-gost && rm -rf \$gtmp
+fi
+cat > /etc/systemd/system/drc-gosc$id.service <<GEOF
+[Unit]
+Description=DR-CPanel transport carrier (tunnel $id, client)
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/drc-gost -L \"udp://127.0.0.1:$lp/127.0.0.1:$port?keepalive=true\" -F \"relay+$tr://$tok@$ephost:$cp$sec\"
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+GEOF
+systemctl daemon-reload; systemctl enable --now drc-gosc$id >/dev/null 2>&1
+echo \"Transport carrier: $tr to $ephost:$cp (local feed 127.0.0.1:$lp)\"
+"
+  fi
+  cat <<EOS
+#!/usr/bin/env bash
+# DR-CPanel join script (tunnel #$id${name:+ "$name"}, type: $ty). Run once, as root, on the KHAREJ server.
+set -e
+[ "\$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+if ! command -v wg-quick >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y wireguard-tools
+  elif command -v yum >/dev/null 2>&1; then yum install -y epel-release wireguard-tools
+  else echo "install WireGuard first"; exit 1; fi
+fi
+mkdir -p /etc/wireguard
+( umask 077; cat > /etc/wireguard/drwg$id.conf <<'WGEOF'
+[Interface]
+Address = 10.66.$id.2/30
+ListenPort = $port
+PrivateKey = $fpriv
+MTU = ${mtu:-1420}
+PostUp = iptables -I INPUT -p udp --dport $port -j ACCEPT || true; iptables -I INPUT -i drwg$id -j ACCEPT || true
+PostDown = iptables -D INPUT -p udp --dport $port -j ACCEPT || true; iptables -D INPUT -i drwg$id -j ACCEPT || true
+
+[Peer]
+PublicKey = $ipub
+${epdecl}AllowedIPs = 10.66.$id.1/32
+WGEOF
+)
+systemctl enable wg-quick@drwg$id >/dev/null 2>&1 || true
+systemctl restart wg-quick@drwg$id 2>/dev/null || { wg-quick down drwg$id 2>/dev/null; wg-quick up drwg$id; }
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow $port/udp; ufw allow in on drwg$id; fi
+command -v iperf3 >/dev/null 2>&1 || {
+  if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y -q iperf3 >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then yum install -y -q iperf3 >/dev/null 2>&1 || true; fi
+}
+if command -v iperf3 >/dev/null 2>&1; then
+cat > /etc/systemd/system/drc-iperf.service <<IPEOF
+[Unit]
+Description=DR-CPanel bandwidth test (iperf3 on the tunnel link)
+After=network-online.target
+[Service]
+ExecStart=/usr/bin/iperf3 -s -B 10.66.$id.2
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+IPEOF
+systemctl daemon-reload; systemctl enable --now drc-iperf >/dev/null 2>&1 || true
+fi
+${GOST_CLI}# --- DR-CPanel reverse forwards: these ports on THIS server reach services on the Iran server ---
+sysctl -q -w net.ipv4.ip_forward=1 || true
+iptables -t nat    -N DRC_REV     2>/dev/null || true; iptables -t nat    -F DRC_REV
+iptables -t nat    -C PREROUTING  -j DRC_REV 2>/dev/null || iptables -t nat -I PREROUTING 1 -j DRC_REV
+iptables -t nat    -N DRC_REVPOST 2>/dev/null || true; iptables -t nat    -F DRC_REVPOST
+iptables -t nat    -C POSTROUTING -j DRC_REVPOST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j DRC_REVPOST
+iptables -t nat    -A DRC_REVPOST -o drwg$id -j MASQUERADE
+iptables -t filter -N DRC_REVFWD  2>/dev/null || true; iptables -t filter -F DRC_REVFWD
+iptables -t filter -C FORWARD -j DRC_REVFWD 2>/dev/null || iptables -t filter -I FORWARD 1 -j DRC_REVFWD
+iptables -t filter -A DRC_REVFWD -i drwg$id -j ACCEPT
+${revrules}
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow in on drwg$id; fi
+echo "Done. Tunnel address on this server: 10.66.$id.2 · type: $ty · transport: $tr · reverse forwards: $revn"
 EOS
 }
 
 tunnel_cli() {
   case "${1:-}" in
-    add)    shift; tun_add "$@";;
-    del)    tun_del "${2:-}";;
-    script) tun_script "${2:-}";;
-    use)    tun_active "${2:-}" 1;;
-    direct) tun_active "${2:-}" 0;;
-    sync)   tun_sync;;
-    mtu)    tun_automtu "${2:-}";;
-    repair) repair_wg;;
-    *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] | del IP | script IP | use IP | direct IP | mtu IP | sync | repair"; return 1;;
+    add)     shift; tun_add "$@";;
+    join-open) shift; tun_add_rev "${1:-}" "${2:-turbo}" "${3:-}" "${4:-udp}" "${5:-}";;
+    link)    tun_link "${2:-}";;
+    script-join) shift; tun_script_join "${1:-}" "${2:-}" "${3:-}";;
+    transport) shift; tun_transport "${1:-}" "${2:-}" "${3:-}";;
+    mtuprobe) tun_probe_pub "${2:-}";;
+    del)     tun_del "${2:-}";;
+    script)  tun_script "${2:-}";;
+    use)     tun_active "${2:-}" 1;;
+    direct)  tun_active "${2:-}" 0;;
+    sync)    tun_sync;;
+    mtu)     tun_automtu "${2:-}";;
+    preset)  tun_preset "${2:-}" "${3:-}";;
+    reverse) case "${2:-}" in
+               add)  rev_add "${3:-}" "${4:-}" "${5:-}" "${6:-tcp}";;
+               del)  rev_del "${3:-}" "${4:-}";;
+               list) rev_list;;
+               test) rev_test "${3:-}" "${4:-}";;
+               *) echo "Usage: $0 reverse add IP LPORT DPORT [proto] | del IP LPORT | list | test IP LPORT"; return 1;;
+             esac;;
+    repair)  repair_wg;;
+    *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] [preset] [fwd|dir] [name] [transport] | join-open [UDP_PORT] [preset] [name] [transport] | link IP-or-ID | script IP | script-join TOKEN HOST CLIENT_IP | transport IP [udp|tcp|ws|wss|kcp|quic] [carrier_port] | use IP | direct IP | mtu IP | mtuprobe IP | preset IP [name] | reverse add|del|list|test ... | sync | repair"; return 1;;
   esac
 }
 
@@ -356,16 +859,47 @@ tun_pick() {   # sets TFIP
   [[ -n $TFIP ]] || { err "Invalid number."; return 1; }
 }
 
+kharej_join() {   # [url] : run on a FOREIGN server - fetch the join script from the Iran panel and bring the tunnel up
+  local url=${1:-} sc
+  banner
+  echo "  ${C_BLD}Setup Kharej - join an Iran tunnel${C_RST}"; echo
+  info "Paste the join link the Iran panel gave you (looks like https://IRAN:8443/join/<token>)."
+  [[ -n $url ]] || read -rp "  Join link: " url
+  url=$(printf '%s' "$url" | tr -d '"'\''')
+  [[ $url =~ ^https?://[^[:space:]]+/join/[0-9a-f]{16,64}$ ]] || { err "That does not look like a DR-CPanel join link."; return 1; }
+  info "Fetching the join script from the Iran server..."
+  sc=$(curl -fsSLk --max-time 60 "$url") || { err "Could not fetch the link (is the Iran panel reachable from here?)"; return 1; }
+  [[ $sc == *"DR-CPanel join script"* ]] || { err "The server did not return a DR-CPanel join script."; return 1; }
+  bash -c "$sc"
+  echo
+  kharej_status
+}
+
+kharej_status() {   # the foreign-side view: every drwg* link, its handshake age and its carrier
+  local hs ifc n=0
+  banner
+  echo "  ${C_BLD}Kharej links (this server)${C_RST}"; echo
+  for ifc in $(ip -o link show 2>/dev/null | awk -F': ' '/drwg/{print $2}'); do
+    n=$((n + 1))
+    hs=$(wg show "$ifc" latest-handshakes 2>/dev/null | awk '{print $2}')
+    local age="no handshake"
+    [[ ${hs:-0} -gt 0 ]] && age="$(( ($(date +%s) - hs) / 60 )) min ago"
+    printf "  %-12s %s\n" "$ifc" "$age"
+  done
+  (( n == 0 )) && info "No tunnels on this server yet - run: dr-cpanel join '<link>'"
+  return 0
+}
+
 tunnel_menu() {
-  banner; echo "  ${C_BLD}Encrypted transport (WireGuard)${C_RST}"; echo
-  info "Encrypts the Iran <-> foreign link in the kernel (ChaCha20). One command runs on the foreign server."; echo
-  local i=0 id fip port a hs c r
+  banner; echo "  ${C_BLD}Encrypted transport (WireGuard + carrier)${C_RST}"; echo
+  info "Encrypts the Iran <-> foreign link in the kernel (ChaCha20); every tunnel picks its own carrier (UDP/TCP/WS/WSS/KCP/QUIC)."; echo
+  local i=0 id fip port a hs c r pr tr cp
   if [[ -s $TUN ]]; then
-    printf "  ${C_BLD}%-3s %-17s %-6s %-13s %s${C_RST}\n" "#" "FOREIGN IP" UDP LINK "FORWARDS VIA"
-    while IFS='|' read -r id fip port _ _ _ _ _ a; do
+    printf "  ${C_BLD}%-3s %-17s %-6s %-8s %-13s %-12s %s${C_RST}\n" "#" "FOREIGN IP" "PORT" "TR" "LINK" "PRESET" "FORWARDS VIA"
+    while IFS='|' read -r id fip port _ _ _ _ _ a pr _ _ _ _ tr; do
       [[ -z $id ]] && continue; i=$((i + 1))
       hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
-      printf "  %-3s %-17s %-6s %-13s %s\n" "$i" "$fip" "$port" "$([[ ${hs:-0} -gt 0 ]] && echo linked || echo no-handshake)" "$([[ $a == 1 ]] && echo tunnel || echo direct)"
+      printf "  %-3s %-17s %-6s %-8s %-13s %-12s %s\n" "$i" "$fip" "$port" "${tr:-udp}" "$([[ ${hs:-0} -gt 0 ]] && echo linked || echo no-handshake)" "${pr:--}" "$([[ $a == 1 ]] && echo tunnel || echo direct)"
     done < "$TUN"; echo
   fi
   echo "   1) Create tunnel to a foreign server"
@@ -374,24 +908,96 @@ tunnel_menu() {
   echo "   4) Switch forwards back to direct"
   echo "   5) Remove tunnel"
   echo "   6) Auto-tune MTU         find the largest packet the link passes"
+  echo "   7) Performance preset    per-tunnel preset, applied when the tunnel is active"
+  echo "   8) Reverse forwards      ports on the foreign server -> services on this (Iran) server"
+  echo "   9) Transport             switch a tunnel between UDP / TCP / WS / WSS / KCP / QUIC"
   echo "   0) Back"; echo
   read -rp "  Select: " c
   case $c in
-    1) read -rp "  Foreign server IP: " fip; read -rp "  UDP port [51820]: " port
-       if tun_add "$fip" "${port:-51820}"; then ok "Tunnel created. Run this on the foreign server as root:"; echo; tun_script "$fip"
+    1) read -rp "  Foreign server IP: " fip; read -rp "  Tunnel port [51820]: " port
+       echo "  Transport (how the tunnel crosses the path):"
+       echo "    1) UDP (fastest)   2) TCP   3) WebSocket   4) WSS   5) KCP   6) QUIC"
+       read -rp "  Select [1]: " tc
+       case ${tc:-1} in 2) tr=tcp;; 3) tr=ws;; 4) tr=wss;; 5) tr=kcp;; 6) tr=quic;; *) tr=udp;; esac
+       cp=""; [[ $tr != udp ]] && { read -rp "  Carrier port on the foreign server [auto]: " cp; }
+       echo "  Performance preset for THIS tunnel:"
+       echo "    1) Balanced   2) Turbo (recommended)   3) Throughput   4) Gaming   Enter = Turbo"
+       read -rp "  Select [2]: " pc
+       case ${pc:-2} in 1) pr=balanced;; 3) pr=throughput;; 4) pr=gaming;; *) pr=turbo;; esac
+       if tun_add "$fip" "${port:-51820}" 0 "$pr" fwd "" "$tr" "$cp"; then ok "Tunnel created (transport: $tr · preset: $pr). Run this on the foreign server as root:"; echo; tun_script "$fip"
        else err "Failed."; fi;;
     2) tun_pick && tun_script "$TFIP";;
     3) tun_pick && { if tun_active "$TFIP" 1; then ok "Forwards to $TFIP now use the tunnel. MTU: $(awk -F'|' -v ip="$TFIP" '$2==ip{print $4}' "$TUN")"; else err "Not switched."; fi; };;
     4) tun_pick && { tun_active "$TFIP" 0 && ok "Forwards to $TFIP are direct again."; };;
     5) tun_pick && confirm "Remove the tunnel to $TFIP? Its forwards go back to direct." && tun_del "$TFIP" && ok "Removed.";;
     6) tun_pick && { local got; if got=$(tun_automtu "$TFIP"); then ok "Best MTU for this link: $got"; else err "Could not measure (link must be connected first)."; fi; };;
+    7) tun_pick && { local cur; cur=$(tun_preset "$TFIP")
+       echo "  Current preset: ${cur:-- (system default)}"
+       echo "    1) Balanced   2) Turbo   3) Throughput   4) Gaming   5) none (follow the system preset)"
+       read -rp "  Select: " pc
+       case $pc in
+         1) tun_preset "$TFIP" balanced && ok "Preset: balanced (applies now if the tunnel is active).";;
+         2) tun_preset "$TFIP" turbo && ok "Preset: turbo (applies now if the tunnel is active).";;
+         3) tun_preset "$TFIP" throughput && ok "Preset: throughput (applies now if the tunnel is active).";;
+         4) tun_preset "$TFIP" gaming && ok "Preset: gaming (applies now if the tunnel is active).";;
+         5) tun_preset "$TFIP" none && ok "Tunnel follows the system preset again.";;
+         *) err "Canceled.";;
+       esac; };;
+    8) reverse_menu;;
+    9) tun_pick && { local cur ntr
+       cur=$(tun_transport "$TFIP")
+       echo "  Current transport: $cur"
+       echo "    1) UDP (plain WireGuard, fastest)   2) TCP   3) WebSocket   4) WSS   5) KCP   6) QUIC"
+       echo "  (for anything but UDP the foreign server's script must be run again after the switch)"
+       read -rp "  Select: " tc
+       case $tc in
+         1) ntr=udp;; 2) ntr=tcp;; 3) ntr=ws;; 4) ntr=wss;; 5) ntr=kcp;; 6) ntr=quic;; *) err "Canceled."; return;;
+       esac
+       local ncp=""; [[ $ntr != udp ]] && { read -rp "  Carrier port [auto]: " ncp; }
+       if got=$(tun_transport "$TFIP" "$ntr" "$ncp"); then ok "Transport: $got. If this tunnel is carried (not UDP), re-run the foreign script on the other server."; else err "Failed."; fi; };;
+  esac
+}
+
+reverse_menu() {   # ports on the foreign server that reach services on the Iran server
+  banner; echo "  ${C_BLD}Reverse forwards${C_RST}"; echo
+  info "The port opens on the FOREIGN server; whoever connects lands on a service of THIS (Iran) server, through the encrypted tunnel."
+  info "Example: your vpn/panel runs on this Iran server; publish it on the foreign server's clean IP."
+  local n=0 rf fip lp dp rp c
+  if [[ -s $REV ]]; then
+    printf "\n  ${C_BLD}%-3s %-17s %-13s %-13s %s${C_RST}\n" "#" "FOREIGN IP" "PORT (foreign)" "PORT (iran)" PROTO
+    while IFS='|' read -r fip lp dp rp; do
+      [[ -z $fip ]] && continue; n=$((n + 1))
+      printf "  %-3s %-17s %-13s %-13s %s\n" "$n" "$fip" "$lp" "$dp" "$rp"
+    done < "$REV"
+  else
+    info "No reverse forwards yet."
+  fi
+  echo
+  echo "   1) Add a reverse forward       (foreign port -> an Iran service port)"
+  echo "   2) Remove a reverse forward"
+  echo "   3) Test a reverse forward      (12 probes through the whole loop)"
+  echo "   4) Show the foreign script     (run it again on the foreign server after any change)"
+  echo "   0) Back"; echo
+  read -rp "  Select: " c
+  case $c in
+    1) read -rp "  Foreign server IP: " fip; read -rp "  Port on the FOREIGN server: " lp
+       read -rp "  Port of the service on THIS (Iran) server: " dp; read -rp "  Protocol tcp/udp/both [tcp]: " rp
+       if rev_add "$fip" "$lp" "$dp" "${rp:-tcp}"; then
+         ok "Reverse forward saved."
+         warn "Now show the foreign script (option 4) and run it on the foreign server again — the port opens there."
+       else err "Failed."; fi;;
+    2) read -rp "  Foreign server IP: " fip; read -rp "  Port on the foreign server: " lp
+       rev_del "$fip" "$lp" && { ok "Removed."; warn "Run the foreign script again (option 4) to close the port there."; };;
+    3) read -rp "  Foreign server IP: " fip; read -rp "  Port on the foreign server: " lp
+       local res; res=$(rev_test "$fip" "$lp") && ok "Reverse test: $res" || err "${res#*: }";;
+    4) read -rp "  Foreign server IP: " fip && tun_script "$fip";;
   esac
 }
 
 apply_rules() {
   sysctl -q -w net.ipv4.ip_forward=1 >/dev/null 2>&1
   local spec t chain parent
-  for spec in "mangle PREROUTING DRC_SEC" "mangle FORWARD DRC_MSS" "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD"; do
+  for spec in "mangle PREROUTING DRC_SEC" "mangle FORWARD DRC_MSS" "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD" "filter INPUT DRC_IN"; do
     set -- $spec; t=$1; parent=$2; chain=$3
     iptables -t "$t" -N "$chain" 2>/dev/null || true
     iptables -t "$t" -F "$chain"
@@ -403,6 +1009,22 @@ apply_rules() {
     while IFS='|' read -r tid _; do
       [[ -n $tid ]] && iptables -t mangle -A DRC_MSS -o "drwg$tid" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     done < "$TUN"
+  fi
+  # reverse forwards: packets arriving from the foreign side for a service on this (Iran) server.
+  # The foreign script DNATs kharej:listen -> 10.66.<id>.1:port; here we steer it to 127.0.0.1
+  # so services that only listen on localhost work too (route_localnet makes that legal).
+  if [[ -s $REV ]]; then
+    local rf fip lp dp rp trow
+    while IFS='|' read -r fip lp dp rp; do
+      [[ -z $fip ]] && continue
+      trow=$(tun_row "$fip"); [[ -n $trow ]] || continue
+      tid=${trow%%|*}
+      sysctl -q -w "net.ipv4.conf.drwg$tid.route_localnet=1" >/dev/null 2>&1 || true
+      for p in $(proto_list "$rp"); do
+        iptables -t nat    -A DRC_PRE -i "drwg$tid" -p "$p" -d "10.66.$tid.1" --dport "$dp" -j DNAT --to-destination "127.0.0.1:$dp"
+        iptables -t filter -A DRC_IN  -i "drwg$tid" -p "$p" --dport "$dp" -m comment --comment "drc-rev:$lp" -j ACCEPT
+      done
+    done < "$REV"
   fi
   [[ -s $CONF ]] || return 0
   local name proto lport ip dport p act tip
@@ -516,6 +1138,8 @@ BIN = "/usr/local/bin/dr-cpanel"; UI = os.path.join(os.path.dirname(os.path.absp
 CERT = D + "/web.crt"; KEY = D + "/web.key"; LOGF = "/var/log/dr-cpanel.log"; SECF = D + "/security.conf"
 LOCK = threading.Lock(); CLOCK = threading.Lock(); SESS = {}; FAILS = {}
 LOGS = collections.deque(maxlen=300); HEALTH = {}; SYS = {}
+JOINMISS = {}   # rate limiting for the public /join/<token> endpoint
+CTMISS = {}     # rate limiting for the public /ctest/<id> + report endpoints
 
 # ------------------------------------------------------------ config / log
 def cfg():
@@ -653,7 +1277,31 @@ def tunnels():
     try:
         for l in open(TUNF):
             p = l.rstrip("\n").split("|")
-            if len(p) >= 9: out[p[1]] = dict(id=int(p[0]), ip=p[1], port=int(p[2]), mtu=int(p[3]), active=p[8] == "1")
+            if len(p) >= 9:
+                pend = p[1] == "pending"   # rev tunnel created in the wizard; the kharej has not fetched its join link yet
+                ty = p[10] if len(p) > 10 and p[10] in ("fwd", "dir", "rev") else "fwd"
+                tr = p[14] if len(p) > 14 and p[14] in ("udp", "tcp", "ws", "wss", "kcp", "quic") else "udp"
+                cp = int(p[15]) if len(p) > 15 and p[15].isdigit() else 0
+                key = ("pending%s" % p[0]) if pend else p[1]
+                out[key] = dict(id=int(p[0]), ip=("pending" if pend else p[1]), port=int(p[2]), mtu=int(p[3]), active=p[8] == "1",
+                                preset=(p[9] if len(p) > 9 and p[9] in ("balanced", "turbo", "throughput", "gaming") else ""),
+                                type=ty, pending=pend, name=(p[12] if len(p) > 12 else ""), has_link=bool(len(p) > 11 and p[11]),
+                                tr=tr, cport=cp)
+    except (FileNotFoundError, ValueError): pass
+    return out
+
+def tun_by(k):   # look a tunnel up by its foreign IP, its id, or its pending-<id> key
+    ts = tunnels()
+    return ts.get(k) or next((t for t in ts.values() if str(t["id"]) == str(k)), None)
+
+REVF = D + "/reverse.conf"
+
+def rev_rows():
+    out = []
+    try:
+        for l in open(REVF):
+            p = l.rstrip("\n").split("|")
+            if len(p) == 4: out.append(dict(ip=p[0], lport=int(p[1]), dport=int(p[2]), proto=p[3]))
     except (FileNotFoundError, ValueError): pass
     return out
 
@@ -690,25 +1338,53 @@ def summarize(v):
     j = sum(abs(a - b) for a, b in zip(ok, ok[1:])) / (len(ok) - 1) if len(ok) > 1 else 0
     return dict(ok=True, min=round(min(ok)), avg=round(sum(ok) / len(ok)), max=round(max(ok)), jitter=round(j, 1), loss=round(100 * (n - len(ok)) / n))
 
-def tcp_series(ip, port, n=8):
+def tcp_series(ip, port, n=12, to=4, gap=0.15):
+    # BackPack-style probe: TCP connect timing (ICMP is often blocked where tunnel traffic flows fine)
     v = []
     for _ in range(n):
         s = time.time()
-        try: socket.create_connection((ip, port), 2).close(); v.append((time.time() - s) * 1000)
+        try: socket.create_connection((ip, port), to).close(); v.append((time.time() - s) * 1000)
         except Exception: v.append(None)
-        time.sleep(0.1)
+        time.sleep(gap)
     return summarize(v)
 
+def udp_egress():
+    # one DNS query over UDP to three resolvers: does UDP leave this machine at all? (WireGuard needs it)
+    q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+    for dns in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5)
+            s.sendto(q, (dns, 53)); s.recvfrom(512); s.close(); return True
+        except Exception:
+            try: s.close()
+            except Exception: pass
+    return False
+
+def recommend(res, udp_ok):
+    # maps the measured link to a DR-CPanel preset, the way BackPack's Link Test maps it to a transport
+    if not udp_ok:
+        return dict(preset="", label="udp_blocked", fa="خروجی UDP بسته است")
+    q = (res.get("tunnel") or {}).get("tcp") or res.get("direct") or {}
+    if not q.get("ok"): return dict(preset="", label="unreachable", fa="مقصد پاسخ نمی‌دهد")
+    loss, jit, avg = q.get("loss", 100), q.get("jitter", 0), q.get("avg", 0)
+    if loss >= 20: return dict(preset="gaming", label="unstable", fa="لینک ناپایدار — پیشنهاد: Gaming")
+    if loss >= 2:  return dict(preset="throughput", label="lossy", fa="پکت‌خسری %s%% — پیشنهاد: Throughput" % loss)
+    if avg and jit > avg / 3: return dict(preset="turbo", label="jittery", fa="لینک شلوغ/نوسانی — پیشنهاد: Turbo")
+    return dict(preset="turbo", label="clean", fa="لینک تمیز و پایدار — Turbo مناسب است")
+
 def transport_test(ip, port):
-    # Compares the plain forward with the encrypted tunnel: TCP connect time, jitter and loss to the same foreign port.
+    # BackPack-style Link Test: 12 TCP probes direct vs tunnel + UDP egress + a preset recommendation
+    t = tun_by(ip)
     ports = [r["dport"] for r in read_rules() if r["ip"] == ip and r["proto"] != "udp"]
     port = port or (ports[0] if ports else 443)
-    t = tunnels().get(ip); res = dict(ip=ip, port=port, direct=None, tunnel=None, verdict="no_tunnel")
-    with ThreadPoolExecutor(2) as ex:
+    res = dict(ip=ip, port=port, direct=None, tunnel=None, verdict="no_tunnel")
+    with ThreadPoolExecutor(3) as ex:
         fd = ex.submit(tcp_series, ip, port)
         ft = ex.submit(tcp_series, peer(t), port) if t else None
+        fu = ex.submit(udp_egress)
         res["direct"] = fd.result()
         if t: res["tunnel"] = dict(tcp=ft.result())
+        res["udp"] = fu.result()
     if t:
         up = next((x["up"] for x in tunnel_info() if x["ip"] == ip), False); w = res["tunnel"]["tcp"]; d = res["direct"]
         if not w["ok"]: res["verdict"] = "wg_nosvc" if up else "wg_down"
@@ -716,11 +1392,19 @@ def transport_test(ip, port):
         else:
             sd = d["avg"] + 15 * d["loss"]; sw = w["avg"] + 15 * w["loss"]
             res["verdict"] = "wg" if sw <= sd * 1.3 + 10 else "direct"
+    res["rec"] = recommend(res, res["udp"])
     return res
+
+def rev_test(ip, lport):
+    # full reverse loop: Iran -> foreign tunnel IP:listen -> foreign DNAT -> back to the Iran service
+    t = tun_by(ip)
+    if not t: raise ValueError("no_tunnel")
+    if not any(r["ip"] == ip and r["lport"] == int(lport) for r in rev_rows()): raise ValueError("no_reverse")
+    return tcp_series(peer(t), int(lport))
 
 def bwtest(ip):
     # real throughput of the encrypted link: iperf3 UDP to the iperf3 listener on the foreign tunnel IP
-    t = tunnels().get(ip)
+    t = tun_by(ip)
     if not t: raise ValueError("no_tunnel")
     if not shutil.which("iperf3"):
         for pm in (["apt-get", "install", "-y", "-qq", "iperf3"], ["dnf", "install", "-y", "iperf3"], ["yum", "install", "-y", "iperf3"]):
@@ -737,6 +1421,154 @@ def bwtest(ip):
     except Exception: raise ValueError("bw_fail")
     return dict(mbps=round(s.get("bits_per_second", 0) / 1e6, 1), jitter=round(s.get("jitter_ms", 0), 2),
                 loss=round(s.get("lost_percent", 0), 1), pps=round(s.get("packets", 0) / 5), mtu=t.get("mtu"))
+
+# --------------------------------------------------- connection test (BackPack-style)
+CTF = D + "/conntest.json"
+CTF2 = D + "/ctest.json"   # two-server connection test: {"id","tport","uport","until","report"}
+CT = {"running": False, "result": None}
+
+def ctest_script(cid, host, tport, uport, api):
+    # the script the kharej runs for the two-server test: real probes (ICMP + TCP echo + UDP echo),
+    # a table printed on BOTH sides, and the report posted back to this panel
+    host = str(host).split(":")[0]
+    sc = """#!/usr/bin/env bash
+# DR-CPanel two-server connection test - run as root on the KHAREJ server
+IRAN="@HOST@"; TPORT=@TPORT@; UPORT=@UPORT@; RID="@CID@"; API="@API@"
+icmp='{"ok":false,"loss":100}'; tcp='{"ok":false}'; udp='{"ok":false}'
+pl=$(ping -4 -q -c 10 -W 1 "$IRAN" 2>/dev/null | tail -2)
+loss=$(sed -n 's/.*, \\([0-9.]*\\)% packet loss.*/\\1/p' <<<"$pl" | tail -1)
+rtt=$(sed -n 's@.* = [0-9.]*/\\([0-9.]*\\)/[0-9.]*/\\([0-9.]*\\).*@\\1 \\2@p' <<<"$pl" | tail -1)
+avg=${rtt%% *}; jit=${rtt##* }
+if [[ -n $loss && $loss != 100 ]]; then
+  icmp=$(printf '{"ok":true,"loss":%s,"avg":%s,"jit":%s}' "$loss" "${avg:-0}" "${jit:-0}")
+fi
+if command -v python3 >/dev/null 2>&1; then
+  tcp=$(python3 - "$IRAN" "$TPORT" <<'PYP'
+import json,socket,sys,time
+h,p=sys.argv[1],int(sys.argv[2]); ok=[]; n=12
+for _ in range(n):
+    try:
+        t0=time.time(); s=socket.create_connection((h,p),3); s.sendall(b"drc-ctest")
+        d=s.recv(4096); s.close()
+        if d==b"drc-ctest": ok.append(round((time.time()-t0)*1000,1))
+    except Exception: pass
+print(json.dumps({"ok":bool(ok),"loss":round(100*(n-len(ok))/n),"avg":round(sum(ok)/len(ok),1) if ok else None,"jit":round(max(ok)-min(ok),1) if len(ok)>1 else None}))
+PYP
+) || tcp='{"ok":false}'
+  udp=$(python3 - "$IRAN" "$UPORT" <<'PYP'
+import json,socket,sys,time
+h,p=sys.argv[1],int(sys.argv[2]); ok=[]; n=20
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1.5)
+for i in range(n):
+    try:
+        t0=time.time(); s.sendto(b"drc-ctest-%d"%i,(h,p)); d,_=s.recvfrom(2048)
+        if d==b"drc-ctest-%d"%i: ok.append(round((time.time()-t0)*1000,1))
+    except Exception: pass
+s.close()
+print(json.dumps({"ok":bool(ok),"loss":round(100*(n-len(ok))/n),"avg":round(sum(ok)/len(ok),1) if ok else None,"jit":round(max(ok)-min(ok),1) if len(ok)>1 else None}))
+PYP
+) || udp='{"ok":false}'
+else
+  okc=0; tots=""
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    t0=$(date +%s%N)
+    if timeout 3 bash -c "exec 3<>/dev/tcp/$IRAN/$TPORT" 2>/dev/null </dev/null; then
+      t1=$(date +%s%N); okc=$((okc+1)); tots="$tots $(( (t1-t0)/1000000 ))"
+    fi
+  done
+  avgc=$(printf '%s\\n' $tots | awk '{s+=$1;n++} END{if(n)printf "%.1f",s/n}')
+  [[ -n $avgc ]] && tcp=$(printf '{"ok":true,"loss":%d,"avg":%s}' $(( (12-okc)*100/12 )) "$avgc")
+  echo "  (python3 not found - TCP measured via /dev/tcp, UDP skipped)"
+fi
+echo
+echo "  DR-CPanel two-server test:  KHAREJ  ->  IRAN ($IRAN)"
+if command -v python3 >/dev/null 2>&1; then
+python3 - "$icmp" "$tcp" "$udp" <<'PYP'
+import json,sys
+def g(j,k):
+    try: v=json.loads(j).get(k); return "-" if v is None else v
+    except Exception: return "-"
+rows=[("ping (ICMP)",g(sys.argv[1],"avg"),g(sys.argv[1],"jit"),g(sys.argv[1],"loss")),
+      ("tcp echo",g(sys.argv[2],"avg"),g(sys.argv[2],"jit"),g(sys.argv[2],"loss")),
+      ("udp echo",g(sys.argv[3],"avg"),g(sys.argv[3],"jit"),g(sys.argv[3],"loss"))]
+print("  | %-10s | %8s | %8s | %6s |" % ("path","avg ms","jitter","loss%"))
+print("  " + "-"*42)
+for r in rows: print("  | %-10s | %8s | %8s | %5s%% |" % r)
+PYP
+else
+  echo "  icmp: $icmp"; echo "  tcp: $tcp"
+fi
+curl -fsSLk --max-time 10 -X POST -H 'Content-Type: application/json' \\
+  -d "{\\"icmp\\":$icmp,\\"tcp\\":$tcp,\\"udp\\":$udp}" \\
+  "$API/api/ctest/report?id=$RID" >/dev/null 2>&1 \\
+  && echo "  report sent - open the panel's connection-test page to see it on both sides" \\
+  || echo "  panel unreachable - the table above is still valid"
+echo
+"""
+    return (sc.replace("@HOST@", host).replace("@TPORT@", str(int(tport))).replace("@UPORT@", str(int(uport)))
+              .replace("@CID@", cid).replace("@API@", api))
+
+def ping_stats(host, n=10):
+    # latency / jitter / loss of a real ICMP ping (jitter = the mdev field ping already computes)
+    try:
+        r = subprocess.run(["ping", "-4", "-n", "-q", "-c", str(n), "-W", "1", host], capture_output=True, text=True, timeout=25)
+        loss = re.search(r"([\d.]+)% packet loss", r.stdout)
+        rtt = re.search(r"= [\d.]+/([\d.]+)/([\d.]+)/([\d.]+)" , r.stdout)
+        if not loss: return None
+        d = dict(loss=round(float(loss.group(1))))
+        if rtt: d.update(avg=round(float(rtt.group(1))), mx=round(float(rtt.group(2))), jitter=round(float(rtt.group(3)), 1))
+        d["ok"] = d["loss"] < 100 and "avg" in d
+        return d
+    except Exception: return None
+
+def dl_speed():
+    # plain HTTPS download from Cloudflare's speed endpoint -> Mbit/s of the direct internet path
+    try:
+        t0 = time.time(); n = 0
+        req = urllib.request.Request("https://speed.cloudflare.com/__down?bytes=15000000", headers={"User-Agent": "DR-CPanel"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            while True:
+                b = r.read(65536)
+                if not b: break
+                n += len(b)
+        dt = time.time() - t0
+        return round(n * 8 / dt / 1e6, 1) if dt > 0.2 and n > 1000000 else None
+    except Exception: return None
+
+def conntest_run():
+    res = dict(t=time.time())
+    with ThreadPoolExecutor(4) as ex:
+        f1 = ex.submit(ping_stats, "4.2.2.4"); f2 = ex.submit(ping_stats, "1.1.1.1")
+        f3 = ex.submit(dl_speed); fu = ex.submit(udp_egress)
+        res["g1"], res["g2"], res["dl"], res["udp"] = f1.result(), f2.result(), f3.result(), fu.result()
+    res["tunnels"] = []
+    for t in tunnel_info():
+        e = dict(id=t["id"], ip=t["ip"], name=t.get("name", ""), up=t["up"], type=t.get("type", "fwd"), active=t["active"])
+        if t["up"]:
+            e.update(ping_stats("10.66.%d.2" % t["id"]) or {"ok": False})
+            try: e["mtu"] = int(tun_cmd("mtuprobe", str(t["id"]), t=150).strip() or 0) or None
+            except Exception: e["mtu"] = None
+        res["tunnels"].append(e)
+    # the BackPack-style banner: best method, its numbers, and the preset to go with it
+    tun = next((x for x in res["tunnels"] if x.get("up") and x.get("ok")), None)
+    g = tun or res["g1"] or res["g2"] or {}
+    rec = dict(preset="", label="", fa="")
+    if res["udp"] is False:
+        rec.update(label="udp_blocked", fa="خروجی UDP بسته است — تانل WireGuard بالا نمی‌آید؛ اول UDP را باز کن")
+    elif tun:
+        rec.update(label="tunnel", fa="تانل رمزنگاری‌شده سالم است — فورواردها را روی همین بگذار",
+                   preset=(tun_preset_of(tun["id"]) or "turbo"))
+    elif g.get("ok"):
+        rec.update(label="direct", fa="تانلی برقرار نیست — لینک مستقیم سالم است؛ یک تانل بساز")
+    else:
+        rec.update(label="offline", fa="هیچ مقاصدی پاسخ نمی‌دهند — اتصال سرور را بررسی کن")
+    res["rec"] = rec
+    jsave(CTF, res)
+    return res
+
+def tun_preset_of(tid):
+    t = tun_by(str(tid))
+    return (t or {}).get("preset", "")
 
 def counters():
     c = {}
@@ -1039,6 +1871,7 @@ def state():
     return {"rules": rs, "host": socket.gethostname(), "sys": dict(SYS), "ip_forward": sysval("net.ipv4.ip_forward") == "1",
             "cc": sysval("net.ipv4.tcp_congestion_control"), "now": time.time(), "ver": "__DR_VERSION__",
             "t24": [(h * 3600, b) for h, b in (T24 or [])], "perf": dict(preset=pc, ct=ct, cm=cm),
+            "reverse": rev_rows(),
             "totp": bool(cf.get("totp")), "bot": bool(cf.get("tg_bot", True)), "rhour": cf.get("tg_report_hour", 12), "bhour": cf.get("tg_backup_hour", 3)}
 
 def perf_current_py():
@@ -1397,7 +2230,36 @@ class H(BaseHTTPRequestHandler):
     def get(self):
         p = self.path.split("?")[0]
         if p == "/": return self.out(200, open(UI, "rb").read(), "text/html; charset=utf-8")
+        m = re.fullmatch(r"/join/([0-9a-f]{16,64})", p)
+        if m:   # public, token-gated: the one-line script the kharej runs to join the tunnel
+            ip = self.client_address[0]; now = time.time()
+            if len(JOINMISS) > 5000: JOINMISS.clear()
+            JOINMISS[ip] = [t for t in JOINMISS.get(ip, []) if t > now - 60]
+            if len(JOINMISS[ip]) > 20: return self.out(429, {"error": "Too many requests"})
+            try:
+                sc = tun_cmd("script-join", m.group(1), self.headers.get("Host", ""), ip, t=60)
+            except ValueError as e:
+                return self.out(404, {"error": str(e)})
+            log("info", "Join link fetched by %s (tunnel joined from that IP)" % ip); audit("join_served", ip, ip)
+            return self.out(200, sc.encode(), "text/plain; charset=utf-8",
+                            [("X-Robots-Tag", "noindex, nofollow"), ("Content-Disposition", "inline")])
         if p.startswith("/sub/"): return self.sub_public(p)
+        m = re.fullmatch(r"/ctest/([0-9a-f]{16,64})", p)
+        if m:   # public, id-gated: the two-server connection-test script the kharej runs
+            ip = self.client_address[0]; now = time.time()
+            if len(CTMISS) > 5000: CTMISS.clear()
+            CTMISS[ip] = [t for t in CTMISS.get(ip, []) if t > now - 60]
+            if len(CTMISS[ip]) > 20: return self.out(429, {"error": "Too many requests"})
+            CTMISS[ip].append(now)
+            st = jload(CTF2) or {}
+            if m.group(1) != st.get("id") or now > st.get("until", 0):
+                return self.out(404, {"error": "No open test (make a new link from the panel)"})
+            host = (self.headers.get("Host") or socket.gethostname()).strip()
+            sch = "https" if cfg().get("tls") else "http"
+            sc = ctest_script(st["id"], host, int(st["tport"]), int(st["uport"]), "%s://%s" % (sch, host))
+            log("info", "Connection-test link fetched by %s" % ip); audit("ctest_served", ip, ip)
+            return self.out(200, sc.encode(), "text/plain; charset=utf-8",
+                            [("X-Robots-Tag", "noindex, nofollow"), ("Content-Disposition", "inline")])
         if not p.startswith("/api/"): return self.out(404, {"error": "not found"})
         if not self.authed(): return self.out(401, {"error": "auth"})
         if p == "/api/state": return self.out(200, state())
@@ -1405,6 +2267,25 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/audit": return self.out(200, {"a": audit_read()})
         if p == "/api/health": return self.out(200, health_check())
         if p == "/api/tunnels": return self.out(200, {"tunnels": tunnel_info(), "wg": bool(shutil.which("wg"))})
+        if p == "/api/reverse": return self.out(200, {"rows": rev_rows()})
+        if p == "/api/conntest":
+            return self.out(200, {"running": CT["running"], "result": CT["result"] or (jload(CTF) or None)})
+        if p == "/api/ctest":
+            st = jload(CTF2) or {}
+            out = dict(tport=st.get("tport"), uport=st.get("uport"), until=st.get("until"), report=st.get("report"))
+            if st.get("id") and (st.get("until", 0) or 0) > time.time():
+                host = (self.headers.get("Host") or socket.gethostname()).strip()
+                sch = "https" if cfg().get("tls") else "http"
+                out.update(id=st["id"], cmd="bash <(curl -fsSLk %s://%s/ctest/%s)" % (sch, host, st["id"]))
+            return self.out(200, out)
+        if p == "/api/tunnel/link":
+            mm = re.search(r"ip=([0-9.]+)", self.path)
+            try: tok = tun_cmd("link", mm.group(1) if mm else "", t=20).strip()
+            except ValueError as e: return self.out(400, {"error": str(e)})
+            if not re.fullmatch(r"[0-9a-f]{16,64}", tok): return self.out(500, {"error": "Token error"})
+            host = self.headers.get("Host") or socket.gethostname()
+            sch = "https" if cfg().get("tls") else "http"
+            return self.out(200, {"url": "bash <(curl -fsSLk %s://%s/join/%s)" % (sch, host, tok), "token": tok})
         if p == "/api/tunnel/script":
             m = re.search(r"ip=([\d.]+)", self.path)
             try: return self.out(200, {"script": tun_cmd("script", m.group(1) if m else "", t=20)})
@@ -1456,6 +2337,23 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             if self.path == "/api/login": return self.login(self.body())
+            if self.path.startswith("/api/ctest/report"):
+                # public but id-gated: the kharej side of the two-server connection test posts its results here
+                ip = self.client_address[0]; now = time.time()
+                if len(CTMISS) > 5000: CTMISS.clear()
+                CTMISS[ip] = [t for t in CTMISS.get(ip, []) if t > now - 60]
+                if len(CTMISS[ip]) > 10: return self.out(429, {"error": "Too many requests"})
+                CTMISS[ip].append(now)
+                d = self.body(8192)
+                mm = re.search(r"id=([0-9a-f]{16,64})", self.path)
+                st = jload(CTF2) or {}
+                if not mm or not st or mm.group(1) != st.get("id"): return self.out(404, {"error": "No open test"})
+                if now > st.get("until", 0): return self.out(410, {"error": "Test expired"})
+                rep = {"icmp": d.get("icmp") if isinstance(d, dict) else None, "tcp": d.get("tcp") if isinstance(d, dict) else None,
+                       "udp": d.get("udp") if isinstance(d, dict) else None, "t": now, "ip": ip}
+                st["report"] = rep; jsave(CTF2, st)
+                log("info", "Two-server test report from %s" % ip); audit("ctest_report", ip, ip)
+                return self.out(200, {"ok": True})
             if not self.authed(): return self.out(401, {"error": "auth"})
             d = self.body(3000000 if self.path == "/api/restore" else 20000 if self.path in ("/api/cert", "/api/security") else 4096)
             if self.path == "/api/logout":
@@ -1487,16 +2385,80 @@ class H(BaseHTTPRequestHandler):
                 else: raise ValueError("Bad action")
                 jsave(SUBF, s); t = s.get(k, ""); return self.out(200, {"token": t, "path": "/sub/" + t if t else ""})
             if self.path in ("/api/tunnel", "/api/tunnel/test", "/api/tunnel/bw"):
+                if self.path.endswith("/test") or self.path.endswith("/bw"):
+                    try: ip = str(ipaddress.IPv4Address(str(d.get("ip", "")).strip()))
+                    except Exception: raise ValueError("Invalid IP")
+                    if self.path.endswith("/test"): return self.out(200, transport_test(ip, int(d.get("port") or 0)))
+                    return self.out(200, bwtest(ip))
+                a = d.get("action")
+                if a == "add" and str(d.get("type") or "") == "rev":
+                    # reverse wizard: no foreign IP needed - the kharej dials in with the one-line join link
+                    pr = str(d.get("preset") or "turbo")
+                    if pr not in ("balanced", "turbo", "throughput", "gaming"): raise ValueError("Bad preset")
+                    tr = str(d.get("tr") or "udp")
+                    if tr not in ("udp", "tcp", "ws", "wss", "kcp", "quic"): raise ValueError("Bad transport")
+                    nm = re.sub(r"[^A-Za-z0-9_.-]", "_", str(d.get("name") or ""))[:40]
+                    with LOCK: tun_cmd("join-open", str(int(d.get("port") or 51820)), pr, nm, tr, str(int(d.get("cport") or 0)), t=300)
+                    log("info", "Reverse tunnel created - waiting for the kharej to run its join link")
+                    audit("tunnel_add_rev", "wg port %s tr %s" % (d.get("port"), tr), self.client_address[0])
+                    return self.out(200, {"ok": True, "pending": True})
+                if a == "transport":
+                    # works for pending rev tunnels too: the join script reads the row at join time
+                    tr = str(d.get("tr") or "")
+                    if tr not in ("udp", "tcp", "ws", "wss", "kcp", "quic"): raise ValueError("Bad transport")
+                    key = str(d.get("id") or "").strip()
+                    ip2 = key if re.fullmatch(r"\d+", key) else str(d.get("ip", "")).strip()
+                    with LOCK: tun_cmd("transport", ip2, tr, str(int(d.get("cport") or 0)))
+                    log("info", "Tunnel transport -> %s (%s)" % (tr, ip2)); audit("tunnel_transport", "%s %s" % (ip2, tr), self.client_address[0])
+                    return self.out(200, {"ok": True})
                 try: ip = str(ipaddress.IPv4Address(str(d.get("ip", "")).strip()))
                 except Exception: raise ValueError("Invalid IP")
-                if self.path.endswith("/test"): return self.out(200, transport_test(ip, int(d.get("port") or 0)))
-                if self.path.endswith("/bw"): return self.out(200, bwtest(ip))
-                a = d.get("action")
                 with LOCK:
-                    if a == "add": tun_cmd("add", ip, str(int(d.get("port") or 51820)))
+                    if a == "add":
+                        ty = str(d.get("type") or "fwd")
+                        if ty not in ("fwd", "dir"): raise ValueError("Bad type")
+                        pr = str(d.get("preset") or "")
+                        if pr and pr not in ("balanced", "turbo", "throughput", "gaming"): raise ValueError("Bad preset")
+                        tr = str(d.get("tr") or "udp")
+                        if tr not in ("udp", "tcp", "ws", "wss", "kcp", "quic"): raise ValueError("Bad transport")
+                        nm = re.sub(r"[^A-Za-z0-9_.-]", "_", str(d.get("name") or ""))[:40]
+                        tun_cmd("add", ip, str(int(d.get("port") or 51820)), "0", pr, ty, nm, tr, str(int(d.get("cport") or 0)))
+                    elif a == "preset":
+                        pr = str(d.get("preset") or "none")
+                        if pr != "none" and pr not in ("balanced", "turbo", "throughput", "gaming"): raise ValueError("Bad preset")
+                        tun_cmd("preset", ip, pr)
                     elif a in ("use", "direct", "del"): tun_cmd(a, ip)
                     else: raise ValueError("Bad action")
                 log("info", "Tunnel %s: %s" % (a, ip)); audit("tunnel_" + str(a), ip, self.client_address[0]); return self.out(200, {"ok": True})
+            if self.path == "/api/reverse":
+                a = d.get("action")
+                if a == "test":
+                    return self.out(200, rev_test(str(d.get("ip", "")), int(d.get("lport") or 0)))
+                ip = str(d.get("ip", "")).strip()
+                try: ipaddress.IPv4Address(ip)
+                except Exception: raise ValueError("Invalid IP")
+                with LOCK:
+                    if a == "add":
+                        lp, dp = int(d.get("lport") or 0), int(d.get("dport") or 0)
+                        proto = str(d.get("proto") or "tcp")
+                        if proto not in ("tcp", "udp", "both"): raise ValueError("Invalid protocol")
+                        if not (1 <= lp <= 65535 and 1 <= dp <= 65535): raise ValueError("Invalid port")
+                        r = subprocess.run([BIN, "reverse", "add", ip, str(lp), str(dp), proto], capture_output=True, text=True, timeout=60)
+                        if r.returncode:
+                            msg = (r.stderr or r.stdout).strip().splitlines()
+                            raise ValueError(re.sub(r"^error: ", "", msg[-1])[:200] if msg else "Command failed")
+                        log("info", "Reverse forward %s:%d → this server:%d (%s)" % (ip, lp, dp, proto))
+                        audit("reverse_add", "%s:%d->%d" % (ip, lp, dp), self.client_address[0])
+                        return self.out(200, {"ok": True, "notice": "script"})
+                    if a == "del":
+                        lp = int(d.get("lport") or 0)
+                        r = subprocess.run([BIN, "reverse", "del", ip, str(lp)], capture_output=True, text=True, timeout=60)
+                        if r.returncode:
+                            msg = (r.stderr or r.stdout).strip().splitlines()
+                            raise ValueError(re.sub(r"^error: ", "", msg[-1])[:200] if msg else "Command failed")
+                        log("info", "Reverse forward removed %s:%d" % (ip, lp)); audit("reverse_del", "%s:%d" % (ip, lp), self.client_address[0])
+                        return self.out(200, {"ok": True, "notice": "script"})
+                raise ValueError("Bad action")
             if self.path == "/api/perf":
                 p = str(d.get("preset", ""))
                 if p not in ("balanced", "turbo", "throughput", "gaming"): raise ValueError("Bad preset")
@@ -1504,6 +2466,35 @@ class H(BaseHTTPRequestHandler):
                 if r.returncode: raise ValueError("Preset failed: " + (r.stderr or "").strip()[-150:])
                 log("info", "Performance preset applied: %s" % p); audit("perf", p, self.client_address[0])
                 return self.out(200, {"ok": True, "preset": p})
+            if self.path == "/api/conntest":
+                if CT["running"]: return self.out(200, {"running": True})
+                CT["running"] = True
+                def ctjob():
+                    try: CT["result"] = conntest_run()
+                    except Exception as e: log("warn", "conntest failed: %s" % type(e).__name__); CT["result"] = None
+                    finally: CT["running"] = False
+                threading.Thread(target=ctjob, daemon=True).start()
+                log("info", "Connection test started"); audit("conntest", "", self.client_address[0])
+                return self.out(200, {"running": True})
+            if self.path == "/api/ctest":
+                # two-server connection test: open ephemeral echo servers (or close them) and hand out the one-line link
+                a = d.get("action")
+                if a == "open":
+                    r = subprocess.run([BIN, "ctest-open"], capture_output=True, text=True, timeout=30)
+                    if r.returncode:
+                        msg = (r.stderr or r.stdout).strip().splitlines()
+                        raise ValueError(re.sub(r"^error: ", "", msg[-1])[:200] if msg else "Could not open the test")
+                    out = r.stdout.split()
+                    if len(out) != 3: raise ValueError((out[0] if out and str(out[0]).startswith("error:") else "Could not open the test"))
+                    cid, tport, uport = out
+                    host = (self.headers.get("Host") or socket.gethostname()).strip()
+                    sch = "https" if cfg().get("tls") else "http"
+                    log("info", "Two-server test link opened (tcp %s / udp %s)" % (tport, uport)); audit("ctest_open", "%s/%s" % (tport, uport), self.client_address[0])
+                    return self.out(200, {"id": cid, "cmd": "bash <(curl -fsSLk %s://%s/ctest/%s)" % (sch, host, cid), "tport": int(tport), "uport": int(uport)})
+                if a == "close":
+                    subprocess.run([BIN, "ctest-close"], capture_output=True, text=True, timeout=30)
+                    log("info", "Two-server test closed"); return self.out(200, {"ok": True})
+                raise ValueError("Bad action")
             if self.path == "/api/totp":
                 c = cfg(); a = d.get("action"); ip = self.client_address[0]
                 if a == "setup":
@@ -1606,6 +2597,7 @@ if __name__ == "__main__":
         try: do_domain(a[1], a[2] if len(a) > 2 else "", restart=False); print("OK")
         except Exception as e: print("ERROR:", e); sys.exit(1)
     elif a[0] == "info": print(c.get("port", 8443), "https" if c.get("tls") else "http", c.get("domain") or "-")
+    elif a[0] == "conntest": print(json.dumps(conntest_run()))
     else:
         threading.Thread(target=sampler, daemon=True).start()
         threading.Thread(target=monitor, daemon=True).start()
@@ -1708,6 +2700,8 @@ body[data-t=light] .v{text-shadow:none}
 .hist i:last-child{background:linear-gradient(to top,var(--acg),var(--ac));box-shadow:0 0 12px rgba(var(--acr),.55)}
 /* ---------------- buttons ---------------- */
 .btn{border:1px solid var(--line2);background:var(--sunk);color:var(--tx);padding:8px 16px;border-radius:12px;cursor:pointer;transition:.18s}
+.prsel{width:auto;min-width:104px;padding:7px 10px;border-radius:11px;font-size:13px}
+.btn.okc{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,var(--line2))}.btn.errc{color:var(--er);border-color:color-mix(in srgb,var(--er) 45%,var(--line2))}
 .btn:hover{border-color:color-mix(in srgb,var(--ac) 55%,var(--line2));transform:translateY(-1px);box-shadow:0 6px 16px -8px rgba(var(--acr),.55)}.btn:active{transform:scale(.97)}
 .btn.p{background:linear-gradient(135deg,var(--acg),var(--ac));color:var(--acf);border-color:transparent;font-weight:600;box-shadow:0 5px 20px -6px rgba(var(--acr),.65),inset 0 1px 0 rgba(255,255,255,.22)}
 .btn.p:hover{box-shadow:0 9px 28px -6px rgba(var(--acr),.75),inset 0 1px 0 rgba(255,255,255,.26)}
@@ -1737,6 +2731,19 @@ th{color:var(--mu);font-weight:500;font-size:12px}tr:last-child td{border:0}tbod
 .srch input:focus{box-shadow:none;border:0}
 html[dir=ltr] .srch input{direction:ltr;text-align:left}
 .srch .clr{position:absolute;inset-inline-end:7px;width:24px;height:24px;display:grid;place-items:center;border:0;background:0;color:var(--mu);border-radius:8px;cursor:pointer;transition:.15s}.srch .clr:hover{color:var(--tx);background:var(--sunk)}
+/* ---------------- tunnel wizard + connection test ---------------- */
+.wsteps{display:flex;gap:6px;margin:2px 0 14px}
+.wsteps i{flex:1;height:4px;border-radius:99px;background:var(--sunk);transition:.25s}
+.wsteps i.on{background:var(--acp);box-shadow:0 0 8px color-mix(in srgb,var(--acp) 60%,transparent)}
+.wsteps i.done{background:color-mix(in srgb,var(--acp) 45%,transparent)}
+.wcard{border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-bottom:9px;cursor:pointer;transition:.15s;background:var(--sunk)}
+.wcard:hover{border-color:var(--line2)}
+.wcard.on{border-color:var(--acp);background:color-mix(in srgb,var(--acp) 10%,transparent);box-shadow:0 0 0 1px var(--acp) inset}
+.wcard b{display:flex;align-items:center;gap:8px;font-size:14px;margin-bottom:3px;flex-wrap:wrap}
+.wcard small{color:var(--mu);line-height:1.6;display:block}
+.wrow{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.wrow .l{font-size:12px;color:var(--mu);display:block}
+.wrow b{font-size:15px}
 /* ---------------- modal / inputs ---------------- */
 .modal{position:fixed;inset:0;background:rgba(4,3,10,.62);backdrop-filter:blur(10px);display:none;place-items:center;padding:16px;z-index:20}.modal.on{display:grid;animation:rise .2s both}
 body[data-t=light] .modal{background:rgba(29,22,64,.32)}
@@ -1851,7 +2858,7 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="layout hide" id="app">
 <header class="top"><div class="brand"><i class="mk"><svg><use href="#i-bolt"/></svg></i><svg class="dr" viewBox="0 0 76 36" aria-label="DR"><use href="#i-dr"/></svg><div class="tt"><b>CPanel</b><small><span id="host"></span> · <span id="ver"></span></small></div></div>
 <div class="tools"><button class="ibtn lng" type="button" title="زبان"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9S14.5 18.3 12 21c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z"/></svg><span class="lc">EN</span></button><button class="ibtn" id="thm" title="تم"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18a9 9 0 0 0 0-18z" fill="currentColor"/></svg><span>ظاهر</span></button><button class="ibtn sq" id="out" title="خروج"><svg class="ic" viewBox="0 0 24 24"><path d="M9 4H5v16h4M16 8l4 4-4 4M20 12H9"/></svg></button></div></header>
-<nav class="tabs"><div class="seg"><i class="ind" id="ind" aria-hidden="true"></i><button class="nav on" data-p="dash"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>داشبورد</span></button><button class="nav" data-p="tun"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg><span>تانل‌ها</span></button><button class="nav" data-p="trans"><svg class="ic" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span>ترنسپورت</span></button><button class="nav" data-p="health"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg><span>بررسی سلامت</span></button><button class="nav" data-p="logs"><svg class="ic" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7"/></svg><span>لاگ‌ها</span></button><button class="nav" data-p="set"><svg class="ic" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span>تنظیمات</span></button></div></nav>
+<nav class="tabs"><div class="seg"><i class="ind" id="ind" aria-hidden="true"></i><button class="nav on" data-p="dash"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>داشبورد</span></button><button class="nav" data-p="tun"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg><span>تانل‌ها</span></button><button class="nav" data-p="trans"><svg class="ic" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span>ترنسپورت</span></button><button class="nav" data-p="test"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3v3M5.6 5.6l2.2 2.2M3 12h3M18.4 5.6l-2.2 2.2M21 12h-3"/><circle cx="12" cy="15" r="5"/><path d="M12 15l2.5-2.5"/></svg><span>کانکشن تست</span></button><button class="nav" data-p="health"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg><span>بررسی سلامت</span></button><button class="nav" data-p="logs"><svg class="ic" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7"/></svg><span>لاگ‌ها</span></button><button class="nav" data-p="set"><svg class="ic" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span>تنظیمات</span></button></div></nav>
 <main>
 <section id="p_dash">
 <div class="sec">سرور</div>
@@ -1882,14 +2889,29 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <section id="p_trans" class="hide"><div class="bar"><h1 style="margin:0">ترنسپورت</h1></div>
 <div class="card"><h2 style="margin-top:0;font-size:16px">تانل رمزنگاری‌شده (WireGuard)</h2>
 <div class="hint" style="margin:0 0 12px">ارتباط سرور ایران و سرور خارج را در هسته لینوکس رمزنگاری می‌کند (ChaCha20، سرعت بالا). فورواردها، حجم، سلامت و امنیت تانل بدون تغییر کار می‌کنند. فقط یک دستور روی سرور خارج اجرا می‌شود. ابتدا تانل را بساز، دستور را روی سرور خارج بزن، بعد با «تست» مقایسه کن و «فعال‌سازی» را بزن.</div>
-<div style="overflow-x:auto"><table><thead><tr><th>سرور خارج</th><th>پورت UDP</th><th>وضعیت لینک</th><th>ترافیک</th><th>مسیر فورواردها</th><th></th></tr></thead><tbody id="tb_t"></tbody></table></div>
-<div class="row" style="margin-top:14px"><div><label>IP سرور خارج</label><input id="t_i" list="t_dl" placeholder="1.2.3.4" autocomplete="off"><datalist id="t_dl"></datalist></div><div><label>پورت UDP</label><input id="t_udp" value="51820" inputmode="numeric"></div><div style="flex:0 0 auto;align-self:end"><button class="btn p" id="t_add">ساخت تانل</button></div></div></div>
+<div style="overflow-x:auto"><table><thead><tr><th>سرور خارج</th><th>پورت UDP</th><th>وضعیت لینک</th><th>ترافیک</th><th>مسیر فورواردها</th><th>کارایی</th><th></th></tr></thead><tbody id="tb_t"></tbody></table></div>
+<div class="acts" style="margin:12px 0 0;flex-wrap:wrap"><button class="btn p" id="t_add">+ ساخت تانل جدید</button><span class="hint" style="margin:0">ویزارد مثل بک‌پک: نوع (ریورس / دایرکت / فوروارد) ← مشخصات ← کارایی ← اتصال. «لینک اتصال» هر تانل همیشه از ستون آخر قابل کپی است.</span></div></div>
+<div class="card" style="margin-top:16px"><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h2 style="margin:0;font-size:16px">ریورس — پورت سرور خارج → سرویس همین سرور ایران</h2></div>
+<div class="hint" style="margin:10px 0 12px">برعکس فوروارد: پورت روی <b>سرور خارج</b> باز می‌شود و هرکس به آن وصل شود، به سرویسی که روی همین سرور ایران اجرا شده می‌رسد (از داخل تانل رمزنگاری‌شده). مثلاً پنل یا VPN روی ایران داری و می‌خواهی با IP تمیز خارج دیده شود. بعد از هر تغییر، دکمه «دستور سرور خارج» را بزن و اسکریپت را دوباره روی سرور خارج اجرا کن.</div>
+<div style="overflow-x:auto"><table><thead><tr><th>سرور خارج</th><th>پورت (سرور خارج)</th><th>پورت سرویس (ایران)</th><th>پروتکل</th><th></th></tr></thead><tbody id="tb_r"></tbody></table></div>
+<div class="row" style="margin-top:12px"><div><label>سرور خارج</label><select id="rv_ip"></select></div><div><label>پورت روی سرور خارج</label><input id="rv_l" inputmode="numeric" placeholder="8443"></div><div><label>پورت سرویس روی ایران</label><input id="rv_d" inputmode="numeric" placeholder="8443"></div><div><label>پروتکل</label><select id="rv_p"><option>tcp</option><option>udp</option><option>both</option></select></div><div style="flex:0 0 auto;align-self:end"><button class="btn p" id="rv_add">+ افزودن ریورس</button></div></div><div id="rv_res" style="margin-top:10px"></div></div>
 <div class="card" id="t_sc" style="display:none;margin-top:16px"><h2 style="margin-top:0;font-size:16px">این دستور را روی سرور خارج (root) اجرا کن</h2>
 <div class="hint" style="margin:0 0 10px">فقط یک‌بار. بعد از اجرا حدود ۱۰ ثانیه صبر کن تا وضعیت لینک «متصل» شود. این متن شامل کلید خصوصی سرور خارج است؛ آن را جایی منتشر نکن.</div>
 <textarea id="t_sx" rows="9" readonly style="font-size:12px"></textarea><div class="acts"><button class="btn p" id="t_cp">کپی</button></div></div>
-<div class="card" style="margin-top:16px"><h2 style="margin-top:0;font-size:16px">تست ترنسپورت</h2>
-<div class="hint" style="margin:0 0 12px">مسیر مستقیم و تانل رمزنگاری‌شده را با هم مقایسه می‌کند (تأخیر، نوسان و ازدست‌رفتن بسته) و بهترین را پیشنهاد می‌دهد.</div>
+<div class="card" style="margin-top:16px"><h2 style="margin-top:0;font-size:16px">تست ترنسپورت (Link Test)</h2>
+<div class="hint" style="margin:0 0 12px">مسیر مستقیم و تانل رمزنگاری‌شده را با هم مقایسه می‌کند؛ ۱۲ پروب TCP می‌زند، خروجی UDP را چک می‌کند (تانل WireGuard روی UDP سوار است) و بر اساس تأخیر، نوسان و پکت‌خسری، حالت کارایی پیشنهاد می‌دهد.</div>
 <div class="row"><div><label>سرور خارج</label><select id="t_ti"></select></div><div><label>پورت سرویس روی سرور خارج (خالی = خودکار)</label><input id="t_tp" inputmode="numeric"></div><div style="flex:0 0 auto;align-self:end"><button class="btn p" id="t_run">اجرای تست</button> <button class="btn" id="t_bw">تست پهنای باند</button></div></div><div id="t_res" style="margin-top:12px"></div></div></section>
+<section id="p_test" class="hide"><div class="bar"><h1 style="margin:0">کانکشن تست</h1><button class="btn p" id="ct_run">اجرای تست</button></div>
+<div class="panel">
+<div class="cell"><div class="hd"><b class="v" id="ct_c">—</b><span class="l">CPU</span></div><div class="s" id="ct_cs">—</div></div>
+<div class="cell"><div class="hd"><b class="v" id="ct_r">—</b><span class="l">RAM</span></div><div class="s" id="ct_rs">—</div></div>
+<div class="cell"><div class="hd"><b class="v" id="ct_d">—</b><span class="l">دیسک</span></div><div class="s" id="ct_ds">—</div></div>
+<div class="cell"><div class="hd"><b class="v" id="ct_n">—</b><span class="l">ترافیک سرور</span></div><div class="s" id="ct_ns">—</div></div>
+</div>
+<div class="card" style="margin-top:14px"><div id="ct_out"><div class="empty">برای شروع «اجرای تست» را بزن — حدود ۲۰ ثانیه طول می‌کشد: پینگ، نوسان، پکت‌خسری، سرعت دانلود، خروجی UDP و سلامت تانل‌ها</div></div></div>
+<div class="card" style="margin-top:14px"><div class="bar" style="margin:0 0 10px"><h1 style="margin:0;font-size:16px">تست بین ایران و خارج <span class="hint" style="font-size:11px">(دوطرفه — مثل Connection Test بک‌پک)</span></h1><button class="btn p" id="ct_open">ساخت لینک تست</button></div>
+<div class="hint">یک لینک می‌سازد که روی <b>سرور خارج</b> اجرا می‌کنی (root) — پینگ ICMP، اکوی TCP و UDP واقعی بین دو سرور اندازه‌گیری می‌شود؛ جدول روی <b>هر دو سرور</b> نمایش داده می‌شود و پیشنهاد ترنسپورت می‌دهد.</div>
+<div id="ct2_out" style="margin-top:10px"><div class="empty">هنوز لینکی ساخته نشده</div></div></div></section>
 <section id="p_health" class="hide"><div class="bar"><h1 style="margin:0">بررسی سلامت</h1><button class="btn p" id="hrun">اجرای بررسی</button></div><div class="card" id="hl"><div class="empty">برای شروع «اجرای بررسی» را بزنید</div></div></section>
 <section id="p_logs" class="hide"><div class="bar"><h1 style="margin:0">لاگ‌ها</h1><div class="acts" style="margin:0"><button class="btn on" id="lgs" type="button">سیستم</button><button class="btn" id="lga" type="button">حسابرسی</button></div></div><div class="card"><div class="lg" id="lg"></div></div></section>
 
@@ -1929,7 +2951,7 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <i class="fd"></i>
 <a class="fgl" href="https://github.com/behymin12345-hash/DR-CPanel" target="_blank" rel="noopener noreferrer"><svg class="fi" viewBox="0 0 24 24"><use href="#i-gh"/></svg><span>GitHub · DR-CPanel</span></a>
 <i class="fd"></i>
-<span class="fver" id="fver">v2.8.0</span>
+<span class="fver" id="fver">v2.9.0</span>
 </div></footer>
 </div>
 
@@ -1947,15 +2969,18 @@ html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 <div class="row" style="margin-top:10px"><div><label>حداکثر اتصال همزمان هر آی‌پی (۰ = خاموش)</label><input id="c_m" type="number" min="0"></div><div><label>اتصال جدید در دقیقه برای هر آی‌پی (۰ = خاموش)</label><input id="c_r" type="number" min="0"></div></div>
 <div class="qs er" id="c_w" style="display:none;margin-top:10px">فقط آی‌پی‌های داخل لیست به این پورت می‌رسند. مطمئن شو آی‌پی مشتری‌ها داخل لیست است.</div>
 <div class="acts"><button class="btn p" id="c_ok">ذخیره</button><button class="btn" id="c_x">بستن</button></div></div></div>
+<div class="modal" id="wm"><div class="box"><h3 id="w_t">ساخت تانل جدید</h3>
+<div class="wsteps" id="w_st"></div><div id="w_b"></div>
+<div class="acts" style="margin-top:14px"><button class="btn" id="w_back">بازگشت</button><button class="btn p" id="w_next">ادامه</button></div></div></div>
 <div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let prev=null,timer=null,page="dash",SP={};
 let LANG="fa";try{LANG=localStorage.getItem("drl")==="en"?"en":"fa"}catch(e){}
-const EN={"ورود به پنل مدیریت تانل": "Sign in to the tunnel manager", "رمز عبور": "Password", "نمایش رمز": "Show password", "ورود": "Sign in", "تم": "Theme", "ظاهر": "Appearance", "خروج": "Sign out", "داشبورد": "Dashboard", "تانل‌ها": "Tunnels", "بررسی سلامت": "Health check", "لاگ‌ها": "Logs", "تنظیمات": "Settings", "سرور": "Server", "دیسک": "Disk", "تانل": "Tunnels", "ترافیک کل": "Total traffic", "سرعت لحظه‌ای": "Live speed", "وضعیت تانل‌ها": "Tunnel status", "نام": "Name", "مسیر": "Route", "وضعیت": "Status", "پینگ": "Ping", "نمودار": "Chart", "سرعت": "Speed", "+ افزودن تانل": "+ Add tunnel", "پروتکل": "Protocol", "پورت ورودی": "Listen port", "مقصد": "Destination", "حجم (مصرف / سقف)": "Quota (used / limit)", "اجرای بررسی": "Run check", "برای شروع «اجرای بررسی» را بزنید": "Press “Run check” to start", "تلگرام (اعلان قطع/وصل و منابع)": "Telegram (up/down and resource alerts)", "آدرس API تلگرام (اختیاری — برای سرور ایران با پروکسی/ورکر)": "Telegram API address (optional — for Iran servers via proxy/worker)", "ذخیره": "Save", "ارسال پیام تست": "Send test message", "دامنه و HTTPS": "Domain & HTTPS", "دامنه (باید به IP همین سرور اشاره کند)": "Domain (must point to this server's IP)", "ایمیل (اختیاری)": "Email (optional)", "برای گرفتن گواهی Let's Encrypt پورت ۸۰ باید آزاد باشد. تمدید خودکار انجام می‌شود. لینک کاربران هم روی همین دامنه و HTTPS کار می‌کند.": "To get a Let's Encrypt certificate, port 80 must be free. Renewal is automatic. User links also work on this domain over HTTPS.", "دریافت گواهی و فعال‌سازی": "Get certificate & enable", "حذف دامنه": "Remove domain", "یا گواهی خودم را وارد می‌کنم": "Or I'll enter my own certificate", "نصب گواهی": "Install certificate", "تغییر رمز": "Change password", "رمز فعلی": "Current password", "رمز جدید (حداقل ۸ کاراکتر)": "New password (min. 8 characters)", "بکاپ و بازیابی": "Backup & restore", "بکاپ شامل تانل‌ها، تنظیمات پنل، رمز و گواهی است. بازیابی فقط لیست تانل‌ها را برمی‌گرداند.": "The backup includes tunnels, panel settings, password and certificate. Restore only brings back the tunnel list.", "دانلود بکاپ": "Download backup", "بازیابی از فایل": "Restore from file", "افزودن تانل جدید": "Add new tunnel", "پورت ورودی (این سرور)": "Listen port (this server)", "IP سرور خارج": "Foreign server IP", "پورت مقصد (خالی = برابر)": "Destination port (empty = same)", "نام (اختیاری)": "Name (optional)", "انصراف": "Cancel", "حجم تانل": "Tunnel quota", "حجم تانل —": "Tunnel quota —", "بستن": "Close", "ریست مصرف": "Reset usage", "لینک کاربر": "User link", "صفحه‌ای فقط‌خواندنی که کاربر بدون ورود به پنل، حجم مصرف‌شده و باقی‌مانده‌اش را می‌بیند. آدرس آن حدس‌زدنی نیست.": "A read-only page where the user can see used and remaining data without signing in to the panel. Its address is not guessable.", "خطا": "Error", "آنلاین": "online", "قطع": "offline", "نامشخص": "unknown", "آنلاین ·": "online ·", "هنوز تانلی نساخته‌اید": "No tunnels yet", "حجم تمام": "Quota reached", "تست": "Test", "حجم": "Quota", "لینک": "Link", "حذف": "Delete", "UDP قابل تست نیست": "UDP can't be tested", "مقصد پاسخ نمی‌دهد": "Destination is not responding", "اتصال موفق ·": "Connected ·", "این تانل حذف شود؟": "Delete this tunnel?", "حذف شد": "Deleted", "تانل اضافه شد": "Tunnel added", "در حال بررسی…": "Checking…", "لاگی ثبت نشده": "No logs yet", "•••••• (ذخیره شده — برای تغییر وارد کنید)": "•••••• (saved — enter a new one to change)", "فعال: https://": "Active: https://", "بدون دامنه: گواهی self-signed (مرورگر هشدار می‌دهد)": "No domain: self-signed certificate (the browser will warn)", "HTTPS خاموش است": "HTTPS is off", "اگر سرور ایران به تلگرام دسترسی ندارد، آدرس یک پروکسی/ورکر سازگار با Bot API را در فیلد API بگذارید.": "If the Iran server can't reach Telegram, put the address of a Bot API–compatible proxy/worker in the API field.", "ذخیره شد": "Saved", "پیام تست ارسال شد": "Test message sent", "ارسال ناموفق:": "Send failed:", "رمز تغییر کرد": "Password changed", "لیست تانل‌ها با محتوای این بکاپ جایگزین شود؟": "Replace the tunnel list with this backup's contents?", "بازیابی شد": "Restored", "رمز را وارد کنید": "Enter the password", "مصرف": "Used", "سقف": "Limit", "نامحدود": "Unlimited", "باقی‌مانده": "Remaining", "حجم تمام شده و تانل قطع است. با بالا بردن سقف یا ریست مصرف، خودکار وصل می‌شود.": "The quota is used up and the tunnel is cut off. Raising the limit or resetting usage reconnects it automatically.", "مقدار دلخواه": "Custom amount", "افزودن به سقف:": "Add to limit:", "سقف حجم ذخیره شد": "Quota limit saved", "سقف حجم برداشته شد": "Quota limit removed", "مصرف این تانل صفر شود؟": "Reset this tunnel's usage to zero?", "مصرف صفر شد": "Usage reset", "لینک کاربر —": "User link —", "کپی لینک": "Copy link", "لینک جدید": "New link", "حذف لینک": "Delete link", "ساخت لینک": "Create link", "کپی شد": "Copied", "لینک قبلی از کار می‌افتد. ادامه؟": "The old link will stop working. Continue?", "لینک حذف شود؟": "Delete the link?", "دامنه را وارد کنید": "Enter a domain", "گواهی گرفته می‌شود و پنل ری‌استارت می‌شود. ادامه؟": "A certificate will be issued and the panel will restart. Continue?", "در حال دریافت گواهی؛ تا دو دقیقه صبر کنید…": "Getting the certificate; wait up to two minutes…", "فعال شد؛ در حال انتقال به دامنه…": "Enabled; redirecting to the domain…", "دامنه حذف شود و گواهی self-signed برگردد؟": "Remove the domain and go back to the self-signed certificate?", "انجام شد؛ پنل ری‌استارت می‌شود": "Done; the panel is restarting", "گواهی نصب شد؛ پنل ری‌استارت می‌شود": "Certificate installed; the panel is restarting", "رنگ‌بندی و ظاهر": "Colors & appearance", "رنگ اصلی پنل را انتخاب کنید؛ روی دکمه‌ها، تب فعال، نوارها و نمودارها اعمال می‌شود.": "Pick the panel's main color. It applies to buttons, the active tab, meters and charts.", "زبان": "Language", "در حال بارگذاری…": "Loading…", "احراز هویت": "Authentication", "داده‌های سرور": "Server metrics", "رابط کاربری": "Interface"};
+const EN={"ورود به پنل مدیریت تانل": "Sign in to the tunnel manager", "رمز عبور": "Password", "نمایش رمز": "Show password", "ورود": "Sign in", "تم": "Theme", "ظاهر": "Appearance", "خروج": "Sign out", "داشبورد": "Dashboard", "تانل‌ها": "Tunnels", "بررسی سلامت": "Health check", "لاگ‌ها": "Logs", "تنظیمات": "Settings", "سرور": "Server", "دیسک": "Disk", "تانل": "Tunnels", "ترافیک کل": "Total traffic", "سرعت لحظه‌ای": "Live speed", "وضعیت تانل‌ها": "Tunnel status", "نام": "Name", "مسیر": "Route", "وضعیت": "Status", "پینگ": "Ping", "نمودار": "Chart", "سرعت": "Speed", "+ افزودن تانل": "+ Add tunnel", "پروتکل": "Protocol", "پورت ورودی": "Listen port", "مقصد": "Destination", "حجم (مصرف / سقف)": "Quota (used / limit)", "اجرای بررسی": "Run check", "برای شروع «اجرای بررسی» را بزنید": "Press “Run check” to start", "تلگرام (اعلان قطع/وصل و منابع)": "Telegram (up/down and resource alerts)", "آدرس API تلگرام (اختیاری — برای سرور ایران با پروکسی/ورکر)": "Telegram API address (optional — for Iran servers via proxy/worker)", "ذخیره": "Save", "ارسال پیام تست": "Send test message", "دامنه و HTTPS": "Domain & HTTPS", "دامنه (باید به IP همین سرور اشاره کند)": "Domain (must point to this server's IP)", "ایمیل (اختیاری)": "Email (optional)", "برای گرفتن گواهی Let's Encrypt پورت ۸۰ باید آزاد باشد. تمدید خودکار انجام می‌شود. لینک کاربران هم روی همین دامنه و HTTPS کار می‌کند.": "To get a Let's Encrypt certificate, port 80 must be free. Renewal is automatic. User links also work on this domain over HTTPS.", "دریافت گواهی و فعال‌سازی": "Get certificate & enable", "حذف دامنه": "Remove domain", "یا گواهی خودم را وارد می‌کنم": "Or I'll enter my own certificate", "نصب گواهی": "Install certificate", "تغییر رمز": "Change password", "رمز فعلی": "Current password", "رمز جدید (حداقل ۸ کاراکتر)": "New password (min. 8 characters)", "بکاپ و بازیابی": "Backup & restore", "بکاپ شامل تانل‌ها، تنظیمات پنل، رمز و گواهی است. بازیابی فقط لیست تانل‌ها را برمی‌گرداند.": "The backup includes tunnels, panel settings, password and certificate. Restore only brings back the tunnel list.", "دانلود بکاپ": "Download backup", "بازیابی از فایل": "Restore from file", "افزودن تانل جدید": "Add new tunnel", "پورت ورودی (این سرور)": "Listen port (this server)", "IP سرور خارج": "Foreign server IP", "پورت مقصد (خالی = برابر)": "Destination port (empty = same)", "نام (اختیاری)": "Name (optional)", "انصراف": "Cancel", "حجم تانل": "Tunnel quota", "حجم تانل —": "Tunnel quota —", "بستن": "Close", "ریست مصرف": "Reset usage", "لینک کاربر": "User link", "صفحه‌ای فقط‌خواندنی که کاربر بدون ورود به پنل، حجم مصرف‌شده و باقی‌مانده‌اش را می‌بیند. آدرس آن حدس‌زدنی نیست.": "A read-only page where the user can see used and remaining data without signing in to the panel. Its address is not guessable.", "خطا": "Error", "آنلاین": "online", "قطع": "offline", "نامشخص": "unknown", "آنلاین ·": "online ·", "هنوز تانلی نساخته‌اید": "No tunnels yet", "حجم تمام": "Quota reached", "تست": "Test", "حجم": "Quota", "لینک": "Link", "حذف": "Delete", "UDP قابل تست نیست": "UDP can't be tested", "مقصد پاسخ نمی‌دهد": "Destination is not responding", "اتصال موفق ·": "Connected ·", "این تانل حذف شود؟": "Delete this tunnel?", "حذف شد": "Deleted", "تانل اضافه شد": "Tunnel added", "در حال بررسی…": "Checking…", "لاگی ثبت نشده": "No logs yet", "•••••• (ذخیره شده — برای تغییر وارد کنید)": "•••••• (saved — enter a new one to change)", "فعال: https://": "Active: https://", "بدون دامنه: گواهی self-signed (مرورگر هشدار می‌دهد)": "No domain: self-signed certificate (the browser will warn)", "HTTPS خاموش است": "HTTPS is off", "اگر سرور ایران به تلگرام دسترسی ندارد، آدرس یک پروکسی/ورکر سازگار با Bot API را در فیلد API بگذارید.": "If the Iran server can't reach Telegram, put the address of a Bot API–compatible proxy/worker in the API field.", "ذخیره شد": "Saved", "پیام تست ارسال شد": "Test message sent", "ارسال ناموفق:": "Send failed:", "رمز تغییر کرد": "Password changed", "لیست تانل‌ها با محتوای این بکاپ جایگزین شود؟": "Replace the tunnel list with this backup's contents?", "بازیابی شد": "Restored", "رمز را وارد کنید": "Enter the password", "مصرف": "Used", "سقف": "Limit", "نامحدود": "Unlimited", "باقی‌مانده": "Remaining", "حجم تمام شده و تانل قطع است. با بالا بردن سقف یا ریست مصرف، خودکار وصل می‌شود.": "The quota is used up and the tunnel is cut off. Raising the limit or resetting usage reconnects it automatically.", "مقدار دلخواه": "Custom amount", "افزودن به سقف:": "Add to limit:", "سقف حجم ذخیره شد": "Quota limit saved", "سقف حجم برداشته شد": "Quota limit removed", "مصرف این تانل صفر شود؟": "Reset this tunnel's usage to zero?", "مصرف صفر شد": "Usage reset", "لینک کاربر —": "User link —", "کپی لینک": "Copy link", "لینک جدید": "New link", "حذف لینک": "Delete link", "ساخت لینک": "Create link", "کپی شد": "Copied", "لینک قبلی از کار می‌افتد. ادامه؟": "The old link will stop working. Continue?", "لینک حذف شود؟": "Delete the link?", "دامنه را وارد کنید": "Enter a domain", "گواهی گرفته می‌شود و پنل ری‌استارت می‌شود. ادامه؟": "A certificate will be issued and the panel will restart. Continue?", "در حال دریافت گواهی؛ تا دو دقیقه صبر کنید…": "Getting the certificate; wait up to two minutes…", "فعال شد؛ در حال انتقال به دامنه…": "Enabled; redirecting to the domain…", "دامنه حذف شود و گواهی self-signed برگردد؟": "Remove the domain and go back to the self-signed certificate?", "انجام شد؛ پنل ری‌استارت می‌شود": "Done; the panel is restarting", "گواهی نصب شد؛ پنل ری‌استارت می‌شود": "Certificate installed; the panel is restarting", "رنگ‌بندی و ظاهر": "Colors & appearance", "رنگ اصلی پنل را انتخاب کنید؛ روی دکمه‌ها، تب فعال، نوارها و نمودارها اعمال می‌شود.": "Pick the panel's main color. It applies to buttons, the active tab, meters and charts.", "زبان": "Language", "حالت کارایی این تانل": "Performance preset for this tunnel", "کارایی": "Preset", "سیستم": "System", "ریورس — پورت سرور خارج → سرویس همین سرور ایران": "Reverse — a port on the foreign server → a service on this Iran server", "برعکس فوروارد: پورت روی <b>سرور خارج</b> باز می‌شود و هرکس به آن وصل شود، به سرویسی که روی همین سرور ایران اجرا شده می‌رسد (از داخل تانل رمزنگاری‌شده). مثلاً پنل یا VPN روی ایران داری و می‌خواهی با IP تمیز خارج دیده شود. بعد از هر تغییر، دکمه «دستور سرور خارج» را بزن و اسکریپت را دوباره روی سرور خارج اجرا کن.": "The opposite of a forward: the port opens on the <b>foreign server</b> and whoever connects to it lands on a service running on this Iran server, through the encrypted tunnel. For example your panel or VPN lives in Iran and you want it reachable on the foreign server clean IP. After every change press the foreign-script button and run the script on the foreign server again.", "پورت (سرور خارج)": "Port (foreign)", "پورت سرویس (ایران)": "Service port (Iran)", "+ افزودن ریورس": "+ Add reverse", "پورت روی سرور خارج": "Port on the foreign server", "پورت سرویس روی ایران": "Service port in Iran", "هنوز ریورسی ساخته نشده": "No reverse forwards yet", "اول یک تانل بساز": "Create a tunnel first", "پورت‌ها را وارد کنید": "Enter the ports", "ذخیره شد — اسکریپت سرور خارج را دوباره اجرا کن": "Saved — run the foreign-server script again", "این ریورس حذف شود؟ بعدش اسکریپت سرور خارج را دوباره اجرا کن.": "Delete this reverse forward? Run the foreign-server script again afterwards.", "حذف شد — اسکریپت سرور خارج را دوباره اجرا کن": "Deleted — run the foreign-server script again", "بی‌پاسخ": "no answer", "✘ خطا": "✘ error", "تست ترنسپورت (Link Test)": "Transport test (Link Test)", "مسیر مستقیم و تانل رمزنگاری‌شده را با هم مقایسه می‌کند؛ ۱۲ پروب TCP می‌زند، خروجی UDP را چک می‌کند (تانل WireGuard روی UDP سوار است) و بر اساس تأخیر، نوسان و پکت‌خسری، حالت کارایی پیشنهاد می‌دهد.": "Compares the direct path with the encrypted tunnel: fires 12 TCP probes, checks UDP egress (the WireGuard tunnel rides on UDP) and recommends a performance preset based on latency, jitter and packet loss.", "خروجی UDP از این سرور بسته است — تونل WireGuard روی UDP سوار است و بالا نمی‌آید. اول UDP را روی فایروال/اپراتور باز کن.": "UDP egress is blocked on this server — the WireGuard tunnel rides on UDP and will not come up. Open UDP on the firewall/operator first.", "اعمال ": "Apply ", "پیش‌فرض سیستم": "System default", "در حال تست… (حدود ۲۰ ثانیه)": "Testing… (about 20 seconds)", "در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…": "Creating (installing WireGuard can take a moment)…", "در حال بارگذاری…": "Loading…", "احراز هویت": "Authentication", "داده‌های سرور": "Server metrics", "رابط کاربری": "Interface"};
 const FA={"Wrong password": "رمز اشتباه است", "Too many attempts, try later": "تلاش‌های زیاد؛ بعداً امتحان کنید", "Too many requests": "درخواست‌های زیاد؛ کمی صبر کنید", "Current password is wrong": "رمز فعلی اشتباه است", "New password must be at least 8 characters": "رمز جدید باید حداقل ۸ کاراکتر باشد", "A forward on this port already exists": "برای این پورت قبلاً تانل ساخته شده", "Invalid IP": "آی‌پی نامعتبر است", "Invalid port": "پورت نامعتبر است", "Port out of range": "پورت خارج از محدوده است", "Invalid protocol": "پروتکل نامعتبر است", "Invalid domain": "دامنه نامعتبر است", "Invalid email": "ایمیل نامعتبر است", "This port is used by the web panel": "این پورت توسط خود پنل استفاده می‌شود", "No such rule": "چنین تانلی وجود ندارد", "Server error": "خطای سرور", "Bad request": "درخواست نامعتبر", "Too large": "حجم داده زیاد است", "Bad action": "عملیات نامعتبر", "Port 80 is busy: Let's Encrypt needs it for a moment": "پورت ۸۰ اشغال است؛ Let's Encrypt لحظه‌ای به آن نیاز دارد", "API address must start with https://": "آدرس API باید با https:// شروع شود", "No forwards found in this file": "در این فایل تانلی پیدا نشد", "Certificate and key are invalid or do not match": "گواهی و کلید نامعتبر یا ناهمخوان‌اند", "Certificate and key must be PEM text": "گواهی و کلید باید متن PEM باشند"};
 Object.assign(EN,{"ترنسپورت":"Transport","تانل رمزنگاری‌شده (WireGuard)":"Encrypted tunnel (WireGuard)","سرور خارج":"Foreign server","پورت UDP":"UDP port","وضعیت لینک":"Link status","ترافیک":"Traffic","مسیر فورواردها":"Forwards via","متصل":"Linked","بدون handshake":"No handshake","مستقیم":"Direct","ساخت تانل":"Create tunnel","دستور سرور خارج":"Foreign setup script","برگشت به مستقیم":"Back to direct","فعال‌سازی":"Activate","کپی":"Copy","کپی شد":"Copied","انجام شد":"Done","هنوز تانلی ساخته نشده":"No tunnels yet","تست ترنسپورت":"Transport test","اجرای تست":"Run test","پاسخ می‌دهد":"Responds","بی‌پاسخ":"No answer","میانگین":"Average","کمترین / بیشترین":"Min / Max","نوسان":"Jitter","ازدست‌رفتن":"Loss","حذف همه":"Delete all","این تانل حذف شود؟ فورواردها به حالت مستقیم برمی‌گردند.":"Remove this tunnel? Its forwards go back to direct.","همه پورت‌های این سرور حذف شوند؟":"Delete every port of this server?","در حال تست… (حدود ۲۰ ثانیه)":"Testing… (about 20 s)","در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…":"Creating (installing WireGuard can take a moment)…","این دستور را روی سرور خارج (root) اجرا کن":"Run this on the foreign server (root)","IP سرور خارج":"Foreign server IP","حذف شد":"Deleted","امنیت تانل ذخیره شد":"Tunnel security saved","امنیت تانل":"Tunnel security","امنیت":"Security","این محدودیت‌ها فقط روی پورت همین تانل اعمال می‌شوند و ترافیک را دست‌نخورده عبور می‌دهند.":"These limits apply only to this tunnel's port and pass traffic through untouched.","آی‌پی‌های مجاز (هر خط یا با کاما؛ خالی = همه)":"Allowed IPs (one per line or comma-separated; empty = anyone)","حداکثر اتصال همزمان هر آی‌پی (۰ = خاموش)":"Max simultaneous connections per IP (0 = off)","اتصال جدید در دقیقه برای هر آی‌پی (۰ = خاموش)":"New connections per minute per IP (0 = off)","فقط آی‌پی‌های داخل لیست به این پورت می‌رسند. مطمئن شو آی‌پی مشتری‌ها داخل لیست است.":"Only the listed IPs can reach this port. Make sure your clients' IPs are in the list.","پورت":"port","جستجو (نام، پورت، آی‌پی)…":"Search name, port, IP…","موردی پیدا نشد":"No matches found","پاک کردن":"Clear","نشست منقضی شد":"Session expired — sign in again"});
 Object.assign(FA,{"Invalid IP or network":"آی‌پی یا شبکه نامعتبر است","Too many IPs":"تعداد آی‌پی‌ها زیاد است","Numbers out of range":"عدد خارج از محدوده است","Session expired — sign in again":"نشست منقضی شد — دوباره وارد شوید","Wrong code":"کد اشتباه است","Setup first":"اول «فعال‌سازی» را بزنید","no_tunnel":"تانل رمزنگاری‌شده‌ای برای این سرور ساخته نشده","no_iperf":"iperf3 نصب نشد (دسترسی مخازن؟)","bw_nosvc":"سرور خارج آماده تست نیست — اسکریپت سمت خارج را دوباره اجرا کن","bw_fail":"تست پهنای باند ناموفق بود","Bad preset":"پریست نامعتبر","Preset failed":"اعمال پریست ناموفق بود"});
-Object.assign(EN,{"ترافیک ۲۴ ساعت":"24-hour traffic","پریست کارایی":"Performance preset","ورود دومرحله‌ای (TOTP)":"Two-step login (TOTP)","حسابرسی":"Audit","سیستم":"System","تست پهنای باند":"Bandwidth test","پکیج آفلاین":"Offline package","ربات (/status /tunnels /traffic)":"Bot (/status /tunnels /traffic)","گزارش روزانه":"Daily report","بکاپ شبانه در تلگرام":"Nightly backup to Telegram","ساعت گزارش روزانه (۰–۲۳)":"Daily report hour (0–23)","ساعت بکاپ شبانه (۰–۲۳)":"Nightly backup hour (0–23)","ریست دوره‌ای مصرف":"Periodic usage reset","تاریخ انقضا (اختیاری)":"Expiry date (optional)","کد دومرحله‌ای یا کد بازیابی":"Two-step or recovery code","منقضی":"Expired","تلگرام (اعلان قطع/وصل، ربات، گزارش و بکاپ)":"Telegram (alerts, bot, report and backup)"});
+Object.assign(EN,{"کانکشن تست":"Connection test","تست بین ایران و خارج":"Iran ⇄ abroad test","دوطرفه — مثل Connection Test بک‌پک":"two-sided — like BackPack's Connection Test","ساخت لینک تست":"Create test link","یک لینک می‌سازد که روی سرور خارج اجرا می‌کنی (root) — پینگ ICMP، اکوی TCP و UDP واقعی بین دو سرور اندازه‌گیری می‌شود؛ جدول روی هر دو سرور نمایش داده می‌شود و پیشنهاد ترنسپورت می‌دهد.":"Builds a link to run on the foreign server (root) — it measures real ICMP, TCP-echo and UDP-echo probes between the two servers, prints the table on both sides and recommends a transport.","هنوز لینکی ساخته نشده":"No test link yet","این یک خط را روی سرور خارج اجرا کن (root):":"Run this one line on the foreign server (root):","لینک تا ۱۵ دقیقه اعتبار دارد.":"The link is valid for 15 minutes.","بستن تست":"Close test","آخرین نتیجه از سرور خارج (":"Latest result from the foreign server (","مسیر":"Path","میانگین ms":"avg ms","نوسان ms":"jitter ms","پینگ (ICMP)":"Ping (ICMP)","اکوی TCP":"TCP echo","اکوی UDP":"UDP echo","ترنسپورت (مسیر تانل — مثل بک‌پک برای هر تانل جدا)":"Transport (how the tunnel crosses — BackPack-style, per tunnel)","پورت ترنسپورت (روی سرور شنونده)":"Carrier port (on the listening server)","خالی = خودکار":"empty = automatic","ترافیک سرور":"Server traffic","برای شروع «اجرای تست» را بزن — حدود ۲۰ ثانیه طول می‌کشد: پینگ، نوسان، پکت‌خسری، سرعت دانلود، خروجی UDP و سلامت تانل‌ها":"Press “Run test” to start — takes about 20 s: ping, jitter, loss, download speed, UDP egress and tunnel health","هنوز تستی اجرا نشده":"No test has run yet","آخرین تست:":"Last run:","دانلود مستقیم (Cloudflare)":"Direct download (Cloudflare)","UDP خروجی":"UDP egress","باز":"open","بسته":"blocked","پکت‌خسری":"Loss","تانل ":"Tunnel ","+ ساخت تانل جدید":"+ New tunnel","ویزارد مثل بک‌پک: نوع (ریورس / دایرکت / فوروارد) ← مشخصات ← کارایی ← اتصال. «لینک اتصال» هر تانل همیشه از ستون آخر قابل کپی است.":"BackPack-style wizard: type (reverse / direct / forward) → details → performance → connect. Each tunnel's join link stays copyable from the last column.","ساخت تانل جدید":"New tunnel","نوع":"Type","اختیاری":"Optional","اتصال":"Connect","بازگشت":"Back","ادامه":"Continue","ساخت تانل و نمایش لینک":"Create tunnel & show the link","ریورس":"Reverse","دایرکت":"Direct","پورت فوروارد":"Port forward","پیشنهادی":"Recommended","ایران — همین سرور.":"Iran — this server.","دو سرور چطور به هم وصل شوند؟":"How should the two servers connect?","سرور خارج به ایران dial می‌زند (مثل بک‌پک). فقط یک دستور روی سرور خارج اجرا می‌کنی؛ حتی لازم نیست IP خارج را بدانی — مناسب وقتی خارج پشت NAT است یا ایران خروجی آزاد ندارد.":"The foreign server dials in to Iran (like BackPack). You run one command on the foreign server; you don't even need to know its IP — ideal when the foreign side is behind NAT or the Iran side has no free egress.","ایران به سرور خارج وصل می‌شود (حالت کلاسیک). IP سرور خارج و پورت UDP آن را داری.":"Iran dials out to the foreign server (the classic way). You have the foreign server's IP and its UDP port.","همان حالت همیشگی: فورواردهای این سرور از داخل تانل رمزنگاری‌شده رد می‌شوند. IP سرور خارج لازم است.":"The usual mode: this server's forwards ride the encrypted tunnel. Needs the foreign server's IP.","نام تانل (اختیاری)":"Tunnel name (optional)","پورت UDP تانل":"Tunnel UDP port","تصادفی":"Random","ریورس — سرور خارج به ایران وصل می‌شود؛ IP خارج لازم نیست.":"Reverse — the foreign server connects to Iran; no foreign IP needed.","ایران به سرور خارج وصل می‌شود؛ آدرس خارج را بده.":"Iran connects to the foreign server; enter its address.","حالت کارایی ":"Performance of ","— برای هر تانل جدا ذخیره می‌شود و موقع «فعال‌سازی» خودکار اعمال می‌شود.":"— stored per tunnel and applied automatically when you activate it.","اختیاری — اولین فوروارد را همین‌جا بساز یا خالی بگذار و بعداً از تب «تانل‌ها» اضافه کن.":"Optional — create the first forward here, or leave it empty and add it later from the Tunnels tab.","پورت ورودی (این سرور)":"Listen port (this server)","پورت مقصد (خالی = برابر)":"Destination port (empty = same)","مقصد این فوروارد خودکار آدرس داخلی تانل می‌شود.":"This forward's destination is the tunnel's internal address automatically.","مقصد:":"Destination:","این یک خط را روی ":"Run this one line on the ","سرور خارج":"foreign server"," اجرا کن (root) — WireGuard را نصب می‌کند، تانل را برپا می‌کند و به ایران dial می‌زند. چند ثانیه بعد وضعیت لینک در جدول «متصل» می‌شود:":" (root) — it installs WireGuard, brings the tunnel up and dials back to Iran. The link status turns “Linked” within seconds:","کپی دستور":"Copy command","اسکریپت کامل (جایگزین)":"Full script (alternative)","این لینک محرمانه است — کلید خصوصی سمت خارج داخلش است؛ جایی منتشرش نکن. دکمه «لینک اتصال» در جدول همیشه دوباره همین دستور را می‌دهد.":"This link is secret — it contains the foreign side's private key; do not publish it. The “Join link” button in the table always serves the same command again.","لینک اتصال تانل":"Tunnel join link","لینک اتصال":"Join link","منتظر اتصال":"Waiting to join","در انتظار اتصال سرور خارج…":"Waiting for the foreign server…","در حال تست… (حدود ۲۰ ثانیه)":"Testing… (about 20 s)","ثانیه) — پینگ، دانلود و تانل‌ها":"s) — ping, download and tunnels"});
 const RE=new RegExp(Object.keys(EN).sort((a,b)=>b.length-a.length).map(k=>k.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|"),"g");
 const TX=s=>{s=String(s);return LANG==="en"?s.replace(RE,m=>EN[m]):(FA[s]||s)};
 const cf=s=>confirm(TX(s));
@@ -2006,8 +3031,8 @@ function show(on){if(!on&&!$("login").classList.contains("hide")){clearInterval(
 function tick(){load();if(page==="logs")logs()}
 async function load(){try{render(await api("state"))}catch(e){}}
 function nav(p){page=p;document.querySelectorAll(".nav[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p===p));moveInd();
- ["dash","tun","trans","health","logs","set"].forEach(x=>{const el=$("p_"+x);el.classList.toggle("hide",x!==p);if(x===p){el.style.animation="none";void el.offsetWidth;el.style.animation=""}});
- if(p==="trans")trLoad();if(p==="logs")logs();if(p==="set")settings()}
+ ["dash","tun","trans","test","health","logs","set"].forEach(x=>{const el=$("p_"+x);el.classList.toggle("hide",x!==p);if(x===p){el.style.animation="none";void el.offsetWidth;el.style.animation=""}});
+ if(p==="trans"){trLoad();rvLoad()}if(p==="test"){ctLoad();ct2Load();load()}if(p==="logs")logs();if(p==="set")settings()}
 document.querySelectorAll(".nav[data-p]").forEach(b=>b.onclick=()=>nav(b.dataset.p));
 function spark(h){const v=(h||[]).map(x=>x==null?-1:x);if(v.length<2)return"";const m=Math.max(...v,1),w=84,H=22,st=w/(v.length-1);
  return `<svg width="${w}" height="${H}">`+v.map((x,i)=>x<0?`<line x1="${i*st}" x2="${i*st}" y1="3" y2="${H}" style="stroke:var(--er)" stroke-width="2"/>`:"").join("")+
@@ -2094,23 +3119,163 @@ const OPEN=new Set();
 function tg(ip){OPEN.has(ip)?OPEN.delete(ip):OPEN.add(ip);drawTunAll(true)}
 async function gtst(ip,b){b.disabled=true;try{const ix=window.LAST.rules.map((r,i)=>[r,i]).filter(([r])=>r.ip===ip&&r.proto!=="udp");const res=await Promise.all(ix.map(([r,i])=>api("test/"+(i+1),"POST",{})));const ok=res.filter(x=>x.ms!=null).length;toast(ok+" از "+res.length+" پورت پاسخ می‌دهند",ok===res.length?"s":"e")}catch(e){toast(e.message,"e")}b.disabled=false}
 async function gdel(ip){const g=window.LAST.rules.filter(r=>r.ip===ip);if(!cf("همه پورت‌های این سرور حذف شوند؟"))return;try{await api("rules/bulk","POST",{lports:g.map(r=>r.lport)});toast("حذف شد","s");load()}catch(e){toast(e.message,"e")}}
-let TUNS=[];const tage=a=>a==null?"—":a<90?a+"s":Math.round(a/60)+"m";
+let TUNS=[];const tage=a=>a==null?"—":a<90?a+"s":Math.round(a/60)+"m";const PRFA={balanced:"Balanced",turbo:"Turbo",throughput:"Throughput",gaming:"Gaming"};
 async function trLoad(){try{const r=await api("tunnels");TUNS=r.tunnels;const cur=$("t_ti").value;
- $("tb_t").innerHTML=TUNS.length?TUNS.map(t=>`<tr><td class="ltr">${t.ip}</td><td class="ltr">${t.port}</td><td>${t.up?'<span class="pill up">متصل</span>':'<span class="pill down">بدون handshake</span>'} <span class="hint">${tage(t.age)}</span></td><td class="ltr">↓${hb(t.rx)} ↑${hb(t.tx)}</td><td>${t.active?'<span class="pill up">🔒 تانل</span>':'<span class="pill unknown">مستقیم</span>'}</td><td><button class="btn" onclick="trAct('script','${t.ip}')">دستور سرور خارج</button> <button class="btn" onclick="trAct('${t.active?"direct":"use"}','${t.ip}')">${t.active?"برگشت به مستقیم":"فعال‌سازی"}</button> <button class="btn d" onclick="trAct('del','${t.ip}')">حذف</button></td></tr>`).join(""):'<tr><td colspan="6" class="empty">هنوز تانلی ساخته نشده</td></tr>';
- const ips=[...new Set((window.LAST?window.LAST.rules:[]).map(r=>r.ip))];$("t_dl").innerHTML=ips.map(i=>`<option value="${i}">`).join("");
- $("t_ti").innerHTML=[...new Set([...TUNS.map(t=>t.ip),...ips])].map(i=>`<option>${i}</option>`).join("");if(cur)$("t_ti").value=cur}catch(e){toast(e.message,"e")}}
+ $("tb_t").innerHTML=TUNS.length?TUNS.map((t,i)=>{const key=t.pending?t.id:t.ip;const ty=t.type==="rev"?'<span class="pill up" style="font-size:10px">ریورس</span>':t.type==="dir"?'<span class="pill unknown" style="font-size:10px">دایرکت</span>':"";
+  const trb=t.tr&&t.tr!=="udp"?` <span class="pill unknown" style="font-size:10px">${t.tr.toUpperCase()}</span>`:"";
+  return `<tr><td>${t.name?`<b>${esc(t.name)}</b><br>`:""}${t.pending?'<span class="hint">در انتظار اتصال سرور خارج…</span>':'<span class="ltr">'+t.ip+"</span>"} ${ty}${trb}</td><td class="ltr">${t.port}</td><td>${t.pending?'<span class="pill unknown">منتظر اتصال</span>':t.up?'<span class="pill up">متصل</span>':'<span class="pill down">بدون handshake</span>'}${t.pending?"":' <span class="hint">'+tage(t.age)+"</span>"}</td><td class="ltr">↓${hb(t.rx)} ↑${hb(t.tx)}</td><td>${t.active?'<span class="pill up">🔒 تانل</span>':'<span class="pill unknown">مستقیم</span>'}</td><td><select class="prsel" onchange="trPreset('${key}',this.value)">${["","balanced","turbo","throughput","gaming"].map(p=>`<option value="${p}" ${(t.preset||"")===p?"selected":""}>${p?PRFA[p]:"سیستم"}</option>`).join("")}</select><select class="prsel" style="margin-top:6px" onchange="trTransport('${key}',this.value)">${["udp","tcp","ws","wss","kcp","quic"].map(x=>`<option value="${x}" ${(t.tr||"udp")===x?"selected":""}>${x.toUpperCase()}</option>`).join("")}</select></td><td><button class="btn" onclick="trLink(${i})">لینک اتصال</button> ${t.pending?"":`<button class="btn" onclick="trAct('script','${t.ip}')">دستور سرور خارج</button> <button class="btn" onclick="trAct('${t.active?"direct":"use"}','${key}')">${t.active?"برگشت به مستقیم":"فعال‌سازی"}</button> `}<button class="btn d" onclick="trAct('del','${key}')">حذف</button></td></tr>`}).join(""):'<tr><td colspan="7" class="empty">هنوز تانلی ساخته نشده</td></tr>';
+ const ips=[...new Set((window.LAST?window.LAST.rules:[]).map(r=>r.ip))];
+ $("t_ti").innerHTML=[...new Set([...TUNS.filter(t=>!t.pending).map(t=>t.ip),...ips])].map(i=>`<option>${i}</option>`).join("");if(cur)$("t_ti").value=cur;rvIps()}catch(e){toast(e.message,"e")}}
+async function trTransport(key,v){if(!v)return;const t=TUNS.find(x=>(x.pending?x.id:x.ip)==key);if(!t)return;
+ if(!cf(`ترنسپورت این تانل به ${v.toUpperCase()} تغییر کند؟`+(v!=="udp"&&t.tr==="udp"?" اسکریپت سمت سرور خارج باید دوباره اجرا شود.":"")))return;
+ try{await api("tunnel","POST",{action:"transport",ip:t.pending?undefined:t.ip,id:t.id,tr:v});toast("ترنسپورت: "+v.toUpperCase()+" — اگر تانل carried است، دستور سمت خارج را دوباره اجرا کن","s");trLoad()}catch(e){toast(e.message,"e")}}
+async function trPreset(ip,v){try{await api("tunnel","POST",{action:"preset",ip,preset:v||"none"});toast(v?"اعمال شد: "+PRFA[v]:"پیش‌فرض سیستم","s");trLoad();load()}catch(e){toast(e.message,"e")}}
+let REVS=[];
+function rvIps(){const el=$("rv_ip");if(!el)return;const cur=el.value;const ips=[...new Set(TUNS.filter(t=>!t.pending).map(t=>t.ip))];el.innerHTML=ips.map(i=>`<option>${i}</option>`).join("");if(cur)el.value=cur}
+async function rvLoad(){try{const r=await api("reverse");REVS=r.rows;
+ $("tb_r").innerHTML=REVS.length?REVS.map(x=>`<tr><td class="ltr">${esc(x.ip)}</td><td class="ltr">${x.lport}</td><td class="ltr">${x.dport}</td><td><span class="tag">${x.proto}</span></td><td><button class="btn" onclick="rvTest('${x.ip}',${x.lport},this)">تست</button> <button class="btn d" onclick="rvDel('${x.ip}',${x.lport})">حذف</button></td></tr>`).join(""):'<tr><td colspan="5" class="empty">هنوز ریورسی ساخته نشده</td></tr>'}catch(e){}}
+$("rv_add").onclick=async()=>{const b=$("rv_add");b.disabled=true;try{const ip=$("rv_ip").value;if(!ip){toast("اول یک تانل بساز","e");return}
+ if(!+$("rv_l").value||!+$("rv_d").value){toast("پورت‌ها را وارد کنید","e");return}
+ await api("reverse","POST",{action:"add",ip,lport:+$("rv_l").value,dport:+$("rv_d").value,proto:$("rv_p").value});
+ toast("ذخیره شد — اسکریپت سرور خارج را دوباره اجرا کن","s");$("rv_l").value=$("rv_d").value="";rvLoad();trAct("script",ip)}catch(e){toast(e.message,"e")}b.disabled=false};
+async function rvDel(ip,lp){if(!cf("این ریورس حذف شود؟ بعدش اسکریپت سرور خارج را دوباره اجرا کن."))return;
+ try{await api("reverse","POST",{action:"del",ip,lport:lp});toast("حذف شد — اسکریپت سرور خارج را دوباره اجرا کن","s");rvLoad()}catch(e){toast(e.message,"e")}}
+async function rvTest(ip,lp,b){b.disabled=true;b.textContent="…";try{const r=await api("reverse","POST",{action:"test",ip,lport:lp});
+ b.textContent=r.ok?`✔ ${r.avg} ms · ${r.loss}%`:"✘ بی‌پاسخ";b.classList.add(r.ok?"okc":"errc")}catch(e){b.textContent="✘ خطا";toast(e.message,"e")}b.disabled=false}
 async function trAct(a,ip){try{
  if(a==="script"){const r=await api("tunnel/script?ip="+ip);$("t_sx").value=r.script;$("t_sc").style.display="block";$("t_sc").scrollIntoView({behavior:"smooth"});return}
  if(a==="del"&&!cf("این تانل حذف شود؟ فورواردها به حالت مستقیم برمی‌گردند."))return;
  await api("tunnel","POST",{action:a,ip});toast("انجام شد","s");await load();trLoad()}catch(e){toast(e.message,"e")}}
-$("t_add").onclick=async()=>{const b=$("t_add");b.disabled=true;try{toast("در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…","");const ip=$("t_i").value.trim();await api("tunnel","POST",{action:"add",ip,port:+$("t_udp").value||51820});await trLoad();await trAct("script",ip)}catch(e){toast(e.message,"e")}b.disabled=false};
+$("t_add").onclick=wOpen;
+/* ---------------- tunnel wizard (BackPack-style) ---------------- */
+const WTY={rev:{t:"ریورس",b:"پیشنهادی",d:"سرور خارج به ایران dial می‌زند (مثل بک‌پک). فقط یک دستور روی سرور خارج اجرا می‌کنی؛ حتی لازم نیست IP خارج را بدانی — مناسب وقتی خارج پشت NAT است یا ایران خروجی آزاد ندارد."},
+dir:{t:"دایرکت",d:"ایران به سرور خارج وصل می‌شود (حالت کلاسیک). IP سرور خارج و پورت UDP آن را داری."},
+fwd:{t:"پورت فوروارد",d:"همان حالت همیشگی: فورواردهای این سرور از داخل تانل رمزنگاری‌شده رد می‌شوند. IP سرور خارج لازم است."}};
+const WTR=[["udp","UDP — سریع‌ترین (پیشنهادی)","دیتاگرام خام UDP؛ کمترین سربار. اگر UDP باز است همین را بردار."],
+["tcp","TCP","وقتی UDP بسته یا throttle می‌شود؛ بسته‌های تانل داخل یک اتصال TCP ساده سفر می‌کنند."],
+["ws","WebSocket","تونل داخل HTTP عادی — از فیلترهای HTTP-only و CDN رد می‌شود."],
+["wss","WebSocket + TLS","وب‌سوکت داخل TLS — شبیه ترافیک HTTPS؛ گواهی self-signed خودکار ساخته می‌شود."],
+["kcp","UDP + KCP","UDP با تصحیح خطا (FEC) — جواب مسیر پرافت، بازی و تماس."],
+["quic","QUIC","سشن واقعی QUIC با TLS 1.3 و کنترل ازدحام — هیچ تنظیمی نمی‌خواهد."]];
+const WPR=[["turbo","Turbo","تعادل سرعت و پایداری — پیشنهاد برای اکثر تانل‌ها"],["balanced","Balanced","کم‌بارترین حالت برای سرورهای ضعیف"],["throughput","Throughput","بافر و پنجرهٔ بزرگ‌تر — برای حجم بالا"],["gaming","Gaming","کمترین تأخیر — برای گیم و تماس"],["","پیش‌فرض سیستم","تنظیمات کلی سرور (تب تنظیمات)"]];
+const WSTEPS=["نوع","تانل","کارایی","اختیاری","اتصال"];
+let WZ=null;
+function wOpen(){WZ={step:0,type:"rev",name:"",port:51820,ip:"",tr:"udp",cport:"",preset:"turbo",lport:"",dport:""};$("w_t").textContent="ساخت تانل جدید";$("wm").classList.add("on");wDraw()}
+function wClose(){WZ=null;$("wm").classList.remove("on")}
+function wSet(k,v){if(WZ){WZ[k]=v;wDraw()}}
+function wRand(){if(WZ){WZ.port=10000+Math.floor(Math.random()*50000);wDraw()}}
+function wGrab(){const w=WZ;if(!w)return;
+ if(w.step===1){if($("w_n"))w.name=$("w_n").value.trim().slice(0,40);if($("w_i"))w.ip=$("w_i").value.trim();if($("w_p"))w.port=+$("w_p").value||51820;if($("w_tr"))w.tr=$("w_tr").value;if($("w_c"))w.cport=$("w_c").value.trim()}
+ if(w.step===3){if($("w_l"))w.lport=$("w_l").value.trim();if($("w_d"))w.dport=$("w_d").value.trim()}}
+function wDraw(){const w=WZ;if(!w)return;
+ $("w_st").innerHTML=WSTEPS.map((s,i)=>`<i class="${i<w.step?"done":i===w.step?"on":""}" title="${s}"></i>`).join("");
+ const h=[];
+ if(w.step===0){h.push('<div class="hint" style="margin:0 0 10px"><b>ایران — همین سرور.</b> دو سرور چطور به هم وصل شوند؟</div>');
+  for(const[k,v]of Object.entries(WTY))h.push(`<div class="wcard ${w.type===k?"on":""}" onclick="wSet('type','${k}')"><b>${v.t}${v.b?` <span class="pill up" style="font-size:10px">${v.b}</span>`:""}</b><small>${v.d}</small></div>`)}
+ else if(w.step===1){h.push(`<div class="hint" style="margin:0 0 10px">${w.type==="rev"?"ریورس — سرور خارج به ایران وصل می‌شود؛ IP خارج لازم نیست.":"ایران به سرور خارج وصل می‌شود؛ آدرس خارج را بده."}</div>`);
+  h.push(`<label>نام تانل (اختیاری)</label><input id="w_n" placeholder="tanl-1" value="${esc(w.name)}">`);
+  if(w.type!=="rev")h.push(`<label>IP سرور خارج</label><input id="w_i" placeholder="1.2.3.4" dir="ltr" value="${esc(w.ip)}">`);
+  h.push(`<label>پورت UDP تانل</label><div style="display:flex;gap:8px;margin-top:4px"><input id="w_p" inputmode="numeric" value="${w.port}" style="flex:1"><button class="btn" type="button" onclick="wRand()">تصادفی</button></div>`);
+  h.push(`<label style="margin-top:10px">ترنسپورت (مسیر تانل — مثل بک‌پک برای هر تانل جدا)</label><select id="w_tr" onchange="wSet('tr',this.value)">${WTR.map(x=>`<option value="${x[0]}" ${w.tr===x[0]?"selected":""}>${x[1]}</option>`).join("")}</select><div class="hint" style="margin:6px 0 0">${(WTR.find(x=>x[0]===w.tr)||["","",""])[2]}</div>`);
+  if(w.tr!=="udp")h.push(`<label style="margin-top:8px">پورت ترنسپورت (روی سرور شنونده)</label><input id="w_c" inputmode="numeric" placeholder="خالی = خودکار" value="${esc(w.cport)}" dir="ltr">`)}
+ else if(w.step===2){h.push('<div class="hint" style="margin:0 0 10px">حالت کارایی <b>همین تانل</b> — برای هر تانل جدا ذخیره می‌شود و موقع «فعال‌سازی» خودکار اعمال می‌شود.</div>');
+  for(const[k,n,d]of WPR)h.push(`<div class="wcard ${w.preset===k?"on":""}" onclick="wSet('preset','${k}')"><b>${n}</b><small>${d}</small></div>`)}
+ else if(w.step===3){h.push('<div class="hint" style="margin:0 0 10px">اختیاری — اولین فوروارد را همین‌جا بساز یا خالی بگذار و بعداً از تب «تانل‌ها» اضافه کن.</div>');
+  h.push('<div class="row"><div><label>پورت ورودی (این سرور)</label><input id="w_l" inputmode="numeric" placeholder="443"></div><div><label>پورت مقصد (خالی = برابر)</label><input id="w_d" inputmode="numeric"></div></div>');
+  h.push(w.type==="rev"?'<div class="hint">مقصد این فوروارد خودکار آدرس داخلی تانل می‌شود.</div>':`<div class="hint">مقصد: <b class="ltr">${esc(w.ip)}</b></div>`)}
+ $("w_b").innerHTML=h.join("");
+ $("w_back").style.visibility=(w.step===0||w.step===4)?"hidden":"visible";
+ $("w_next").textContent=w.step===3?"ساخت تانل و نمایش لینک":w.step===4?"بستن":"ادامه"}
+async function wFinish(){const w=WZ,b=$("w_next");if(!w)return;b.disabled=true;
+ try{toast("در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…","");
+  if(w.type==="rev")await api("tunnel","POST",{action:"add",type:"rev",port:w.port,preset:w.preset,name:w.name,tr:w.tr,cport:w.cport});
+  else await api("tunnel","POST",{action:"add",type:w.type,ip:w.ip,port:w.port,preset:w.preset,name:w.name,tr:w.tr,cport:w.cport});
+  await trLoad();
+  const t=w.type==="rev"?[...TUNS].filter(x=>x.pending).sort((a,c)=>c.id-a.id)[0]:TUNS.find(x=>x.ip===w.ip);
+  if(w.lport&&t){const dip=w.type==="rev"?"10.66."+t.id+".2":w.ip;
+   try{await api("rules","POST",{lport:w.lport,ip:dip,dport:w.dport||w.lport,proto:"tcp",name:w.name?("fw-"+w.name):""});await load()}catch(e){}}
+  else load();
+  let url="";try{const rr=await api("tunnel/link?ip="+(t?(t.pending?t.id:t.ip):w.ip));url=rr.url}catch(e){}
+  wDone(url,t)}catch(e){toast(e.message,"e")}b.disabled=false}
+function wDone(url,t){WZ={step:4};$("w_t").textContent="لینک اتصال تانل"+(t&&t.name?" — "+t.name:"");$("wm").classList.add("on");
+ $("w_st").innerHTML='<i class="done"></i>'.repeat(5);
+ $("w_b").innerHTML=`<div class="hl" style="margin:0 0 12px"><b class="ok">✔</b><div>این یک خط را روی <b>سرور خارج</b> اجرا کن (root) — WireGuard را نصب می‌کند، تانل را برپا می‌کند و به ایران dial می‌زند. چند ثانیه بعد وضعیت لینک در جدول «متصل» می‌شود:</div></div>
+  <textarea id="w_lnk" rows="3" readonly dir="ltr" style="font-size:12.5px">${esc(url||"—")}</textarea>
+  <div class="acts"><button class="btn p" id="w_cp">کپی دستور</button>${t&&!t.pending?'<button class="btn" id="w_scr">اسکریپت کامل (جایگزین)</button>':""}</div>
+  <div class="hint" style="margin-top:8px">این لینک محرمانه است — کلید خصوصی سمت خارج داخلش است؛ جایی منتشرش نکن. دکمه «لینک اتصال» در جدول همیشه دوباره همین دستور را می‌دهد.</div>`;
+ $("w_back").style.visibility="hidden";$("w_next").textContent="بستن";
+ $("w_cp").onclick=async()=>{try{await navigator.clipboard.writeText($("w_lnk").value)}catch(e){$("w_lnk").select();document.execCommand("copy")}toast("کپی شد","s")};
+ if($("w_scr"))$("w_scr").onclick=async()=>{try{const r=await api("tunnel/script?ip="+(t.pending?t.id:t.ip));$("w_lnk").value=r.script;$("w_lnk").rows=16;if($("w_scr"))$("w_scr").style.display="none"}catch(e){toast(e.message,"e")}}}
+async function trLink(i){const t=TUNS[i];if(!t)return;try{const r=await api("tunnel/link?ip="+(t.pending?t.id:t.ip));wDone(r.url,t)}catch(e){toast(e.message,"e")}}
+$("w_next").onclick=()=>{const w=WZ;if(!w)return;
+ if(w.step===4){wClose();trLoad();load();return}
+ if(w.step===1){wGrab();if(w.type!=="rev"&&!/^\d{1,3}(\.\d{1,3}){3}$/.test(w.ip)){toast("آی‌پی سرور خارج را درست وارد کن","e");return}
+  if(!(w.port>=1&&w.port<=65535)){toast("پورت نامعتبر است","e");return}}
+ if(w.step===3){wGrab();wFinish();return}
+ w.step++;wDraw()};
+$("w_back").onclick=()=>{const w=WZ;if(w&&w.step>0&&w.step<4){w.step--;wDraw()}};
+/* ---------------- connection test ---------------- */
+async function ctLoad(){try{const r=await api("conntest");ctDraw(r)}catch(e){}}
+async function ctRun(){const b=$("ct_run");if(b.disabled)return;b.disabled=true;$("ct_out").innerHTML='<div class="empty">در حال تست… (حدود ۲۰ ثانیه)</div>';
+ try{await api("conntest","POST",{});let n=0;const iv=setInterval(async()=>{n++;
+  try{const r=await api("conntest");if(!r.running||n>45){clearInterval(iv);b.disabled=false;ctDraw(r);load()}
+   else $("ct_out").innerHTML='<div class="empty">در حال تست… ('+(n*2)+' ثانیه) — پینگ، دانلود و تانل‌ها</div>'}catch(e){clearInterval(iv);b.disabled=false}},2000)}
+ catch(e){b.disabled=false;toast(e.message,"e")}}
+$("ct_run").onclick=ctRun;
+/* ---- two-server connection test (BackPack-style) ---- */
+function ct2Rec(r){const rp=r.report;if(!rp)return null;
+ const ic=rp.icmp||{},tc=rp.tcp||{},ud=rp.udp||{};
+ if(ud&&ud.ok&&ud.loss!=null&&ud.loss<5&&!(ic.jit&&ic.avg&&ic.jit>ic.avg/2))return{tr:"udp",fa:"مسیر UDP تمیز است — ترنسپورت UDP (سریع‌ترین) مناسب است."};
+ if(ud&&ud.ok&&ud.loss!=null&&ud.loss>=5&&ud.loss<40)return{tr:"kcp",fa:"UDP پرافت است ("+ud.loss+"%) — ترنسپورت KCP (تصحیح خطا) پیشنهاد می‌شود."};
+ if(ud&&ud.ok===false)return{tr:tc&&tc.ok?"tcp":"ws",fa:tc&&tc.ok?"UDP بین دو سرور رد نمی‌شود — ترنسپورت TCP پیشنهاد می‌شود.":"UDP و TCP هر دو ناپایدارند — ترنسپورت WebSocket (WS) را امتحان کن."};
+ return{tr:"udp",fa:"UDP پاسخ می‌دهد — ترنسپورت UDP مناسب است."}}
+function ct2Draw(r){const el=$("ct2_out");if(!el)return;let h="";
+ if(r.cmd){h+=`<label>این یک خط را روی <b>سرور خارج</b> اجرا کن (root):</label><textarea id="ct2_lnk" rows="2" readonly dir="ltr" style="font-size:12.5px">${esc(r.cmd)}</textarea><div class="acts"><button class="btn p" id="ct2_cp">کپی دستور</button><button class="btn d" id="ct2_cl">بستن تست</button><span class="hint">لینک تا ۱۵ دقیقه اعتبار دارد.</span></div>`}
+ const rp=r.report;
+ if(rp){const dts=new Date(rp.t*1000).toLocaleString("sv");
+  const cell=(x,k)=>x&&x[k]!=null?x[k]:"—";
+  const row=(n,x)=>`<tr><td>${n}</td><td>${x&&x.ok?'<span class="pill up">پاسخ می‌دهد</span>':'<span class="pill down">بی‌پاسخ</span>'}</td><td class="ltr">${cell(x,"avg")}</td><td class="ltr">${cell(x,"jit")}</td><td class="ltr">${x&&x.loss!=null?x.loss+"%":"—"}</td></tr>`;
+  h+=`<div class="hint" style="margin:10px 0 6px">آخرین نتیجه از سرور خارج (<span class="ltr">${esc(rp.ip||"")}</span> · <span class="ltr">${dts}</span>):</div><div style="overflow-x:auto"><table><thead><tr><th>مسیر</th><th>وضعیت</th><th>میانگین ms</th><th>نوسان ms</th><th>پکت‌خسری</th></tr></thead><tbody>${row("پینگ (ICMP)",rp.icmp)}${row("اکوی TCP",rp.tcp)}${row("اکوی UDP",rp.udp)}</tbody></table></div>`;
+  const rec=ct2Rec(r);
+  if(rec){h+=`<div class="hl" style="margin-top:10px"><b class="ok">⚡</b><div>${esc(rec.fa)}`;
+   if(TUNS.filter(t=>!t.pending).length===1)h+=` <button class="btn p" style="margin-inline-start:10px" onclick="ct2Apply('${rec.tr}')">اعمال ${rec.tr.toUpperCase()} به تانل</button>`;
+   h+="</div></div>"}}
+ $("ct2_out").innerHTML=h||'<div class="empty">هنوز لینکی ساخته نشده</div>';
+ if($("ct2_cp"))$("ct2_cp").onclick=async()=>{try{await navigator.clipboard.writeText($("ct2_lnk").value)}catch(e){$("ct2_lnk").select();document.execCommand("copy")}toast("کپی شد","s")};
+ if($("ct2_cl"))$("ct2_cl").onclick=async()=>{try{await api("ctest","POST",{action:"close"});toast("تست بسته شد","s");ct2Load()}catch(e){toast(e.message,"e")}}}
+async function ct2Apply(tr){const t=TUNS.filter(t=>!t.pending)[0];if(!t)return;
+ try{await api("tunnel","POST",{action:"transport",ip:t.ip,tr});toast("ترنسپورت تانل: "+tr.toUpperCase()+" — دستور سمت خارج را دوباره اجرا کن","s");trLoad()}catch(e){toast(e.message,"e")}}
+async function ct2Load(){try{const r=await api("ctest");ct2Draw(r)}catch(e){}}
+$("ct_open").onclick=async()=>{const b=$("ct_open");if(!b||b.disabled)return;b.disabled=true;
+ try{const r=await api("ctest","POST",{action:"open"});ct2Draw(r);toast("لینک تست ساخته شد — روی سرور خارج اجرا کن","s")}catch(e){toast(e.message,"e")}b.disabled=false};
+function ctDraw(r){const s=(window.LAST||{}).sys||{};
+ $("ct_c").textContent=(s.cpu!=null?Math.round(s.cpu):"—")+"%";$("ct_cs").textContent=s.load!=null?("load "+s.load):"—";
+ $("ct_r").textContent=s.ram_total?Math.round(100*s.ram_used/s.ram_total)+"%":"—";$("ct_rs").textContent=s.ram_total?hb(s.ram_used)+" / "+hb(s.ram_total):"—";
+ $("ct_d").textContent=s.disk_total?Math.round(100*s.disk_used/s.disk_total)+"%":"—";$("ct_ds").textContent=s.disk_total?hb(s.disk_used)+" / "+hb(s.disk_total):"—";
+ $("ct_n").textContent=s.rx!=null?(hb(s.rx)+" ↓"):"—";$("ct_ns").textContent=s.tx!=null?(hb(s.tx)+" ↑"):"—";
+ const res=r.result;
+ if(!res){$("ct_out").innerHTML='<div class="empty">هنوز تستی اجرا نشده</div>';return}
+ const dts=new Date(res.t*1000).toLocaleString("sv");
+ const row=(n,x,ex)=>!x?"":`<tr><td>${n}</td><td>${x.down?'<span class="pill down">قطع</span>':x.ok?'<span class="pill up">پاسخ می‌دهد</span>':'<span class="pill down">بی‌پاسخ</span>'}</td><td class="ltr">${x.ok?x.avg+" ms":"—"}</td><td class="ltr">${x.ok?(x.jitter??"—")+" ms":"—"}</td><td class="ltr">${x.ok?x.loss+"%":"—"}</td>${ex||""}</tr>`;
+ let html=`<div class="hint" style="margin:0 0 10px">آخرین تست: <span class="ltr">${dts}</span></div><div style="overflow-x:auto"><table><thead><tr><th>مقصد</th><th>وضعیت</th><th>میانگین</th><th>نوسان</th><th>پکت‌خسری</th></tr></thead><tbody>`
+  +row("Cloudflare 1.1.1.1",res.g2)+row("Google 4.2.2.4",res.g1);
+ for(const t of res.tunnels||[])html+=row("تانل "+(t.name||t.ip),t.up?t:{down:true},`<td class="ltr">${t.mtu?"MTU "+t.mtu:"—"}</td>`);
+ html+="</tbody></table></div>"
+  +`<div class="wrow"><div><span class="l">دانلود مستقیم (Cloudflare)</span><b class="ltr">${res.dl?res.dl+" Mbit/s":"—"}</b></div><div><span class="l">UDP خروجی</span><b>${res.udp?"باز":"بسته"}</b></div></div>`
+  +(res.udp===false?'<div class="hl" style="margin-top:10px"><b class="err">✘</b><div>خروجی UDP بسته است — تانل WireGuard بالا نمی‌آید. اول UDP را روی فایروال/اپراتور باز کن.</div></div>':"")
+  +((res.rec&&res.rec.fa)?`<div class="hl" style="margin-top:10px"><b class="${res.rec.label==="offline"||res.rec.label==="udp_blocked"?"err":"ok"}">${res.rec.label==="offline"||res.rec.label==="udp_blocked"?"✘":"⚡"}</b><div>${esc(res.rec.fa)}${res.rec.preset?` <button class="btn p" style="margin-inline-start:10px" onclick="applyRec('${res.rec.preset}')">اعمال ${PRFA[res.rec.preset]||res.rec.preset}</button>`:""}</div></div>`:"");
+ $("ct_out").innerHTML=html}
 $("t_cp").onclick=async()=>{try{await navigator.clipboard.writeText($("t_sx").value)}catch(e){$("t_sx").select();document.execCommand("copy")}toast("کپی شد","s")};
 const TV={no_tunnel:["برای مقایسه ابتدا یک تانل رمزنگاری‌شده بساز. فعلاً فقط مسیر مستقیم تست شد.","warn"],wg_down:["لینک WireGuard برقرار نشده: یا دستور سمت سرور خارج هنوز اجرا نشده، یا UDP این مسیر بسته است. فعلاً مستقیم را نگه دار.","err"],wg_nosvc:["لینک WireGuard وصل است ولی این پورت از داخل تانل جواب نمی‌دهد. سرویس باید روی همه آی‌پی‌ها گوش بدهد، نه فقط آی‌پی عمومی.","err"],wg:["WireGuard مناسب است: پایدار و سریع، و ترافیک رمزنگاری می‌شود. «فعال‌سازی» را بزن.","ok"],direct:["در این مسیر مستقیم بهتر جواب می‌دهد (تأخیر یا افت بسته‌ی تانل بیشتر است). اگر رمزنگاری مهم‌تر است می‌توانی تانل را فعال کنی.","warn"]};
 $("t_run").onclick=async()=>{const b=$("t_run");b.disabled=true;$("t_res").innerHTML='<div class="empty">در حال تست… (حدود ۲۰ ثانیه)</div>';
  try{const r=await api("tunnel/test","POST",{ip:$("t_ti").value,port:+$("t_tp").value||0});
   const row=(n,x)=>!x?"":`<tr><td>${n}</td><td>${x.ok?'<span class="pill up">پاسخ می‌دهد</span>':'<span class="pill down">بی‌پاسخ</span>'}</td><td class="ltr">${x.ok?x.avg+" ms":"—"}</td><td class="ltr">${x.ok?x.min+" / "+x.max:"—"}</td><td class="ltr">${x.ok?x.jitter+" ms":"—"}</td><td class="ltr">${x.loss}%</td></tr>`;
   const v=TV[r.verdict];
-  $("t_res").innerHTML=`<div style="overflow-x:auto"><table><thead><tr><th>مسیر (پورت ${r.port})</th><th>وضعیت</th><th>میانگین</th><th>کمترین / بیشترین</th><th>نوسان</th><th>ازدست‌رفتن</th></tr></thead><tbody>${row("مستقیم (بدون رمزنگاری)",r.direct)}${row("WireGuard (رمزنگاری‌شده)",r.tunnel&&r.tunnel.tcp)}</tbody></table></div><div class="hl" style="margin-top:12px"><b class="${v[1]}">${{ok:"✔",warn:"!",err:"✘"}[v[1]]}</b><div>${v[0]}</div></div>`}catch(e){$("t_res").innerHTML="";toast(e.message,"e")}b.disabled=false};
+  $("t_res").innerHTML=`<div style="overflow-x:auto"><table><thead><tr><th>مسیر (پورت ${r.port})</th><th>وضعیت</th><th>میانگین</th><th>کمترین / بیشترین</th><th>نوسان</th><th>ازدست‌رفتن</th></tr></thead><tbody>${row("مستقیم (بدون رمزنگاری)",r.direct)}${row("WireGuard (رمزنگاری‌شده)",r.tunnel&&r.tunnel.tcp)}</tbody></table></div>`
+  +(r.udp===false?`<div class="hl" style="margin-top:10px"><b class="err">✘</b><div>خروجی UDP از این سرور بسته است — تونل WireGuard روی UDP سوار است و بالا نمی‌آید. اول UDP را روی فایروال/اپراتور باز کن.</div></div>`:"")
+  +(r.rec&&r.rec.label!=="unreachable"?`<div class="hl" style="margin-top:10px"><b class="${r.udp===false?"err":"ok"}">${r.udp===false?"✘":"⚡"}</b><div>${esc(r.rec.fa)} ${r.rec.preset?`<button class="btn p" style="margin-inline-start:10px" onclick="applyRec('${r.rec.preset}')">اعمال ${PRFA[r.rec.preset]}</button>`:""}</div></div>`:"")
+  +`<div class="hl" style="margin-top:12px"><b class="${v[1]}">${{ok:"✔",warn:"!",err:"✘"}[v[1]]}</b><div>${v[0]}</div></div>`}catch(e){$("t_res").innerHTML="";toast(e.message,"e")}b.disabled=false};
+async function applyRec(p){try{await api("perf","POST",{preset:p});toast("اعمال شد: "+PRFA[p],"s");load()}catch(e){toast(e.message,"e")}}
 let LGV="s";
 $("lgs").onclick=()=>{LGV="s";$("lgs").classList.add("on");$("lga").classList.remove("on");logs()};
 $("lga").onclick=()=>{LGV="a";$("lga").classList.add("on");$("lgs").classList.remove("on");logs()};
@@ -2511,6 +3676,7 @@ pkg_make() {   # build a self-contained offline package with SHA256 checksums (f
   [[ -s $self ]] || { err "Cannot find this script."; return 1; }
   dir=$(mktemp -d) || return 1
   cp "$self" "$dir/dr-cpanel.sh"
+  if gost_have; then cp /usr/local/bin/drc-gost "$dir/drc-gost"; fi   # bundle the transport carrier for carried tunnels
   cat > "$dir/install.sh" <<'OFEOF'
 #!/usr/bin/env bash
 # DR-CPanel offline installer — no internet needed
@@ -2520,10 +3686,11 @@ cd "$(dirname "$0")"
 sha256sum -c SHA256SUMS >/dev/null 2>&1 || { echo "checksum FAILED — package is broken, do not use it"; exit 1; }
 echo "checksum OK"
 install -m 755 dr-cpanel.sh /usr/local/bin/dr-cpanel
+[[ -f drc-gost ]] && { install -m 755 drc-gost /usr/local/bin/drc-gost; echo "transport carrier (gost) installed"; }
 echo "installed. open the menu with:  dr-cpanel"
 exec /usr/local/bin/dr-cpanel
 OFEOF
-  ( cd "$dir" && sha256sum dr-cpanel.sh install.sh > SHA256SUMS )
+  ( cd "$dir" && sha256sum dr-cpanel.sh install.sh drc-gost 2>/dev/null > SHA256SUMS || sha256sum dr-cpanel.sh install.sh > SHA256SUMS )
   out="/root/dr-cpanel-$VERSION-offline.tar.gz"
   tar czf "$out" -C "$dir" . && rm -rf "$dir" || { rm -rf "$dir"; err "Could not create the package."; return 1; }
   ok "Offline package: $out"
@@ -2632,6 +3799,134 @@ security_menu() {
   apply_rules; ok "Security updated for port $lport."
 }
 
+# ------------------------------------------- two-server connection test (BackPack-style)
+CTESTF="$CONF_DIR/ctest.json"      # {"id","tport","uport","until","report"}
+
+ctest_free_port() {   # a TCP+UDP free port in the 21000-21999 band
+  local p
+  for p in $(shuf -i 21000-21999 -n 20 2>/dev/null || seq 21000 21999); do
+    if ! ss -uln "( sport = :$p )" 2>/dev/null | grep -q ":$p " && ! ss -tln "( sport = :$p )" 2>/dev/null | grep -q ":$p "; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+
+ctest_open() {   # open ephemeral echo servers and print "ID TPORT UPORT" - the panel wraps them into a one-line link
+  local id tport uport until
+  id=$(tun_token); [[ ${#id} -ge 16 ]] || { echo "error: no entropy" >&2; return 1; }
+  tport=$(ctest_free_port) || { echo "error: no free test port" >&2; return 1; }
+  uport=$(ctest_free_port) || { echo "error: no free test port" >&2; return 1; }
+  [[ $tport != "$uport" ]] || uport=$(ctest_free_port) || { echo "error: no free test port" >&2; return 1; }
+  until=$(( $(date +%s) + 900 ))
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null
+  printf '{"id":"%s","tport":%s,"uport":%s,"until":%s,"report":null}\n' "$id" "$tport" "$uport" "$until" > "$CTESTF"
+  chmod 600 "$CTESTF"
+  nohup "$BIN" ctest-daemon "$tport" "$uport" "$until" >/dev/null 2>&1 &
+  echo "$id $tport $uport"
+}
+
+ctest_close() {   # stop the echo servers and clear their firewall rules
+  pkill -f "dr-cpanel ctest-daemon" 2>/dev/null || true
+  if [[ -s $CTESTF ]]; then
+    local tport uport
+    tport=$(python3 -c "import json;print(json.load(open('$CTESTF')).get('tport',''))" 2>/dev/null)
+    uport=$(python3 -c "import json;print(json.load(open('$CTESTF')).get('uport',''))" 2>/dev/null)
+    local n=0
+    [[ -n $tport ]] && { while iptables -D INPUT -p tcp --dport "$tport" -m comment --comment drc-ctest -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done; }
+    n=0
+    [[ -n $uport ]] && { while iptables -D INPUT -p udp --dport "$uport" -m comment --comment drc-ctest -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done; }
+  fi
+  rm -f "$CTESTF"
+  echo "closed"
+}
+
+ctest_daemon() {   # internal: TCP+UDP echo servers for the two-server test (tport uport until)
+  local tport=$1 uport=$2 until=$3
+  iptables -I INPUT -p tcp --dport "$tport" -m comment --comment drc-ctest -j ACCEPT 2>/dev/null || true
+  iptables -I INPUT -p udp --dport "$uport" -m comment --comment drc-ctest -j ACCEPT 2>/dev/null || true
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "$tport/tcp" >/dev/null 2>&1; ufw allow "$uport/udp" >/dev/null 2>&1
+  fi
+  cleanup() {
+    local n=0
+    while iptables -D INPUT -p tcp --dport "$tport" -m comment --comment drc-ctest -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done
+    n=0
+    while iptables -D INPUT -p udp --dport "$uport" -m comment --comment drc-ctest -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done
+  }
+  trap cleanup EXIT INT TERM
+  exec python3 - "$tport" "$uport" "$until" <<'PYEOF'
+import socket, sys, threading, time
+tport, uport, until = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+
+def tcp_echo():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", tport)); s.listen(16); s.settimeout(2)
+    while time.time() < until:
+        try:
+            c, _ = s.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        def h(c):
+            c.settimeout(10)
+            try:
+                while True:
+                    b = c.recv(4096)
+                    if not b: break
+                    c.sendall(b)
+            except Exception: pass
+            finally:
+                try: c.close()
+                except Exception: pass
+        threading.Thread(target=h, args=(c,), daemon=True).start()
+    try: s.close()
+    except Exception: pass
+
+def udp_echo():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", uport)); s.settimeout(2)
+    while time.time() < until:
+        try:
+            b, a = s.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try: s.sendto(b, a)
+        except Exception: pass
+    try: s.close()
+    except Exception: pass
+
+t1 = threading.Thread(target=tcp_echo, daemon=True)
+t2 = threading.Thread(target=udp_echo, daemon=True)
+t1.start(); t2.start()
+while time.time() < until and t1.is_alive() and t2.is_alive():
+    time.sleep(1)
+PYEOF
+}
+
+conntest_cli() {   # BackPack-style connection test, via the installed web backend (no panel needed)
+  [[ -f $WEB_PY ]] || { echo "error: install the web panel first (menu option 9), then run this again" >&2; return 1; }
+  python3 "$WEB_PY" conntest 2>/dev/null | python3 -c '
+import json,sys
+try: r=json.load(sys.stdin)
+except Exception: print("conntest failed"); raise SystemExit(1)
+def row(n,x,extra=""):
+    if x is None: print("  %-26s %s" % (n, "n/a")); return
+    print("  %-26s %s%s" % (n, ("%5s ms · loss %s%%" % (x.get("avg","-"), x.get("loss","-"))) if x.get("ok") else "unreachable", extra))
+print("DR-CPanel connection test  (%s)" % time.strftime("%F %T", __import__("time").localtime(r.get("t", 0))) if True else "")
+row("Cloudflare 1.1.1.1", r.get("g2"))
+row("Google DNS 8.8.8.8→4.2.2.4", r.get("g1"))
+print("  %-26s %s" % ("Download (Cloudflare)", ("%s Mbit/s" % r["dl"]) if r.get("dl") else "n/a"))
+print("  %-26s %s" % ("UDP egress (WireGuard)", "open" if r.get("udp") else "BLOCKED"))
+for t in r.get("tunnels", []):
+    row("tunnel -> %s" % (t.get("name") or t.get("ip")), t, (" · MTU %s" % t["mtu"]) if t.get("mtu") else "")
+rec=r.get("rec") or {}
+print("  recommendation: %s%s" % (rec.get("fa","-"), (" (preset: %s)" % rec["preset"]) if rec.get("preset") else ""))
+';
+}
+
 main_menu() {
   local c
   while true; do
@@ -2648,6 +3943,7 @@ main_menu() {
     echo "  10) Uninstall"
     echo "  11) Tunnel security      IP allow-list, connection and rate limits"
     echo "  12) Encrypted transport  WireGuard link to the foreign server"
+    echo "  13) Setup Kharej         run me on the FOREIGN server to join a tunnel"
     echo "   0) Exit"
     echo
     read -rp "  Select an option: " c
@@ -2665,6 +3961,7 @@ main_menu() {
       10) uninstall;;
       11) security_menu; pause;;
       12) tunnel_menu; pause;;
+      13) kharej_join; pause;;
       0) exit 0;;
     esac
   done
@@ -2675,15 +3972,22 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   ensure_deps
   migrate_legacy
   case "${1:-}" in
-    apply) apply_rules;;
+    apply) apply_rules; gost_boot;;
     list)  list_rules;;
     tunnel) shift; tunnel_cli "$@";;
+    reverse) shift; tunnel_cli reverse "$@";;
+    join) shift; kharej_join "$@";;
+    kharej) kharej_status;;
+    ctest-open) shift; ctest_open;;
+    ctest-close) ctest_close;;
+    ctest-daemon) shift; ctest_daemon "$@";;
+    conntest) conntest_cli;;
     perf)  shift; perf_apply "${1:-}";;
     audit) tail -n "${2:-60}" "$AUDF" 2>/dev/null || info "Audit log is empty.";;
     package) pkg_make;;
     rollback) do_rollback;;
     update) bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh);;
     "")    main_menu;;
-    *)     echo "Usage: $0 [apply|list|update|rollback|package|perf NAME|audit|tunnel]"; exit 1;;
+    *)     echo "Usage: $0 [apply|list|update|rollback|package|perf NAME|audit|conntest|tunnel|reverse|join LINK|kharej]"; exit 1;;
   esac
 fi
