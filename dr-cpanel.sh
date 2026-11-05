@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="2.9.0"
+VERSION="2.9.1"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
 TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active|preset|type|join_token|name|token_expiry|transport|carrier_port
@@ -586,6 +586,19 @@ tun_script() {   # foreign_ip : the script to run on the foreign server
       revn=$((revn + 1))
     done < "$REV"
   fi
+  # BackPack-style forwarded ports: users hit Iran:<lport>, the service listens on the kharej
+  # (often only on its loopback) - bake the loopback redirect into the foreign script.
+  local fwdin="" fwdn=0
+  if [[ -s $CONF ]]; then
+    while IFS='|' read -r fn fp fl fi fd; do
+      [[ $fi == "10.66.$id.2" ]] || continue
+      for p in $(proto_list "$fp"); do
+        fwdin+="iptables -t nat -A DRC_REV -i drwg$id -p $p -d 10.66.$id.2 --dport $fd -j DNAT --to-destination 127.0.0.1:$fd"$'\n'
+      done
+      fwdn=$((fwdn + 1))
+    done < "$CONF"
+    [[ -n $fwdin ]] && fwdin=$'sysctl -q -w net.ipv4.conf.drwg'"$id"$'.route_localnet=1 || true\n'"$fwdin"
+  fi
   # when the transport is not plain UDP, the foreign side listens for the gost carrier
   GOST_SRV=""
   if [[ $tr != udp ]]; then
@@ -681,9 +694,9 @@ iptables -t nat    -A DRC_REVPOST -o drwg$id -j MASQUERADE
 iptables -t filter -N DRC_REVFWD  2>/dev/null || true; iptables -t filter -F DRC_REVFWD
 iptables -t filter -C FORWARD -j DRC_REVFWD 2>/dev/null || iptables -t filter -I FORWARD 1 -j DRC_REVFWD
 iptables -t filter -A DRC_REVFWD -i drwg$id -j ACCEPT
-${revrules}
+${revrules}${fwdin}
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow in on drwg$id; fi
-echo "Done. Tunnel address on this server: 10.66.$id.2 · reverse forwards: $revn"
+echo "Done. Tunnel address on this server: 10.66.$id.2 · reverse forwards: $revn · forwarded ports: $fwdn"
 EOS
 }
 
@@ -711,6 +724,18 @@ tun_script_join() {   # token host client_ip : the one-line join script the pane
       done
       revn=$((revn + 1))
     done < "$REV"
+  fi
+  # BackPack-style forwarded ports of this tunnel: bake the kharej loopback redirect in as well
+  local fwdin="" fwdn=0
+  if [[ -s $CONF ]]; then
+    while IFS='|' read -r fn fp fl fi fd; do
+      [[ $fi == "10.66.$id.2" ]] || continue
+      for p in $(proto_list "$fp"); do
+        fwdin+="iptables -t nat -A DRC_REV -i drwg$id -p $p -d 10.66.$id.2 --dport $fd -j DNAT --to-destination 127.0.0.1:$fd"$'\n'
+      done
+      fwdn=$((fwdn + 1))
+    done < "$CONF"
+    [[ -n $fwdin ]] && fwdin=$'sysctl -q -w net.ipv4.conf.drwg'"$id"$'.route_localnet=1 || true\n'"$fwdin"
   fi
   local epdecl="" lp
   lp=$(tr_local_port "$id")
@@ -818,9 +843,9 @@ iptables -t nat    -A DRC_REVPOST -o drwg$id -j MASQUERADE
 iptables -t filter -N DRC_REVFWD  2>/dev/null || true; iptables -t filter -F DRC_REVFWD
 iptables -t filter -C FORWARD -j DRC_REVFWD 2>/dev/null || iptables -t filter -I FORWARD 1 -j DRC_REVFWD
 iptables -t filter -A DRC_REVFWD -i drwg$id -j ACCEPT
-${revrules}
+${revrules}${fwdin}
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow in on drwg$id; fi
-echo "Done. Tunnel address on this server: 10.66.$id.2 · type: $ty · transport: $tr · reverse forwards: $revn"
+echo "Done. Tunnel address on this server: 10.66.$id.2 · type: $ty · transport: $tr · reverse forwards: $revn · forwarded ports: $fwdn"
 EOS
 }
 
@@ -849,14 +874,6 @@ tunnel_cli() {
     repair)  repair_wg;;
     *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] [preset] [fwd|dir] [name] [transport] | join-open [UDP_PORT] [preset] [name] [transport] | link IP-or-ID | script IP | script-join TOKEN HOST CLIENT_IP | transport IP [udp|tcp|ws|wss|kcp|quic] [carrier_port] | use IP | direct IP | mtu IP | mtuprobe IP | preset IP [name] | reverse add|del|list|test ... | sync | repair"; return 1;;
   esac
-}
-
-tun_pick() {   # sets TFIP
-  local n; TFIP=""
-  [[ -s $TUN ]] || { err "No tunnels yet."; return 1; }
-  read -rp "  Tunnel number: " n
-  [[ $n =~ ^[0-9]+$ ]] && TFIP=$(sed -n "${n}p" "$TUN" | cut -d'|' -f2)
-  [[ -n $TFIP ]] || { err "Invalid number."; return 1; }
 }
 
 kharej_join() {   # [url] : run on a FOREIGN server - fetch the join script from the Iran panel and bring the tunnel up
@@ -888,74 +905,6 @@ kharej_status() {   # the foreign-side view: every drwg* link, its handshake age
   done
   (( n == 0 )) && info "No tunnels on this server yet - run: dr-cpanel join '<link>'"
   return 0
-}
-
-tunnel_menu() {
-  banner; echo "  ${C_BLD}Encrypted transport (WireGuard + carrier)${C_RST}"; echo
-  info "Encrypts the Iran <-> foreign link in the kernel (ChaCha20); every tunnel picks its own carrier (UDP/TCP/WS/WSS/KCP/QUIC)."; echo
-  local i=0 id fip port a hs c r pr tr cp
-  if [[ -s $TUN ]]; then
-    printf "  ${C_BLD}%-3s %-17s %-6s %-8s %-13s %-12s %s${C_RST}\n" "#" "FOREIGN IP" "PORT" "TR" "LINK" "PRESET" "FORWARDS VIA"
-    while IFS='|' read -r id fip port _ _ _ _ _ a pr _ _ _ _ tr; do
-      [[ -z $id ]] && continue; i=$((i + 1))
-      hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
-      printf "  %-3s %-17s %-6s %-8s %-13s %-12s %s\n" "$i" "$fip" "$port" "${tr:-udp}" "$([[ ${hs:-0} -gt 0 ]] && echo linked || echo no-handshake)" "${pr:--}" "$([[ $a == 1 ]] && echo tunnel || echo direct)"
-    done < "$TUN"; echo
-  fi
-  echo "   1) Create tunnel to a foreign server"
-  echo "   2) Show the setup script for the foreign server"
-  echo "   3) Switch forwards to the tunnel   (after the foreign side is set up)"
-  echo "   4) Switch forwards back to direct"
-  echo "   5) Remove tunnel"
-  echo "   6) Auto-tune MTU         find the largest packet the link passes"
-  echo "   7) Performance preset    per-tunnel preset, applied when the tunnel is active"
-  echo "   8) Reverse forwards      ports on the foreign server -> services on this (Iran) server"
-  echo "   9) Transport             switch a tunnel between UDP / TCP / WS / WSS / KCP / QUIC"
-  echo "   0) Back"; echo
-  read -rp "  Select: " c
-  case $c in
-    1) read -rp "  Foreign server IP: " fip; read -rp "  Tunnel port [51820]: " port
-       echo "  Transport (how the tunnel crosses the path):"
-       echo "    1) UDP (fastest)   2) TCP   3) WebSocket   4) WSS   5) KCP   6) QUIC"
-       read -rp "  Select [1]: " tc
-       case ${tc:-1} in 2) tr=tcp;; 3) tr=ws;; 4) tr=wss;; 5) tr=kcp;; 6) tr=quic;; *) tr=udp;; esac
-       cp=""; [[ $tr != udp ]] && { read -rp "  Carrier port on the foreign server [auto]: " cp; }
-       echo "  Performance preset for THIS tunnel:"
-       echo "    1) Balanced   2) Turbo (recommended)   3) Throughput   4) Gaming   Enter = Turbo"
-       read -rp "  Select [2]: " pc
-       case ${pc:-2} in 1) pr=balanced;; 3) pr=throughput;; 4) pr=gaming;; *) pr=turbo;; esac
-       if tun_add "$fip" "${port:-51820}" 0 "$pr" fwd "" "$tr" "$cp"; then ok "Tunnel created (transport: $tr · preset: $pr). Run this on the foreign server as root:"; echo; tun_script "$fip"
-       else err "Failed."; fi;;
-    2) tun_pick && tun_script "$TFIP";;
-    3) tun_pick && { if tun_active "$TFIP" 1; then ok "Forwards to $TFIP now use the tunnel. MTU: $(awk -F'|' -v ip="$TFIP" '$2==ip{print $4}' "$TUN")"; else err "Not switched."; fi; };;
-    4) tun_pick && { tun_active "$TFIP" 0 && ok "Forwards to $TFIP are direct again."; };;
-    5) tun_pick && confirm "Remove the tunnel to $TFIP? Its forwards go back to direct." && tun_del "$TFIP" && ok "Removed.";;
-    6) tun_pick && { local got; if got=$(tun_automtu "$TFIP"); then ok "Best MTU for this link: $got"; else err "Could not measure (link must be connected first)."; fi; };;
-    7) tun_pick && { local cur; cur=$(tun_preset "$TFIP")
-       echo "  Current preset: ${cur:-- (system default)}"
-       echo "    1) Balanced   2) Turbo   3) Throughput   4) Gaming   5) none (follow the system preset)"
-       read -rp "  Select: " pc
-       case $pc in
-         1) tun_preset "$TFIP" balanced && ok "Preset: balanced (applies now if the tunnel is active).";;
-         2) tun_preset "$TFIP" turbo && ok "Preset: turbo (applies now if the tunnel is active).";;
-         3) tun_preset "$TFIP" throughput && ok "Preset: throughput (applies now if the tunnel is active).";;
-         4) tun_preset "$TFIP" gaming && ok "Preset: gaming (applies now if the tunnel is active).";;
-         5) tun_preset "$TFIP" none && ok "Tunnel follows the system preset again.";;
-         *) err "Canceled.";;
-       esac; };;
-    8) reverse_menu;;
-    9) tun_pick && { local cur ntr
-       cur=$(tun_transport "$TFIP")
-       echo "  Current transport: $cur"
-       echo "    1) UDP (plain WireGuard, fastest)   2) TCP   3) WebSocket   4) WSS   5) KCP   6) QUIC"
-       echo "  (for anything but UDP the foreign server's script must be run again after the switch)"
-       read -rp "  Select: " tc
-       case $tc in
-         1) ntr=udp;; 2) ntr=tcp;; 3) ntr=ws;; 4) ntr=wss;; 5) ntr=kcp;; 6) ntr=quic;; *) err "Canceled."; return;;
-       esac
-       local ncp=""; [[ $ntr != udp ]] && { read -rp "  Carrier port [auto]: " ncp; }
-       if got=$(tun_transport "$TFIP" "$ntr" "$ncp"); then ok "Transport: $got. If this tunnel is carried (not UDP), re-run the foreign script on the other server."; else err "Failed."; fi; };;
-  esac
 }
 
 reverse_menu() {   # ports on the foreign server that reach services on the Iran server
@@ -3927,42 +3876,657 @@ print("  recommendation: %s%s" % (rec.get("fa","-"), (" (preset: %s)" % rec["pre
 ';
 }
 
+
+# ------------------------------------------------- BackPack-style menu flows
+# The CLI now follows BackPack 1:1: 0) Connection Test, 1) Setup Iran, 2) Setup
+# Kharej (both ask the Direction first), 3) Manage, ... and our one extra item,
+# 11) Forward Port. Tunnel creation is NOT buried under a transport menu any
+# more: you say which server you are on, which direction, and the wizard asks
+# the transport family -> variant, the address, the port, the forwarded ports,
+# the name and the per-tunnel preset - then one link sets the other side up.
+
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+
+pick_menu() {   # $1=title, rest="key|label|desc"; menu on stderr, chosen key on stdout ("" = cancel)
+  local title=$1; shift
+  {
+    banner; echo "  ${C_BLD}$title${C_RST}"; echo
+    local o key label desc
+    for o in "$@"; do IFS='|' read -r key label desc <<< "$o"
+      printf "   %s) %-16s %s\n" "$key" "$label" "$desc"
+    done
+    echo "   0) Cancel"; echo
+    printf "  Select: "
+  } >&2
+  local c o key label desc
+  read -r c
+  for o in "$@"; do IFS='|' read -r key label desc <<< "$o"
+    [[ $key == "$c" ]] && { echo "$key"; return 0; }
+  done
+  echo ""; return 0
+}
+
+DIR_CHOICE=0
+ask_direction() {   # $1 = Iran|Kharej : the one question that picks the engine (BackPack askDirection)
+  DIR_CHOICE=0
+  banner; echo "  ${C_BLD}Setup $1${C_RST}"; echo
+  echo "  Direction - who dials whom:"
+  echo "   1) Reverse   kharej dials Iran - try this first"
+  echo "   2) Direct    Iran dials kharej - when inbound to Iran is blocked"
+  echo "   0) Back"; echo
+  local c; read -rp "  Select: " c
+  case $c in 1) DIR_CHOICE=1;; 2) DIR_CHOICE=2;; *) DIR_CHOICE=0;; esac
+}
+
+choose_transport() {   # BackPack two-level picker; echoes the transport ("" = cancelled)
+  local fam tr
+  fam=$(pick_menu "Select Transport Family" \
+    "1|TCP|reliable and simple - the safe default" \
+    "2|UDP|lower latency, better on lossy or throttled links" \
+    "3|WebSocket|looks like normal web traffic - CDN friendly") || return 0
+  [[ -z $fam ]] && return 0
+  case $fam in
+    1) tr=$(pick_menu "Select TCP Transport" \
+         "1|TCP|plain & fast - start here if unsure");;
+    2) tr=$(pick_menu "Select UDP Transport" \
+         "1|UDP|raw datagrams - for UDP-based services" \
+         "2|UDP + KCP + FEC|low-latency gaming tunnel - reliable UDP with error correction" \
+         "3|UDP + QUIC|encrypted TLS 1.3 streams over UDP - self-tuning, great under loss");;
+    3) tr=$(pick_menu "Select WebSocket Transport" \
+         "1|WS|WebSocket - HTTP camouflage, CDN friendly" \
+         "2|WSS|secure WebSocket - TLS encrypted (self-signed certificate is automatic)");;
+  esac
+  case $fam:$tr in
+    1:1) echo tcp;;
+    2:1) echo udp;; 2:2) echo kcp;; 2:3) echo quic;;
+    3:1) echo ws;; 3:2) echo wss;;
+    *)   echo "";;
+  esac
+}
+
+wiz_preset() {   # BackPack "How Should The Tunnel Be Tuned?" - per-tunnel, at create time
+  local p
+  p=$(pick_menu "How Should The Tunnel Be Tuned?" \
+    "1|Balanced|least memory - safe defaults" \
+    "2|Turbo|recommended for Iran <-> abroad" \
+    "3|Throughput|maximum bandwidth on fat links" \
+    "4|Gaming|lowest latency for games and real-time") || { echo turbo; return 0; }
+  case $p in 1) echo balanced;; 3) echo throughput;; 4) echo gaming;; *) echo turbo;; esac
+}
+
+parse_ports_spec() {   # "443, 8080=2096, 8080=127.0.0.1:2096" -> lines "listen destport" (BackPack port spec)
+  local spec=$1 e l d
+  [[ -z $(trim "$spec") ]] && return 0
+  local IFS=,
+  for e in $spec; do
+    e=$(trim "$e"); [[ -z $e ]] && continue
+    if [[ $e == *=* ]]; then
+      l=$(trim "${e%%=*}"); d=$(trim "${e#*=}"); d=${d##*:}; d=$(trim "$d")   # bare port or host:port
+    else
+      l=$e; d=$e
+    fi
+    if [[ $l =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]] && valid_port "$l" && valid_port "$d"; then
+      echo "$l $d"
+    else
+      err "Bad port spec '$e' (use 443, 8080=2096 or 8080=127.0.0.1:2096)"; return 1
+    fi
+  done
+}
+
+add_forward_auto() {   # name proto lport ip dport : the wizard's non-interactive forward add
+  local name=$1 proto=$2 lport=$3 ip=$4 dport=$5
+  valid_port "$lport" || { err "Invalid listen port $lport."; return 1; }
+  [[ $proto =~ ^(tcp|udp|both)$ ]] || return 1
+  awk -F'|' -v p="$lport" -v pr="$proto" '$3==p && ($2==pr||$2=="both"||pr=="both"){f=1} END{exit !f}' "$CONF" 2>/dev/null \
+    && { err "A forward on port $lport already exists."; return 1; }
+  valid_port "$dport" || { err "Invalid destination port $dport."; return 1; }
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null
+  echo "$name|$proto|$lport|$ip|$dport" >> "$CONF"
+  apply_rules; ensure_boot
+  return 0
+}
+
+web_base_url() {   # https://host:port of the web backend ("" when unavailable)
+  [[ -f $WEB_PY ]] || return 0
+  local info port tls dom host
+  info=$(python3 "$WEB_PY" info 2>/dev/null) || return 0
+  port=$(awk '{print $1}' <<< "$info"); tls=$(awk '{print $2}' <<< "$info"); dom=$(awk '{print $3}' <<< "$info")
+  [[ $port =~ ^[0-9]+$ ]] || return 0
+  host=$dom; [[ -z $host || $host == "-" ]] && host=$(web_pubip 2>/dev/null)
+  [[ -z $host || $host == "-" ]] && host=$(hostname -I 2>/dev/null | awk '{print $1}')
+  [[ -n $host ]] && echo "$([[ $tls == https ]] && echo https || echo http)://$host:$port"
+  return 0
+}
+
+wizard_rev_iran() {   # Reverse Tunnel - Iran: listens; the kharej joins with one link
+  local tr host port name preset spec id tok url l d fwdn=0 det
+  banner; echo "  ${C_BLD}Reverse Tunnel - Iran${C_RST}"; echo
+  info "Kharej dials IN and joins with one link; users connect to THIS server."
+  tr=$(choose_transport)
+  [[ -z $tr ]] && { warn "No transport chosen - canceled."; return 0; }
+  echo
+  det=$(web_pubip 2>/dev/null); [[ -z $det || $det == "-" ]] && det=$(hostname -I 2>/dev/null | awk '{print $1}')
+  read -rp "  Iran IP Or Domain (What Kharej Dials)${det:+ [$det]}: " host; host=$(trim "${host:-$det}")
+  read -rp "  Tunnel Port [51820]: " port; port=${port:-51820}
+  valid_port "$port" || { err "Invalid port."; return 0; }
+  read -rp "  Forwarded Ports (users hit IRAN, service runs on KHAREJ; e.g. 443, 8080=2096) [none]: " spec
+  read -rp "  Tunnel Name [server-$port]: " name; name=$(trim "${name:-server-$port}")
+  preset=$(wiz_preset)
+  echo
+  echo "  ${C_BLD}--- Summary ---${C_RST}"
+  echo "  Type: Reverse (kharej dials Iran)   Transport: $tr   Preset: $preset"
+  echo "  Iran endpoint: ${host:-<kharej will ask>}   Tunnel port: $port"
+  echo "  Forwarded ports: $(trim "${spec:-none}")"
+  echo
+  confirm "Create This Tunnel?" || { info "Canceled."; return 0; }
+  if [[ ! -f $WEB_PY ]]; then
+    warn "The one-line join link is served by the web backend (not installed yet)."
+    confirm "Install the web backend now?" && web_install || true
+  fi
+  if [[ -n $(trim "$spec") ]]; then
+    parse_ports_spec "$spec" > "$CONF_DIR/.ports.$$" 2>/dev/null \
+      || { rm -f "$CONF_DIR/.ports.$$"; err "No forwards were added."; spec=""; }
+  fi
+  tok=$(tun_add_rev "$port" "$preset" "$name" "$tr" "") \
+    || { err "Tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
+  id=$(awk -F'|' -v t="$tok" '$12==t{print $1; exit}' "$TUN")
+  if [[ -s $CONF_DIR/.ports.$$ ]]; then
+    while read -r l d; do
+      add_forward_auto "rv$l" both "$l" "10.66.$id.2" "$d" \
+        && { ok "Forward  :$l -> kharej :$d  (through the tunnel)"; fwdn=$((fwdn + 1)); }
+    done < "$CONF_DIR/.ports.$$"
+    (( fwdn > 0 )) && warn "If the service on kharej listens only on 127.0.0.1, re-run the kharej join line once after any change."
+  fi
+  rm -f "$CONF_DIR/.ports.$$"
+  echo
+  url=$(web_base_url)
+  if [[ -n $url ]]; then
+    ok "Tunnel #$id created - this side is listening. Run this ONE line on the KHAREJ server (as root):"
+    echo; echo "  ${C_BLD}${C_GRN}bash <(curl -fsSLk $url/join/$tok)${C_RST}"; echo
+    info "The link stays valid: Manage -> Tunnels -> #$id -> Setup Link."
+  else
+    ok "Tunnel #$id created - this side is listening."
+    warn "The web backend is not reachable, so there is no one-line link. Install it (menu 5), then: Manage -> Tunnels -> #$id -> Setup Link."
+  fi
+}
+
+wizard_direct_iran() {   # Direct Tunnel - Iran: Iran dials out to the kharej
+  local tr fip port name preset spec id tok url l d fwdn=0 mtu
+  banner; echo "  ${C_BLD}Direct Tunnel - Iran${C_RST}"; echo
+  info "Iran dials OUT to the kharej server - use it when inbound to Iran is blocked."
+  tr=$(choose_transport)
+  [[ -z $tr ]] && { warn "No transport chosen - canceled."; return 0; }
+  echo
+  read -rp "  Kharej IP Or Domain (What Iran Dials): " fip; fip=$(trim "$fip")
+  if ! valid_ip "$fip"; then
+    local rip; rip=$(getent hosts "$fip" 2>/dev/null | awk '{print $1; exit}')
+    if [[ -n $rip ]]; then ok "  $fip -> $rip"; fip=$rip; else err "Invalid IP or unresolvable domain."; return 0; fi
+  fi
+  read -rp "  Tunnel Port [51820]: " port; port=${port:-51820}
+  valid_port "$port" || { err "Invalid port."; return 0; }
+  read -rp "  Forwarded Ports (users hit IRAN, service runs on KHAREJ; e.g. 443, 8080=2096) [none]: " spec
+  read -rp "  MTU [auto]: " mtu; mtu=$(trim "$mtu"); [[ -z $mtu ]] && mtu=0
+  [[ $mtu =~ ^[0-9]+$ ]] && (( mtu == 0 || (mtu >= 1200 && mtu <= 1500) )) || { err "Invalid MTU."; return 0; }
+  read -rp "  Tunnel Name [direct-$port]: " name; name=$(trim "${name:-direct-$port}")
+  preset=$(wiz_preset)
+  echo
+  echo "  ${C_BLD}--- Summary ---${C_RST}"
+  echo "  Type: Direct (Iran dials kharej)   Transport: $tr   Preset: $preset   MTU: $([[ $mtu == 0 ]] && echo auto || echo "$mtu")"
+  echo "  Kharej: $fip   Tunnel port: $port"
+  echo "  Forwarded ports: $(trim "${spec:-none}")"
+  echo
+  confirm "Create This Tunnel?" || { info "Canceled."; return 0; }
+  if [[ ! -f $WEB_PY ]]; then
+    warn "The one-line join link is served by the web backend (not installed yet)."
+    confirm "Install the web backend now?" && web_install || true
+  fi
+  if [[ -n $(trim "$spec") ]]; then
+    parse_ports_spec "$spec" > "$CONF_DIR/.ports.$$" 2>/dev/null \
+      || { rm -f "$CONF_DIR/.ports.$$"; err "No forwards were added."; spec=""; }
+  fi
+  tun_add "$fip" "$port" "$mtu" "$preset" fwd "$name" "$tr" "" \
+    || { rm -f "$CONF_DIR/.ports.$$"; err "Tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
+  id=${TROW:-}; id=$(cut -d'|' -f1 <<< "$(tun_row "$fip")")
+  if [[ -s $CONF_DIR/.ports.$$ ]]; then
+    while read -r l d; do
+      add_forward_auto "fw$l" both "$l" "10.66.$id.2" "$d" \
+        && { ok "Forward  :$l -> kharej :$d  (through the tunnel)"; fwdn=$((fwdn + 1)); }
+    done < "$CONF_DIR/.ports.$$"
+  fi
+  rm -f "$CONF_DIR/.ports.$$"
+  (( fwdn > 0 )) && tun_active "$fip" 1 >/dev/null 2>&1 && ok "Forwards route through the encrypted tunnel."
+  echo
+  tok=$(tun_link "$fip" 2>/dev/null)
+  url=$(web_base_url)
+  if [[ -n $url && ${#tok} -ge 16 ]]; then
+    ok "Tunnel #$id created. Run this ONE line on the KHAREJ server (as root):"
+    echo; echo "  ${C_BLD}${C_GRN}bash <(curl -fsSLk $url/join/$tok)${C_RST}"; echo
+    info "Classic alternative: Manage -> Tunnels -> #$id -> Foreign Script."
+  else
+    ok "Tunnel #$id created. Run this on the KHAREJ server:"
+    echo; tun_script "$fip"; echo
+    info "Save it as a file and run as root on the kharej server."
+  fi
+}
+
+setup_iran_menu() {
+  ask_direction Iran
+  case $DIR_CHOICE in
+    1) wizard_rev_iran; pause;;
+    2) wizard_direct_iran; pause;;
+  esac
+}
+
+wizard_kharej_side() {   # $1 = 1 (reverse) | 2 (direct) - the kharej side of either direction
+  local c tmp ty
+  ty=$([[ $1 == 1 ]] && echo Reverse || echo Direct)
+  banner; echo "  ${C_BLD}$ty Tunnel - Kharej${C_RST}"; echo
+  echo "  How Do You Want To Set Up This Side?"
+  echo "   1) Setup Link    recommended - paste the Iran server's link"
+  echo "   2) Setup Script  paste the full script the Iran server printed"
+  echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) kharej_join;;
+    2) info "Paste the script, then press Ctrl+D to run it:"
+       tmp=$(mktemp); cat > "$tmp" 2>/dev/null || true
+       if [[ -s $tmp ]]; then bash "$tmp"; else info "Nothing pasted."; fi
+       rm -f "$tmp"; pause;;
+  esac
+}
+
+setup_kharej_menu() {
+  ask_direction Kharej
+  case $DIR_CHOICE in
+    1) wizard_kharej_side 1; pause;;
+    2) wizard_kharej_side 2; pause;;
+  esac
+}
+
+# --- 0) Connection Test ------------------------------------------------------
+ct_print_report() {   # pretty-print the two-server report stored by the panel
+  python3 - "$CTESTF" <<'PYEOF'
+import json, sys
+try: st = json.load(open(sys.argv[1]))
+except Exception: raise SystemExit(2)
+r = st.get("report")
+if not r: raise SystemExit(2)
+def g(k):
+    d = r.get(k) or {}
+    if not isinstance(d, dict) or not d.get("ok"): return ("BLOCKED", "-", "-")
+    return (d.get("avg", "-"), d.get("jitter", "-"), d.get("loss", "-"))
+print()
+print("  DR-CPanel two-server test:  KHAREJ (%s) -> IRAN" % r.get("ip", "?"))
+print("  | %-10s | %8s | %8s | %6s |" % ("path", "avg ms", "jitter", "loss%"))
+print("  " + "-" * 42)
+for name, k in (("ping (ICMP)", "icmp"), ("tcp echo", "tcp"), ("udp echo", "udp")):
+    a, j, l = g(k)
+    print("  | %-10s | %8s | %8s | %5s%% |" % (name, a, j, l))
+print()
+PYEOF
+}
+
+ct_wait_report() {
+  local i=0
+  echo
+  info "Waiting for the kharej to run the link (up to 15 minutes) - Ctrl+C stops waiting."
+  while (( ++i <= 180 )); do
+    sleep 5
+    if ct_print_report 2>/dev/null; then ok "Report received (also visible on the panel's connection-test page)."; return 0; fi
+    (( i % 12 == 0 )) && printf "  ...waiting (%d/15 min)\n" $((i / 12))
+  done
+  warn "No report yet. The listeners stay open for 15 minutes - the kharej line can still be run in that window."
+  info "Close the listeners any time with: dr-cpanel ctest-close"
+}
+
+connection_test_menu() {
+  local c
+  banner; echo "  ${C_BLD}Connection Test${C_RST}"; echo
+  info "Which paths actually work between the two servers - real ICMP + TCP echo + UDP echo."
+  echo
+  echo "  This Server Is:"
+  echo "   1) Iran     start here, get the link"
+  echo "   2) Kharej   paste the Iran server's link"
+  echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) ct_iran_menu; pause;;
+    2) ct_kharej_menu;;
+  esac
+}
+
+ct_iran_menu() {
+  if [[ ! -f $WEB_PY ]]; then
+    warn "The test link is served by the web backend (not installed yet)."
+    confirm "Install it now?" || { info "Install it later from menu 5 (Web Panel)."; return 0; }
+    web_install || return 0
+  fi
+  banner; echo "  ${C_BLD}Connection Test - Iran${C_RST}"; echo
+  info "1/2  Preparing the test listeners (TCP + UDP echo, live 15 minutes)..."
+  local out id tport uport url
+  out=$(ctest_open) || { err "Could not open the test listeners (ports busy?)."; return 0; }
+  read -r id tport uport <<< "$out"
+  url=$(web_base_url)
+  if [[ -z $url ]]; then
+    err "Could not read the web backend address (menu 5 -> Show access info)."
+    ctest_close >/dev/null
+    return 0
+  fi
+  echo
+  info "2/2  Connect the Kharej - run this ONE line there (as root):"
+  echo
+  echo "  ${C_BLD}${C_GRN}bash <(curl -fsSLk $url/ctest/$id)${C_RST}"
+  echo
+  warn "Leave this test open on Iran. Ctrl+C stops waiting (the listeners stay up 15 min)."
+  ct_wait_report
+}
+
+ct_kharej_menu() {
+  banner; echo "  ${C_BLD}Connection Test - Kharej${C_RST}"; echo
+  local url; read -rp "  Test Link (from the Iran server): " url
+  url=$(trim "$url"); [[ -n $url ]] || return 0
+  url=$(printf '%s' "$url" | tr -d "\"'")
+  [[ $url =~ ^https?://[^[:space:]]+/ctest/[0-9a-f]{16,64}$ ]] || { err "That does not look like a DR-CPanel test link."; return 0; }
+  info "Measuring ICMP + TCP echo + UDP echo to the Iran server..."
+  echo
+  curl -fsSLk --max-time 60 "$url" | bash
+  echo
+  pause
+}
+
+# --- 3) Manage ---------------------------------------------------------------
+tun_table() {   # the tunnel table; sets TUN_COUNT
+  local i=0 id fip port a pr ty name tr hs st
+  TUN_COUNT=0
+  [[ -s $TUN ]] || { info "No tunnels yet - build one from Setup Iran / Setup Kharej."; return 1; }
+  printf "  ${C_BLD}%-3s %-18s %-6s %-9s %-10s %-14s %-11s %s${C_RST}\n" "#" "NAME" "PORT" "TYPE" "TRANSPORT" "STATE" "PRESET" "FOREIGN IP"
+  while IFS='|' read -r id fip port _ _ _ _ _ a pr ty tok name _ tr _; do
+    [[ -z $id ]] && continue; i=$((i + 1))
+    if [[ $fip == pending ]]; then st="waiting-join"
+    else
+      hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
+      if [[ ${hs:-0} -gt 0 ]]; then st="linked"; else st="no-handshake"; fi
+      [[ $(systemctl is-active "wg-quick@drwg$id" 2>/dev/null) == active ]] || st="stopped"
+    fi
+    printf "  %-3s %-18s %-6s %-9s %-10s %-14s %-11s %s\n" \
+      "$i" "${name:-tunnel$id}" "$port" "$([[ $ty == rev ]] && echo reverse || echo direct)" \
+      "${tr:-udp}" "$st" "${pr:--}" "$([[ $fip == pending ]] && echo '<waiting for the link>' || echo "$fip")"
+  done < "$TUN"
+  TUN_COUNT=$i
+  return 0
+}
+
+tun_pick_row() {   # sets TROW/TID/TFIP from a table line number
+  local n
+  TROW=""; TID=""; TFIP=""
+  [[ -s $TUN ]] || { err "No tunnels yet."; return 1; }
+  read -rp "  Tunnel number: " n
+  [[ $n =~ ^[0-9]+$ ]] || { err "Invalid number."; return 1; }
+  TROW=$(sed -n "${n}p" "$TUN")
+  [[ -n $TROW ]] || { err "Invalid number."; return 1; }
+  TID=${TROW%%|*}; TFIP=$(cut -d'|' -f2 <<< "$TROW")
+  return 0
+}
+
+tun_show_link() {   # id : the one-line join command for a tunnel
+  local id=$1 r tok url fip
+  r=$(awk -F'|' -v i="$id" '$1==i{print;exit}' "$TUN")
+  [[ -n $r ]] || { err "No such tunnel."; return 1; }
+  fip=$(cut -d'|' -f2 <<< "$r")
+  tok=$(cut -d'|' -f12 <<< "$r")
+  [[ ${#tok} -ge 16 ]] || tok=$(tun_link "$id") || { err "Could not create a join token."; return 1; }
+  url=$(web_base_url)
+  [[ -z $url ]] && { err "The web backend is not reachable - install/restart it from menu 5 first."; return 1; }
+  ok "Run this ONE line on the KHAREJ server (as root):"
+  echo; echo "  ${C_BLD}${C_GRN}bash <(curl -fsSLk $url/join/$tok)${C_RST}"; echo
+  [[ $fip == pending ]] && info "Reverse tunnel: it goes live the moment the kharej runs that line."
+  return 0
+}
+
+tun_switch_transport() {   # id : BackPack-style per-tunnel carrier switch
+  local id=$1 cur ntr ncp got
+  cur=$(tun_transport "$id")
+  echo "  Current transport: $cur"
+  echo "   1) UDP (plain WireGuard - fastest)   2) TCP   3) WS   4) WSS   5) KCP   6) QUIC"
+  read -rp "  Select [1]: " c
+  case ${c:-1} in 2) ntr=tcp;; 3) ntr=ws;; 4) ntr=wss;; 5) ntr=kcp;; 6) ntr=quic;; *) ntr=udp;; esac
+  ncp=""; [[ $ntr != udp ]] && { read -rp "  Carrier port [auto]: " ncp; }
+  if got=$(tun_transport "$id" "$ntr" "$ncp"); then
+    ok "Transport: $got."
+    [[ $got != udp ]] && warn "Carried transport: run the kharej join line / foreign script again after a switch."
+  else
+    err "Failed."
+  fi
+}
+
+tun_switch_preset() {   # id
+  local id=$1 cur got
+  cur=$(tun_preset "$id")
+  echo "  Current preset: ${cur:-- (system default)}"
+  echo "   1) Balanced   2) Turbo   3) Throughput   4) Gaming   5) Follow the system preset"
+  read -rp "  Select: " c
+  case $c in 1) got=balanced;; 2) got=turbo;; 3) got=throughput;; 4) got=gaming;; 5) got=none;; *) err "Canceled."; return 0;; esac
+  tun_preset "$id" "$got" >/dev/null && ok "Preset: $got (applies now if the tunnel is active)."
+}
+
+tunnel_actions() {   # BackPack ManageTunnels -> manageOne: pick a tunnel, then act on it
+  local id fip name a got c
+  banner; echo "  ${C_BLD}Tunnels${C_RST}"; echo
+  tun_table || return 0
+  echo
+  tun_pick_row || return 0
+  id=$TID; fip=$TFIP
+  name=$(cut -d'|' -f13 <<< "$TROW")
+  while true; do
+    echo
+    echo "  ${C_BLD}Tunnel #$id${C_RST}${name:+ \"$name\"}  ($([[ $(cut -d'|' -f11 <<< "$TROW") == rev ]] && echo reverse || echo direct) · $(cut -d'|' -f15 <<< "$TROW"))"
+    echo "   1) Start             bring the interface up"
+    echo "   2) Stop              bring the interface down"
+    echo "   3) Restart"
+    echo "   4) Setup Link        the one-line join command for the kharej"
+    echo "   5) Foreign Script    the classic full script for the kharej"
+    echo "   6) Transport         switch UDP / TCP / WS / WSS / KCP / QUIC"
+    echo "   7) Preset            per-tunnel performance preset"
+    echo "   8) Auto MTU          find the largest packet the link passes"
+    echo "   9) Route Forwards    via this tunnel / back to direct"
+    echo "  10) Live Log          Ctrl+C to return"
+    echo "  11) Delete            remove this tunnel"
+    echo "   0) Back"; echo
+    read -rp "  Select: " c || return 0
+    case $c in
+      1) tun_up "$id" && ok "Started.";;
+      2) tun_down "$id" && ok "Stopped.";;
+      3) tun_up "$id" && ok "Restarted.";;
+      4) tun_show_link "$id";;
+      5) echo; tun_script "$fip"; echo; info "Save the whole script above as a file on the kharej server and run it as root.";;
+      6) tun_switch_transport "$id";;
+      7) tun_switch_preset "$id";;
+      8) got=$(tun_automtu "$id" 2>/dev/null) && ok "Best MTU for this link: $got" || err "Could not measure (the link must be connected first).";;
+      9) a=$(cut -d'|' -f9 <<< "$TROW")
+         if [[ $a == 1 ]]; then tun_active "$fip" 0 && ok "Forwards to $fip are direct again."
+         else tun_active "$fip" 1 && ok "Forwards to $fip now ride the tunnel."; fi
+         TROW=$(tun_row "$id");;
+     10) echo; info "Live log of wg-quick@drwg$id - Ctrl+C to return:"
+         journalctl -n 30 -u "wg-quick@drwg$id" -f 2>/dev/null || warn "journalctl unavailable.";;
+     11) confirm "Delete tunnel #$id ($fip)?" && { tun_del "$fip" && ok "Deleted - its forwards went back to direct."; return 0; };;
+      0) return 0;;
+    esac
+  done
+}
+
+forward_actions() {   # our one extra: the classic DNAT port forwarding
+  local c
+  while true; do
+    banner; echo "  ${C_BLD}Forward Port${C_RST}"; echo
+    info "The classic forwarding: a port on THIS server lands on a foreign node (iptables DNAT)."
+    echo
+    echo "   1) Add Forward          new port -> foreign node"
+    echo "   2) List Forwards        with live traffic counters"
+    echo "   3) Test Forwards        TCP connect time and ping"
+    echo "   4) Import Manual Rules  adopt hand-made iptables rules"
+    echo "   5) Remove Forward"
+    echo "   0) Back"; echo
+    read -rp "  Select: " c || return 0; echo
+    case $c in
+      1) add_forward; pause;;
+      2) banner; list_rules; pause;;
+      3) test_forwards; pause;;
+      4) import_legacy; pause;;
+      5) remove_forward; pause;;
+      0) return 0;;
+    esac
+  done
+}
+
+manage_menu() {   # BackPack: "tunnels, status, health, tests"
+  local c
+  while true; do
+    banner; echo "  ${C_BLD}Manage${C_RST}"; echo
+    echo "   1) Tunnels              start/stop, links, transport, preset, MTU, delete"
+    echo "   2) Forward Ports        list, test, remove the DNAT forwards"
+    echo "   3) Reverse Forwards     ports on kharej that reach services on Iran"
+    echo "   4) Status               full status"
+    echo "   5) Tunnel Security      IP allow-list, connection and rate limits"
+    echo "   0) Back"; echo
+    read -rp "  Select: " c || return 0; echo
+    case $c in
+      1) tunnel_actions;;
+      2) forward_actions;;
+      3) reverse_menu;;
+      4) status; pause;;
+      5) security_menu; pause;;
+      0) return 0;;
+    esac
+  done
+}
+
+# --- 7) Telegram Bot ---------------------------------------------------------
+tg_cfg() {   # echo "token chat api on|off"
+  python3 - "$WEB_CFG" <<'PYEOF'
+import json, sys
+try: c = json.load(open(sys.argv[1]))
+except Exception: c = {}
+print(c.get("tg_token") or "-", c.get("tg_chat") or "-", c.get("tg_api") or "-", "on" if c.get("tg_bot") else "off")
+PYEOF
+}
+
+tg_cfg_set() {   # token chat on|off ("" keeps the current value)
+  python3 - "$WEB_CFG" "${1:-}" "${2:-}" "${3:-}" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; tok, chat, bot = sys.argv[2], sys.argv[3], sys.argv[4]
+try: c = json.load(open(p))
+except Exception: c = {}
+if tok: c["tg_token"] = tok.strip()
+if chat: c["tg_chat"] = chat.strip()
+if bot in ("on", "off"): c["tg_bot"] = bot == "on"
+json.dump(c, open(p, "w"))
+print("saved")
+PYEOF
+}
+
+telegram_menu() {
+  local c tok chat api on
+  read -r tok chat api on <<< "$(tg_cfg)"
+  banner; echo "  ${C_BLD}Telegram Bot${C_RST}"; echo
+  echo "  Token: $([[ $tok == - ]] && echo '<not set>' || echo '<set>')   Chat: $([[ $chat == - || -z $chat ]] && echo '<not set>' || echo '<set>')   Bot: $on"
+  echo
+  echo "   1) Bot Token           from @BotFather"
+  echo "   2) Chat ID             the chat that receives the reports"
+  echo "   3) Enable / Disable    the /status /traffic /report bot"
+  echo "   4) Test Message        send one now"
+  echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) read -rp "  Bot Token: " tok; [[ -n $(trim "$tok") ]] && { tg_cfg_set "$tok" "" "" >/dev/null && ok "Token saved."; };;
+    2) read -rp "  Chat ID: " chat; [[ -n $(trim "$chat") ]] && { tg_cfg_set "" "$chat" "" >/dev/null && ok "Chat saved."; };;
+    3) if [[ $on == on ]]; then tg_cfg_set "" "" off >/dev/null && ok "Bot disabled."
+       else tg_cfg_set "" "" on >/dev/null && ok "Bot enabled (the monitor service picks it up)."; fi;;
+    4) read -r tok chat api on <<< "$(tg_cfg)"
+       if [[ $tok == - || -z $chat ]]; then err "Set the bot token and the chat ID first."
+       else
+         curl -fsS --max-time 15 -H 'Content-Type: application/json' \
+           -d "{\"chat_id\":\"$chat\",\"text\":\"DR-CPanel test message - $(hostname) $(date '+%F %T')\"}" \
+           "$([[ $api == - || -z $api ]] && echo https://api.telegram.org || echo "$api")/bot$tok/sendMessage" >/dev/null 2>&1 \
+           && ok "Sent." || err "Could not send (token / chat / api?)."
+       fi;;
+  esac
+  systemctl restart dr-cpanel-web 2>/dev/null || true
+}
+
+# --- 8) Update ---------------------------------------------------------------
+update_menu() {
+  local c
+  banner; echo "  ${C_BLD}Update${C_RST}"; echo
+  echo "  Current version: $VERSION"
+  echo
+  echo "   1) Update Now     pull the latest release from GitHub"
+  echo "   2) Rollback       go back to the previous version"
+  echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) info "Updating..."
+       bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh)
+       echo; info "Update finished - reopen the menu with: dr-cpanel"
+       exit 0;;
+    2) do_rollback; pause;;
+  esac
+}
+
+# --- doctor ------------------------------------------------------------------
+doctor() {   # the first stop when a tunnel will not build
+  banner; echo "  ${C_BLD}Doctor${C_RST}"; echo
+  local bad=0 pip
+  cok()  { ok "$1"; }
+  cbad() { err "$1"; bad=$((bad + 1)); }
+  command -v python3  >/dev/null 2>&1 && cok "python3"                     || cbad "python3 MISSING (the web backend needs it)"
+  command -v curl     >/dev/null 2>&1 && cok "curl"                        || cbad "curl MISSING"
+  command -v iptables >/dev/null 2>&1 && cok "iptables"                    || cbad "iptables MISSING"
+  command -v wg       >/dev/null 2>&1 && cok "wireguard tools"             || cbad "wireguard tools MISSING - run the installer again"
+  modprobe wireguard  2>/dev/null     && cok "wireguard kernel module"     || cbad "wireguard kernel module FAILED to load"
+  [[ -x /usr/local/bin/drc-gost ]]     && cok "gost carrier installed"     || info "gost carrier: installs on the first carried tunnel"
+  [[ -f $WEB_PY ]]                     && cok "web backend installed"      || warn "web backend NOT installed (join/test links need it - menu 5)"
+  systemctl is-active dr-cpanel-web >/dev/null 2>&1 && cok "web backend running" || warn "web backend NOT running (menu 5 -> Restart)"
+  pip=$(web_pubip 2>/dev/null)
+  [[ -n $pip && $pip != "-" ]]         && cok "public IP detected ($pip)"  || warn "public IP not detectable - type it manually in the wizards"
+  [[ -r $TUN ]]                        && cok "tunnels config readable"    || info "tunnels config: empty (no tunnels yet)"
+  echo
+  if (( bad == 0 )); then ok "Nothing blocking - tunnel creation should work."
+  else warn "$bad blocking problem(s) - fix the red ones and try again."; fi
+  return 0
+}
+
 main_menu() {
   local c
   while true; do
     banner
-    echo "   1) Add forward           new port -> foreign node"
-    echo "   2) List forwards         with live traffic counters"
-    echo "   3) Remove forward"
-    echo "   4) Connection test       TCP connect time and ping"
-    echo "   5) Performance presets   Balanced / Turbo / Throughput / Gaming"
-    echo "   6) Backup & Restore      + offline package"
-    echo "   7) Import manual rules   adopt hand-made iptables rules"
-    echo "   8) Status"
-    echo "   9) Web panel             install and manage the web UI"
-    echo "  10) Uninstall"
-    echo "  11) Tunnel security      IP allow-list, connection and rate limits"
-    echo "  12) Encrypted transport  WireGuard link to the foreign server"
-    echo "  13) Setup Kharej         run me on the FOREIGN server to join a tunnel"
-    echo "   0) Exit"
+    echo "   0) Connection Test     which transports work between two servers"
+    echo "   1) Setup Iran          the server users connect to"
+    echo "   2) Setup Kharej        the server abroad, with the service"
+    echo "   3) Manage              tunnels, status, health, tests"
+    echo "   4) Backup & Restore    all settings in one file"
+    echo "   5) Web Panel           link, login code, port"
+    echo "   6) Optimize            BBR, buffers, limits"
+    echo "   7) Telegram Bot        reports and alerts"
+    echo "   8) Update              with automatic rollback"
+    echo "   9) Uninstall           remove everything"
+    echo "  10) Exit"
+    echo "  11) Forward Port        classic DNAT: a port here -> a foreign node"
     echo
-    read -rp "  Select an option: " c
+    read -rp "  Select an option: " c || exit 0
     echo
     case $c in
-      1) add_forward; pause;;
-      2) banner; list_rules; pause;;
-      3) remove_forward; pause;;
-      4) test_forwards; pause;;
-      5) perf_menu; pause;;
-      6) backup_restore; pause;;
-      7) import_legacy; pause;;
-      8) status; pause;;
-      9) web_menu; pause;;
-      10) uninstall;;
-      11) security_menu; pause;;
-      12) tunnel_menu; pause;;
-      13) kharej_join; pause;;
-      0) exit 0;;
+      0) connection_test_menu; pause;;
+      1) setup_iran_menu;;
+      2) setup_kharej_menu;;
+      3) manage_menu;;
+      4) backup_restore; pause;;
+      5) web_menu; pause;;
+      6) perf_menu; pause;;
+      7) telegram_menu; pause;;
+      8) update_menu; pause;;
+      9) confirm "Remove everything? This cannot be undone." && uninstall;;
+      10) info "Goodbye!"; echo; exit 0;;
+      11) forward_actions;;
     esac
   done
 }
@@ -3982,12 +4546,13 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     ctest-close) ctest_close;;
     ctest-daemon) shift; ctest_daemon "$@";;
     conntest) conntest_cli;;
+    doctor) doctor;;
     perf)  shift; perf_apply "${1:-}";;
     audit) tail -n "${2:-60}" "$AUDF" 2>/dev/null || info "Audit log is empty.";;
     package) pkg_make;;
     rollback) do_rollback;;
     update) bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh);;
     "")    main_menu;;
-    *)     echo "Usage: $0 [apply|list|update|rollback|package|perf NAME|audit|conntest|tunnel|reverse|join LINK|kharej]"; exit 1;;
+    *)     echo "Usage: $0 [apply|list|update|rollback|package|perf NAME|audit|conntest|tunnel|reverse|join LINK|kharej|doctor]"; exit 1;;
   esac
 fi
