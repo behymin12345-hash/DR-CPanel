@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.11.0: Hashem-grade features, natively - (1) IP-Spoof: a spoofed-source pipe for GRE tunnels; the OUTER packets on the wire carry random-looking fake IPs instead of the real server IPs (each side sources its tunnel from its own fake IP and matches the peer's fake IP on a dedicated RX link - kernel double-link construction, works on plain public VPSs wherever the path does not enforce strict uRPF), per-tunnel toggle in the panel table and the CLI ('tunnel gre spoof ID on|off') and baked into the kharej join/foreign scripts; (2) DNS-Spoof: a built-in DNS resolver service (dr-cpanel-dns, UDP :53) with an override table (domain -> IP, or domain -> block, wildcards ok) and clean public-resolver forwarding for everything else - clients pointed at the server bypass DNS hijacking; managed from a new panel DNS tab, the API (/api/dns) and 'dr-cpanel dns on|off|add|del|list|status|menu'; (3) the Link Test now covers GRE rows (direct vs tunnel probes + preset recommendation) and the tunnel table shows the spoof state; (4) an Xtreme UI layer: animated mesh grid + twinkling stars background, gradient headline text, glass cards with a light sweep + hover lift, glowing active nav, springy buttons, pulsing online pills, row-hover glow and a custom scrollbar; v2.10.0: native GRE tunnels - a new L3 tunnel family alongside WireGuard, built on the kernel's ip_gre/fou: two modes (raw GRE over IP protocol 47, or GRE over UDP via FOU for UDP-only paths), reverse tunnels with the same one-line join link flow (GRE links are static, so the Iran-side link is built the moment the kharej fetches its join link) and direct tunnels, per-tunnel presets, auto-MTU probe over the GRE path, MSS clamping, a GRE tunnel watchdog that rebuilds dead links, its own Manage > GRE Tunnels menu with the full per-tunnel action set, CLI 'dr-cpanel tunnel gre ...', web panel wizard types GRE reverse/direct with a GRE/FOU mode picker, merged tunnel table with GRE rows and a FOU/GRE mode switch, /join/<token> and link/script endpoints serving GRE tunnels, gretunnels.conf included in backups/restore and uninstall cleanup, doctor now checks GRE kernel support; WARNING: GRE is a plain L3 tunnel - fast but NOT encrypted, WireGuard transports stay the choice for sensitive traffic; v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v3.0.0: two more engines built in - (1) Xray (VLESS + Reality): Xray-core installs from the panel/CLI, every inbound is a VLESS listener with Reality TLS-camouflage (a real SNI destination it borrows the TLS handshake from, automatic x25519 keys + short-id + flow xtls-rprx-vision), full lifecycle from the new Engines tab in the panel (/api/engines) and 'dr-cpanel xray add|del|on|off|list|link', one-click vless:// client links; (2) Backhaul (Musixal/Backhaul) reverse-tunnel engine: binary install, commented TOML client/server templates per tunnel (client service on Iran, server config ready to copy to the kharej), systemd per tunnel, Manage -> Engines in the CLI; the Engines panel tab shows both engines' state with one-click vless links; plus the Xtreme UI v3 (a visible aurora field with three moving color blobs, gradient headline flow, real gradient card borders with a light sweep, gradient pill nav and primary buttons, glowing status pills, section entrance transitions, custom gradient scrollbar) and a completely rewritten README; v2.11.0: Hashem-grade features, natively - (1) IP-Spoof: a spoofed-source pipe for GRE tunnels; the OUTER packets on the wire carry random-looking fake IPs instead of the real server IPs (each side sources its tunnel from its own fake IP and matches the peer's fake IP on a dedicated RX link - kernel double-link construction, works on plain public VPSs wherever the path does not enforce strict uRPF), per-tunnel toggle in the panel table and the CLI ('tunnel gre spoof ID on|off') and baked into the kharej join/foreign scripts; (2) DNS-Spoof: a built-in DNS resolver service (dr-cpanel-dns, UDP :53) with an override table (domain -> IP, or domain -> block, wildcards ok) and clean public-resolver forwarding for everything else - clients pointed at the server bypass DNS hijacking; managed from a new panel DNS tab, the API (/api/dns) and 'dr-cpanel dns on|off|add|del|list|status|menu'; (3) the Link Test now covers GRE rows (direct vs tunnel probes + preset recommendation) and the tunnel table shows the spoof state; (4) an Xtreme UI layer: animated mesh grid + twinkling stars background, gradient headline text, glass cards with a light sweep + hover lift, glowing active nav, springy buttons, pulsing online pills, row-hover glow and a custom scrollbar; v2.10.0: native GRE tunnels - a new L3 tunnel family alongside WireGuard, built on the kernel's ip_gre/fou: two modes (raw GRE over IP protocol 47, or GRE over UDP via FOU for UDP-only paths), reverse tunnels with the same one-line join link flow (GRE links are static, so the Iran-side link is built the moment the kharej fetches its join link) and direct tunnels, per-tunnel presets, auto-MTU probe over the GRE path, MSS clamping, a GRE tunnel watchdog that rebuilds dead links, its own Manage > GRE Tunnels menu with the full per-tunnel action set, CLI 'dr-cpanel tunnel gre ...', web panel wizard types GRE reverse/direct with a GRE/FOU mode picker, merged tunnel table with GRE rows and a FOU/GRE mode switch, /join/<token> and link/script endpoints serving GRE tunnels, gretunnels.conf included in backups/restore and uninstall cleanup, doctor now checks GRE kernel support; WARNING: GRE is a plain L3 tunnel - fast but NOT encrypted, WireGuard transports stay the choice for sensitive traffic; v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="2.11.0"
+VERSION="3.0.0"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
 TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active|preset|type|join_token|name|token_expiry|transport|carrier_port
@@ -2907,6 +2907,25 @@ class H(BaseHTTPRequestHandler):
             m = re.search(r"lport=(\d+)", self.path); k = m.group(1) if m else ""
             if k not in {str(r["lport"]) for r in read_rules()}: return self.out(404, {"error": "No such rule"})
             t = jload(SUBF).get(k, ""); return self.out(200, {"token": t, "path": "/sub/" + t if t else ""})
+        if p == "/api/engines":
+            xr = {"installed": os.path.exists("/usr/local/bin/xray"), "on": False, "rows": []}
+            try:
+                xr["on"] = subprocess.run(["systemctl", "is-active", "--quiet", "dr-cpanel-xray"], timeout=8).returncode == 0
+            except Exception: pass
+            try:
+                for l in open(D + "/xray/inbounds.conf"):
+                    q = l.rstrip("\n").split("|")
+                    if len(q) == 6 and q[0].strip(): xr["rows"].append(dict(port=int(q[0]), sni=q[1], uuid=q[2], sid=q[3], pub=q[5]))
+            except FileNotFoundError: pass
+            bh = {"installed": os.path.exists("/usr/local/bin/backhaul"), "tunnels": []}
+            try:
+                for l in os.listdir("/etc/dr-cpanel/backhaul") if os.path.isdir("/etc/dr-cpanel/backhaul") else []:
+                    if l.endswith("-client.toml"):
+                        tid = l[:-len("-client.toml")]
+                        active = subprocess.run(["systemctl", "is-active", "--quiet", "dr-bh-" + tid], timeout=8).returncode == 0
+                        bh["tunnels"].append(dict(id=tid, active=active))
+            except Exception: pass
+            return self.out(200, {"xray": xr, "backhaul": bh})
         if p == "/api/dns":
             dnspy = "/usr/local/lib/dr-cpanel/dns.py"; rows = []
             try:
@@ -3189,6 +3208,36 @@ class H(BaseHTTPRequestHandler):
                     log("info", "DNS resolver turned %s" % act); audit("dns_" + act, "", self.client_address[0])
                     return self.out(200, {"ok": True})
                 raise ValueError("Bad action")
+            if self.path == "/api/engines":
+                eng = d.get("engine"); act = d.get("action")
+                if eng == "xray":
+                    if act == "add":
+                        port = int(d.get("port") or 0); sni = re.sub(r"[^A-Za-z0-9.-]", "", str(d.get("sni", "")))
+                        if not (1 <= port <= 65535): raise ValueError("Invalid port")
+                        if not sni: raise ValueError("SNI required (a real domain)")
+                        r = subprocess.run([BIN, "xray", "add", str(port), sni], capture_output=True, text=True, timeout=180)
+                        if r.returncode: raise ValueError((r.stderr or r.stdout).strip()[-180:] or "Failed")
+                        log("info", "Xray inbound :%s (%s) added" % (port, sni)); audit("xray_add", ":" + str(port), self.client_address[0])
+                        return self.out(200, {"ok": True})
+                    if act == "del":
+                        port = str(int(d.get("port") or 0))
+                        r = subprocess.run([BIN, "xray", "del", port], capture_output=True, text=True, timeout=60)
+                        log("info", "Xray inbound :%s removed" % port); audit("xray_del", ":" + port, self.client_address[0])
+                        return self.out(200, {"ok": True})
+                    if act in ("on", "off"):
+                        r = subprocess.run([BIN, "xray", act], capture_output=True, text=True, timeout=180)
+                        if r.returncode: raise ValueError((r.stderr or r.stdout).strip()[-180:] or "Failed")
+                        log("info", "Xray engine turned %s" % act); audit("xray_" + act, "", self.client_address[0])
+                        return self.out(200, {"ok": True})
+                    raise ValueError("Bad action")
+                if eng == "backhaul":
+                    if act == "del":
+                        tid = re.sub(r"[^0-9]", "", str(d.get("id", "")))
+                        subprocess.run([BIN, "backhaul", "del", tid], capture_output=True, text=True, timeout=60)
+                        log("info", "Backhaul tunnel %s removed" % tid); audit("bh_del", tid, self.client_address[0])
+                        return self.out(200, {"ok": True})
+                    raise ValueError("Bad action")
+                raise ValueError("Bad engine")
             if self.path == "/api/totp":
                 c = cfg(); a = d.get("action"); ip = self.client_address[0]
                 if a == "setup":
@@ -3542,57 +3591,104 @@ html[dir=ltr] .ltr{text-align:left}
 html[dir=ltr] #login .go .ic{transform:none}
 html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
 </style><style id="xt">
-/* ---------- DR-CPanel Xtreme UI layer (v2.11) ---------- */
-body{background:
- radial-gradient(1200px 800px at 85% -10%,rgba(139,92,246,.20),transparent 60%),
- radial-gradient(900px 700px at -10% 110%,rgba(236,72,153,.14),transparent 55%),
- radial-gradient(700px 500px at 50% 50%,rgba(56,189,248,.07),transparent 60%),
- linear-gradient(160deg,#07060f,#0b0918 55%,#07060f)}
-body::before{content:"";position:fixed;inset:-20%;z-index:0;pointer-events:none;
- background:linear-gradient(rgba(139,92,246,.045) 1px,transparent 1px),
- linear-gradient(90deg,rgba(139,92,246,.045) 1px,transparent 1px);
- background-size:44px 44px;animation:xtgrid 26s linear infinite;
- -webkit-mask-image:radial-gradient(ellipse at 50% 40%,#000 25%,transparent 72%);
- mask-image:radial-gradient(ellipse at 50% 40%,#000 25%,transparent 72%)}
-@keyframes xtgrid{to{transform:translate3d(44px,44px,0)}}
-body::after{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.75;
- background:radial-gradient(2px 2px at 18% 28%,#ffffff22,transparent 55%),
- radial-gradient(1.6px 1.6px at 72% 18%,#ffffff1a,transparent 55%),
- radial-gradient(1.6px 1.6px at 45% 58%,#c7d2fe44,transparent 55%),
- radial-gradient(1.2px 1.2px at 86% 42%,#ffffff18,transparent 55%),
- radial-gradient(1.2px 1.2px at 8% 70%,#f0abfc22,transparent 55%);
- animation:xttw 8s ease-in-out infinite alternate}
-@keyframes xttw{to{opacity:1;transform:translateY(8px) scale(1.04)}}
-h1,h2{background:linear-gradient(100deg,#f6f5ff 20%,#c4b5fd 55%,#f0abfc 90%);
- -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.card,.lg{transition:transform .4s cubic-bezier(.16,1,.3,1),box-shadow .4s}
-.card:hover{transform:translateY(-3px);box-shadow:0 26px 70px -24px rgba(139,92,246,.55)}
-.card::after,.lg::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
- background:linear-gradient(115deg,transparent 30%,rgba(196,181,253,.10) 45%,transparent 60%);
- background-size:250% 100%;animation:xtshine 7s linear infinite}
-@keyframes xtshine{from{background-position:120% 0}to{background-position:-120% 0}}
-.nav.on{background:linear-gradient(135deg,#8b5cf6,#6366f1)!important;color:#fff!important;
- box-shadow:0 10px 30px -8px rgba(139,92,246,.85)}
-.btn{transition:transform .22s cubic-bezier(.34,1.56,.64,1),box-shadow .22s,filter .22s}
-.btn:hover{filter:brightness(1.12)}
-.btn:active{transform:scale(.955)}
-.btn.p{box-shadow:0 10px 32px -10px rgba(139,92,246,.9)}
-tbody tr{transition:background .25s,box-shadow .25s}
-tbody tr:hover{background:rgba(139,92,246,.09);box-shadow:inset 3px 0 0 #8b5cf6}
-.pill.up{box-shadow:0 0 12px rgba(34,197,94,.55);animation:xtpulse 2.6s ease-in-out infinite}
-@keyframes xtpulse{0%,100%{box-shadow:0 0 10px rgba(34,197,94,.45)}50%{box-shadow:0 0 20px rgba(34,197,94,.85)}}
-.t{animation:xttoast .45s cubic-bezier(.16,1,.3,1) both}
-@keyframes xttoast{from{opacity:0;transform:translateY(14px) scale(.94)}to{opacity:1;transform:none}}
-input,select,textarea{transition:border-color .25s,box-shadow .25s}
-input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px rgba(139,92,246,.22);border-color:#8b5cf6!important}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-thumb{background:linear-gradient(#8b5cf6,#6366f1);border-radius:99px;border:2px solid #07060f}
-::-webkit-scrollbar-track{background:transparent}
-.tab,.nav{position:relative;overflow:hidden}
-.tab::after{content:"";position:absolute;inset:auto 12% 3px 12%;height:2px;border-radius:99px;
- background:linear-gradient(90deg,#8b5cf6,#f0abfc);transform:scaleX(0);transition:transform .3s}
-.tab:hover::after{transform:scaleX(1)}
-@media(prefers-reduced-motion:reduce){body::before,body::after,.card::after,.lg::after{animation:none!important}}
+/* ================= DR-CPanel Xtreme UI v3 ================= */
+:root{--xt1:#8b5cf6;--xt2:#6366f1;--xt3:#ec4899;--xt4:#22d3ee}
+html{scroll-behavior:smooth}
+body{background:#05040c;overflow-x:hidden}
+/* ---- animated aurora field (3 big moving blobs + grid + stars) ---- */
+body::before{content:"";position:fixed;inset:-30%;z-index:0;pointer-events:none;
+ background:
+  radial-gradient(42vw 42vw at 18% 22%,rgba(139,92,246,.34),transparent 62%),
+  radial-gradient(36vw 36vw at 82% 18%,rgba(34,211,238,.20),transparent 60%),
+  radial-gradient(38vw 38vw at 78% 78%,rgba(236,72,153,.22),transparent 62%),
+  radial-gradient(30vw 30vw at 12% 82%,rgba(99,102,241,.24),transparent 60%);
+ filter:blur(46px);animation:xtaurora 26s ease-in-out infinite alternate}
+@keyframes xtaurora{
+ 0%{transform:translate(0,0) rotate(0deg) scale(1)}
+ 33%{transform:translate(6vw,-4vh) rotate(8deg) scale(1.14)}
+ 66%{transform:translate(-5vw,5vh) rotate(-6deg) scale(1.08)}
+ 100%{transform:translate(3vw,-6vh) rotate(4deg) scale(1.16)}}
+body::after{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+ background:
+  radial-gradient(2px 2px at 12% 24%,rgba(255,255,255,.5),transparent 55%),
+  radial-gradient(1.6px 1.6px at 78% 14%,rgba(255,255,255,.4),transparent 55%),
+  radial-gradient(1.8px 1.8px at 42% 62%,rgba(196,181,253,.5),transparent 55%),
+  radial-gradient(1.2px 1.2px at 88% 46%,rgba(255,255,255,.3),transparent 55%),
+  radial-gradient(1.4px 1.4px at 6% 74%,rgba(240,171,252,.4),transparent 55%),
+  radial-gradient(1.2px 1.2px at 64% 84%,rgba(255,255,255,.25),transparent 55%);
+ animation:xtstars 7s ease-in-out infinite alternate}
+@keyframes xtstars{to{opacity:.55;transform:translateY(10px)}}
+/* the whole app floats above the field */
+#app,#login{position:relative;z-index:1}
+/* ---- headings: gradient text ---- */
+h1,h2,.bar h1{background:linear-gradient(95deg,#f8f7ff 15%,#c4b5fd 50%,#f0abfc 85%);
+ -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+ background-size:200% 100%;animation:xtflow 9s linear infinite}
+@keyframes xtflow{to{background-position:200% 0}}
+/* ---- cards: real gradient border + inner glass + hover lift ---- */
+.card,.lg{position:relative;border:none!important;border-radius:20px!important;
+ background:rgba(13,11,24,.72)!important;backdrop-filter:blur(18px)!important;
+ box-shadow:0 24px 70px -30px rgba(0,0,0,.85),0 0 0 1px rgba(139,92,246,.14) inset!important;
+ transition:transform .45s cubic-bezier(.16,1,.3,1),box-shadow .45s}
+.card::before,.lg::before{content:"";position:absolute;inset:0;border-radius:20px;padding:1.4px;
+ background:linear-gradient(135deg,rgba(139,92,246,.75),rgba(34,211,238,.35) 40%,rgba(236,72,153,.55) 75%,rgba(139,92,246,.5));
+ -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;
+ mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude;
+ pointer-events:none;opacity:.9}
+.card::after{content:"";position:absolute;inset:0;border-radius:20px;pointer-events:none;
+ background:linear-gradient(115deg,transparent 32%,rgba(196,181,253,.13) 46%,transparent 60%);
+ background-size:260% 100%;animation:xtsweep 8s linear infinite}
+@keyframes xtsweep{from{background-position:130% 0}to{background-position:-130% 0}}
+.card:hover,.lg:hover{transform:translateY(-4px) scale(1.004);
+ box-shadow:0 34px 90px -28px rgba(139,92,246,.55),0 0 0 1px rgba(139,92,246,.3) inset!important}
+/* ---- buttons ---- */
+.btn{transition:transform .25s cubic-bezier(.34,1.56,.64,1),box-shadow .25s,filter .25s!important;border-radius:12px!important}
+.btn:hover{filter:brightness(1.16) saturate(1.1);transform:translateY(-1px)}
+.btn:active{transform:scale(.95)}
+.btn.p,.btn.primary{background:linear-gradient(135deg,var(--xt1),var(--xt2) 60%,var(--xt3))!important;border:none!important;
+ box-shadow:0 12px 34px -10px rgba(139,92,246,.95)!important}
+.btn.d{background:linear-gradient(135deg,#ef4444,#b91c1c)!important;border:none!important}
+/* ---- nav tabs: gradient pill ---- */
+.nav{border-radius:14px!important;transition:all .3s!important}
+.nav.on{background:linear-gradient(135deg,var(--xt1),var(--xt2))!important;color:#fff!important;
+ box-shadow:0 10px 28px -6px rgba(139,92,246,.9),0 0 0 1px rgba(255,255,255,.12) inset}
+.nav:not(.on):hover{background:rgba(139,92,246,.14)}
+/* ---- tables ---- */
+tbody tr{transition:background .25s,box-shadow .25s,transform .25s}
+tbody tr:hover{background:rgba(139,92,246,.10);box-shadow:inset 4px 0 0 var(--xt1)}
+th{color:#c4b5fd!important;letter-spacing:.4px}
+/* ---- pills ---- */
+.pill{border-radius:99px!important;font-weight:600}
+.pill.up{background:rgba(34,197,94,.16)!important;color:#4ade80!important;
+ box-shadow:0 0 14px rgba(34,197,94,.35);animation:xtpulse 2.4s ease-in-out infinite}
+@keyframes xtpulse{0%,100%{box-shadow:0 0 8px rgba(34,197,94,.3)}50%{box-shadow:0 0 22px rgba(34,197,94,.7)}}
+.pill.down{background:rgba(239,68,68,.16)!important;color:#f87171!important;box-shadow:0 0 14px rgba(239,68,68,.3)}
+/* ---- inputs ---- */
+input,select,textarea{border-radius:12px!important;transition:border-color .3s,box-shadow .3s,background .3s!important;
+ background:rgba(255,255,255,.045)!important;border:1px solid rgba(139,92,246,.22)!important;color:#f6f5ff!important}
+input:focus,select:focus,textarea:focus{border-color:var(--xt1)!important;
+ box-shadow:0 0 0 4px rgba(139,92,246,.18)!important;background:rgba(139,92,246,.06)!important}
+/* ---- login: animated gradient ring ---- */
+#login .lg,#login main,#login .card{animation:xtring 6s linear infinite}
+@keyframes xtring{to{filter:hue-rotate(360deg)}}
+#login input{height:44px}
+#login button{height:44px;font-weight:700;letter-spacing:.3px}
+/* ---- section transitions ---- */
+section{animation:xtin .5s cubic-bezier(.16,1,.3,1) both}
+@keyframes xtin{from{opacity:0;transform:translateY(16px) scale(.99)}to{opacity:1;transform:none}}
+/* ---- toasts ---- */
+.t{border-radius:14px!important;backdrop-filter:blur(14px);
+ box-shadow:0 18px 50px -14px rgba(0,0,0,.8),0 0 0 1px rgba(139,92,246,.3)!important;
+ animation:xttoast .5s cubic-bezier(.16,1,.3,1) both}
+/* ---- scrollbar ---- */
+::-webkit-scrollbar{width:11px;height:11px}
+::-webkit-scrollbar-thumb{background:linear-gradient(var(--xt1),var(--xt2));border-radius:99px;border:2.5px solid #05040c}
+::-webkit-scrollbar-thumb:hover{background:linear-gradient(var(--xt3),var(--xt1))}
+/* ---- selection ---- */
+::selection{background:rgba(139,92,246,.45);color:#fff}
+/* ---- meter bars: gradient fill ---- */
+meter,[class*=meter] i{background:linear-gradient(90deg,var(--xt2),var(--xt1),var(--xt3))!important}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <div id="aur" aria-hidden="true"><i class="a a1"></i><i class="a a2"></i><i class="a a3"></i><i class="st"></i></div>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
@@ -4134,6 +4230,45 @@ document.addEventListener("click",e=>{const m=e.target.closest(".modal");if(m&&e
 setAc(ACC);setLang(LANG);syncThemeColor();bootStart(0,900);
 api("state").then(()=>{bootGo(1);show(true)}).catch(()=>show(false));
 </script><script>
+/* ---------------- Xtreme layer: Engines tab (Xray + Backhaul) ---------------- */
+(function(){
+ const boot=()=>{try{
+  const sec=document.createElement("section");sec.id="p_eng";sec.className="hide";
+  sec.innerHTML='<div class="bar"><h1 style="margin:0">Engines</h1><button class="btn p" id="xr_t">تغییر وضعیت</button></div>'+
+   '<div class="card"><h2 style="margin-top:0;font-size:16px">Xray — VLESS + Reality</h2><div id="xr_st" style="margin-bottom:8px"></div>'+
+   '<div class="row"><div><label>پورت ورودی</label><input id="xr_p" inputmode="numeric" dir="ltr" placeholder="8443"></div>'+
+   '<div><label>SNI واقعی (دامنه‌ای که Reality تقلید می‌کند)</label><input id="xr_s" dir="ltr" placeholder="www.datadoghq.com"></div>'+
+   '<div style="flex:0 0 auto;align-self:end"><button class="btn p" id="xr_a">افزودن</button></div></div>'+
+   '<div class="tbl"><table><thead><tr><th>پورت</th><th>SNI</th><th>UUID</th><th>لینک کاربر</th><th></th></tr></thead><tbody id="xr_tb"></tbody></table></div></div>'+
+   '<div class="card" style="margin-top:16px"><h2 style="margin-top:0;font-size:16px">Backhaul — تانل معکوس</h2><div id="bh_st" style="margin-bottom:8px"></div>'+
+   '<div class="hint">نصب و ساخت تانل Backhaul از منوی CLI انجام می‌شود (Manage → Engines → Backhaul)؛ اینجا وضعیت و حذف در دسترس است.</div>'+
+   '<div class="tbl"><table><thead><tr><th>شناسه</th><th>وضعیت</th><th></th></tr></thead><tbody id="bh_tb"></tbody></table></div></div>';
+  const main=document.querySelector("main");if(!main)return;main.appendChild(sec);
+  const nb=document.createElement("button");nb.className="nav";nb.dataset.p="eng";nb.textContent=TX("موتورها");
+  const dnsnb=document.querySelector(".nav[data-p='dns']")||document.querySelector(".nav[data-p='set']");
+  if(dnsnb)dnsnb.after(nb);else main.querySelector(".bar").appendChild(nb);
+  nb.onclick=()=>nav("eng");
+  const _nav=nav;window.nav=function(p){_nav(p);const el=$("p_eng");if(el)el.classList.toggle("hide",p!=="eng");if(p==="eng"&&window.engLoad)engLoad()};
+  window.engLoad=async()=>{try{const r=await api("engines");
+   const x=r.xray,st=$("xr_st");if(st)st.innerHTML='<div class="acts"><span class="pill '+(x.on?"up":"down")+'">'+TX(x.on?"روشن":"خاموش")+"</span> <span class='hint'>"+(x.installed?"Xray-core نصب است":"نصب نیست")+"</span></div>";
+   const tb=$("xr_tb");if(tb)tb.innerHTML=x.rows.length?x.rows.map(x=>'<tr><td class="ltr">'+x.port+"</td><td class='ltr'>"+esc(x.sni)+"</td><td class='ltr' style='font-size:11px'>"+esc(x.uuid)+"</td>"+
+    "<td><button class='btn' onclick=\"engLink("+x.port+")\">"+TX("کپی vless")+"</button></td><td><button class='btn d' onclick=\"engDel("+x.port+")\">"+TX("حذف")+"</button></td></tr>").join(""):'<tr><td colspan="5" class="empty">'+TX("هیچ inboundی نیست")+"</td></tr>";
+   const bt=$("xr_t");if(bt)bt.textContent=x.on?TX("خاموش‌کردن"):TX("روشن‌کردن");
+   const bs=$("bh_st");if(bs)bs.innerHTML='<div class="acts"><span class="hint">'+(r.backhaul.installed?TX("Backhaul نصب است"):"نصب نیست")+"</span></div>";
+   const bb=$("bh_tb");if(bb)bb.innerHTML=r.backhaul.tunnels.length?r.backhaul.tunnels.map(t=>'<tr><td class="ltr">'+esc(t.id)+"</td><td><span class='pill "+(t.active?"up":"down")+"'>"+(t.active?TX("فعال"):TX("خاموش"))+"</span></td><td><button class='btn d' onclick=\"bhDel('"+t.id+"')\">"+TX("حذف")+"</button></td></tr>").join(""):'<tr><td colspan="3" class="empty">'+TX("تانلی نیست")+"</td></tr>"}catch(e){}};
+  window.engLink=async(port)=>{try{const r=await api("engines");const row=r.xray.rows.find(x=>x.port===port);if(!row)return;
+   const ip=window.LAST?window.LAST.host:"";
+   const link="vless://"+row.uuid+"@"+(r.xray.ip||"")+":"+port+"?security=reality&encryption=none&pbk="+row.pub+"&headerType=none&type=tcp&flow=xtls-rprx-vision&sni="+row.sni+"&sid="+row.sid+"&fp=chrome";
+   try{await navigator.clipboard.writeText(link)}catch(e){}
+   toast(TX("لینک vless کپی شد")+" — "+link.slice(0,60)+"…","s")}catch(e){toast(e.message,"e")}};
+  window.engDel=async(port)=>{if(!cf(TX("این inbound حذف شود؟")))return;try{await api("engines","POST",{engine:"xray",action:"del",port:port});engLoad()}catch(e){toast(e.message,"e")}};
+  window.bhDel=async(id)=>{if(!cf(TX("این تانل حذف شود؟")))return;try{await api("engines","POST",{engine:"backhaul",action:"del",id:id});engLoad()}catch(e){toast(e.message,"e")}};
+  const bt=$("xr_t");if(bt)bt.onclick=async()=>{try{const r=await api("engines");await api("engines","POST",{engine:"xray",action:r.xray.on?"off":"on"});engLoad()}catch(e){toast(e.message,"e")}};
+  const ba=$("xr_a");if(ba)ba.onclick=async()=>{try{await api("engines","POST",{engine:"xray",action:"add",port:+$("xr_p").value,sni:$("xr_s").value.trim()});
+   toast(TX("ساخته شد — نصب Xray ممکن است کمی طول بکشد"),"s");$("xr_p").value="";engLoad()}catch(e){toast(e.message,"e")}};
+ }catch(e){console.warn("engines",e)}};
+ if(document.readyState!=="loading")boot();else document.addEventListener("DOMContentLoaded",boot);
+})();
 /* ---------------- Xtreme layer: DNS tab + IP-Spoof toggle (v2.11) ---------------- */
 (function(){
  const boot=()=>{try{
@@ -4471,6 +4606,278 @@ dns_menu() {
   esac
 }
 
+
+# ------------------------------------------------------------- Xray engine ----
+# VLESS + Reality: Xray-core is installed and every inbound is a VLESS listener
+# with Reality TLS-camouflage (it borrows a real site's TLS handshake for the
+# SNI the user picks). Rows in xray.conf: port|sni|uuid|shortid|priv|pub
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_DIR="/etc/dr-cpanel/xray"
+XRAY_DB="$XRAY_DIR/inbounds.conf"
+XRAY_CFG="$XRAY_DIR/config.json"
+XRAY_UNIT="/etc/systemd/system/dr-cpanel-xray.service"
+
+xray_rows() { [[ -s $XRAY_DB ]] && grep -v "^$" "$XRAY_DB" || true; }
+
+xray_install() {   # fetch Xray-core and lay down the service skeleton
+  mkdir -p "$XRAY_DIR"; chmod 700 "$XRAY_DIR" 2>/dev/null
+  if [[ -x $XRAY_BIN ]]; then ok "Xray-core already installed ($($XRAY_BIN version | head -1))."; else
+    local tmp; tmp=$(mktemp -d) || return 1
+    info "Downloading Xray-core (latest, linux-64)..."
+    curl -fsSL --retry 2 --retry-delay 2 -o "$tmp/x.zip" \
+      "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" \
+      || { rm -rf "$tmp"; err "Download failed (is GitHub reachable?)"; return 1; }
+    python3 - "$tmp/x.zip" "$tmp" <<PY
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).extract("xray", sys.argv[2])
+PY
+    install -m 755 "$tmp/xray" "$XRAY_BIN" || { rm -rf "$tmp"; err "Install failed."; return 1; }
+    rm -rf "$tmp"; ok "Xray-core installed ($($XRAY_BIN version | head -1))."
+  fi
+  if [[ ! -s $XRAY_CFG ]]; then
+    echo '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}' > "$XRAY_CFG"
+    chmod 600 "$XRAY_CFG"
+  fi
+  cat > "$XRAY_UNIT" <<EOF
+[Unit]
+Description=DR-CPanel Xray engine (VLESS-Reality)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/xray run -c $XRAY_CFG
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1
+  if [[ -s $XRAY_DB ]]; then systemctl enable --now dr-cpanel-xray >/dev/null 2>&1; fi
+  return 0
+}
+
+xray_gen() {   # rebuild config.json from the inbound rows
+  python3 - "$XRAY_DB" "$XRAY_CFG" <<PY
+import json, sys
+rows = []
+try:
+    for l in open(sys.argv[1]):
+        p = l.rstrip("\n").split("|")
+        if len(p) == 6 and p[0].strip():
+            rows.append(dict(port=int(p[0]), sni=p[1], uuid=p[2], sid=p[3], priv=p[4], pub=p[5]))
+except FileNotFoundError: pass
+inb = []
+for r in rows:
+    inb.append({
+        "port": r["port"], "protocol": "vless",
+        "settings": {"clients": [{"id": r["uuid"], "flow": "xtls-rprx-vision"}], "decryption": "none"},
+        "streamSettings": {"network": "tcp", "security": "reality",
+            "realitySettings": {"show": False, "dest": r["sni"] + ":443", "xver": 0,
+                "serverNames": [r["sni"]], "privateKey": r["priv"], "shortIds": [r["sid"]]},
+            "tcpSettings": {"acceptProxyProtocol": False}}})
+cfg = {"log": {"loglevel": "warning"}, "inbounds": inb, "outbounds": [{"protocol": "freedom"}]}
+open(sys.argv[2], "w").write(json.dumps(cfg, indent=1))
+PY
+  chmod 600 "$XRAY_CFG" 2>/dev/null
+}
+
+xray_apply() { xray_gen && systemctl restart dr-cpanel-xray 2>/dev/null; systemctl is-active --quiet dr-cpanel-xray; }
+
+xray_add() {   # port sni : a new VLESS-Reality inbound
+  local port=$1 sni=$2
+  valid_port "$port" || { echo "error: invalid port" >&2; return 1; }
+  [[ $port == $(python3 "$WEB_PY" info 2>/dev/null | awk "{print \$1}") ]] && { echo "error: this port is the web panel port" >&2; return 1; }
+  [[ $sni =~ ^[A-Za-z0-9.-]+$ ]] || { echo "error: invalid SNI (use a real domain, e.g. www.datadoghq.com)" >&2; return 1; }
+  [[ -x $XRAY_BIN ]] || xray_install || return 1
+  awk -F"|" -v p="$port" "$1==p{f=1} END{exit !f}" "$XRAY_DB" 2>/dev/null && { echo "error: inbound $port exists" >&2; return 1; }
+  if ! systemctl is-active --quiet dr-cpanel-xray 2>/dev/null && [[ -s $XRAY_DB ]]; then :; fi
+  local uuid priv pub sid
+  uuid=$(cat /proc/sys/kernel/random/uuid)
+  local kout; kout=$("$XRAY_BIN" x25519 2>/dev/null) || { echo "error: xray x25519 failed" >&2; return 1; }
+  priv=$(grep -i "private" <<< "$kout" | awk "{print \$NF}")
+  pub=$(grep -i "public" <<< "$kout" | awk "{print \$NF}")
+  sid=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d " \n")
+  mkdir -p "$XRAY_DIR"; chmod 700 "$XRAY_DIR" 2>/dev/null
+  ( umask 077; echo "$port|$sni|$uuid|$sid|$priv|$pub" >> "$XRAY_DB" )
+  xray_apply && ok "Inbound :$port ready - UUID $uuid (SNI $sni)" || err "Service did not come up: journalctl -u dr-cpanel-xray -n 10"
+}
+
+xray_del() {   # port
+  sed -i "/^$1|/d" "$XRAY_DB" 2>/dev/null
+  xray_apply && ok "Inbound removed."
+}
+
+xray_onoff() {   # on|off
+  [[ -x $XRAY_BIN ]] || xray_install || return 1
+  if [[ $1 == on ]]; then systemctl enable --now dr-cpanel-xray >/dev/null 2>&1 && ok "Xray engine ON.";
+  else systemctl disable --now dr-cpanel-xray >/dev/null 2>&1 && ok "Xray engine OFF."; fi
+}
+
+xray_status() {
+  [[ -x $XRAY_BIN ]] || { info "Xray-core not installed yet (menu: add the first inbound)."; return 0; }
+  info "Xray: $($XRAY_BIN version | head -1) · service: $(systemctl is-active dr-cpanel-xray 2>/dev/null)"
+  local n=0 port sni uuid sid pub
+  if [[ -s $XRAY_DB ]]; then
+    printf "  ${C_BLD}%-3s %-8s %-26s %s${C_RST}\n" "#" "PORT" "SNI" "UUID"
+    while IFS="|" read -r port sni uuid sid priv pub; do
+      n=$((n + 1)); printf "  %-3s %-8s %-26s %s\n" "$n" "$port" "$sni" "$uuid"
+    done < "$XRAY_DB"
+  fi
+  (( n == 0 )) && info "No inbounds yet."
+}
+
+xray_menu() {
+  local c port sni
+  banner; echo "  ${C_BLD}Xray engine (VLESS + Reality)${C_RST}"; echo
+  xray_status
+  echo
+  echo "   1) Install / update Xray-core"
+   echo "   2) Add an inbound        (port + real SNI)"
+   echo "   3) Remove an inbound"
+   echo "   4) Engine ON / OFF"
+   echo "   5) Show a client config  (vless:// link)"
+   echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) xray_install;;
+    2) read -rp "  Listen port: " port; read -rp "  Reality SNI (real domain, e.g. www.datadoghq.com): " sni
+       xray_add "${port:-}" "${sni:-}" && info "Users connect to this server: port $port, Reality SNI $sni.";;
+    3) read -rp "  Inbound port to remove: " port; xray_del "$port";;
+    4) read -rp "  on/off [on]: " x; xray_onoff "${x:-on}";;
+    5) xray_client_link;;
+  esac
+}
+
+xray_client_link() {
+  local port sni uuid sid pub
+  [[ -s $XRAY_DB ]] || { info "No inbounds yet."; return 0; }
+  while IFS="|" read -r port sni uuid sid priv pub; do
+    echo "  ${C_GRN}vless://$uuid@$(web_pubip 2>/dev/null):$port?security=reality&encryption=none&pbk=$pub&headerType=none&type=tcp&flow=xtls-rprx-vision&sni=$sni&sid=$sid&fp=chrome${C_RST}"
+  done < "$XRAY_DB"
+}
+
+# ---------------------------------------------------------- Backhaul engine ----
+# Backhaul (Musixal/Backhaul): a reverse-tunnel engine - the SERVER runs on the
+# kharej and the CLIENT runs on Iran, exposing Iran's forwarded ports on the
+# clean kharej IP. The manager installs the binary, writes a commented TOML
+# template per tunnel and runs it as its own systemd service.
+BH_BIN="/usr/local/bin/backhaul"
+BH_DIR="/etc/dr-cpanel/backhaul"
+BH_UNIT_DIR="/etc/systemd/system"
+
+backhaul_install() {
+  [[ -x $BH_BIN ]] && { ok "Backhaul already installed."; return 0; }
+  local tmp; tmp=$(mktemp -d) || return 1
+  info "Downloading Backhaul (latest, linux-amd64)..."
+  curl -fsSL --retry 2 --retry-delay 2 -o "$tmp/bh.tgz" \
+    "https://github.com/Musixal/Backhaul/releases/latest/download/backhaul_linux_amd64.tar.gz" \
+    || { rm -rf "$tmp"; err "Download failed (check the releases page for the asset name)."; return 1; }
+  tar xzf "$tmp/bh.tgz" -C "$tmp" backhaul 2>/dev/null || tar xzf "$tmp/bh.tgz" -C "$tmp"
+  [[ -f $tmp/backhaul ]] || { rm -rf "$tmp"; err "binary not found in the archive"; return 1; }
+  install -m 755 "$(ls "$tmp"/*linux-amd64* "$tmp"/backhaul 2>/dev/null | head -1)" "$BH_BIN" \
+    || { rm -rf "$tmp"; err "Install failed."; return 1; }
+  rm -rf "$tmp"; ok "Backhaul installed."
+}
+
+backhaul_conf() {   # id transport port token : write the commented TOML template
+  local id=$1 tr=$2 port=$3 tok=$4
+  mkdir -p "$BH_DIR"; chmod 700 "$BH_DIR" 2>/dev/null
+  cat > "$BH_DIR/$id-client.toml" <<EOF
+# Backhaul CLIENT (run this side, Iran). It connects OUT to the kharej server
+# and publishes your forwarded ports there. Edit the [client.services] table
+# to expose more local ports, then: systemctl restart dr-bh-$id
+[client]
+server = "KHAREJ_IP:$port"
+token = "$tok"
+transport = "$tr"
+connection_pool = 8
+
+# Example - expose this server's port 443 on the kharej:
+# [[client.services]]
+# local_port = 443
+# bind_mode = "0.0.0.0"
+# remote_port = 443
+EOF
+  cat > "$BH_DIR/$id-server.toml" <<EOF
+# Backhaul SERVER (copy this file to the KHAREJ server and run:
+#   backhaul -c $id-server.toml   (or install it as a service there)
+[server]
+bind = "0.0.0.0:$port"
+token = "$tok"
+transport = "$tr"
+connection_pool = 8
+EOF
+  chmod 600 "$BH_DIR/$id-client.toml" "$BH_DIR/$id-server.toml"
+}
+
+backhaul_add() {   # id transport port token kharej_ip : client service on Iran
+  local id=$1 tr=$2 port=$3 tok=$4 fip=$5
+  [[ $tr =~ ^(tcp|udp|ws|wss|tcp-mux|tcp-mux-websocket)$ ]] || { echo "error: transport tcp|udp|ws|wss|tcp-mux|tcp-mux-websocket" >&2; return 1; }
+  valid_port "$port" || { echo "error: invalid port" >&2; return 1; }
+  valid_ip "$fip" || { echo "error: invalid kharej IP" >&2; return 1; }
+  [[ ${#tok} -ge 8 ]] || tok=$(tun_token)
+  [[ -x $BH_BIN ]] || backhaul_install || return 1
+  sed -i "s/KHAREJ_IP:$port/$fip:$port/" "$BH_DIR/$id-client.toml" 2>/dev/null
+  sed -i "s/server = .*/server = \"$fip:$port\"/" "$BH_DIR/$id-client.toml"
+  cat > "$BH_UNIT_DIR/dr-bh-$id.service" <<EOF
+[Unit]
+Description=DR-CPanel Backhaul client #$id ($tr)
+After=network-online.target
+
+[Service]
+ExecStart=$BH_BIN -c $BH_DIR/$id-client.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now "dr-bh-$id" >/dev/null 2>&1
+  systemctl is-active --quiet "dr-bh-$id" && ok "Backhaul client #$id running ($tr to $fip:$port)." \
+    || warn "Service started with errors - check the config: $BH_DIR/$id-client.toml"
+  info "Kharej side: copy $BH_DIR/$id-server.toml there and run: backhaul -c $id-server.toml"
+}
+
+backhaul_del() {
+  systemctl disable --now "dr-bh-$1" >/dev/null 2>&1
+  rm -f "$BH_UNIT_DIR/dr-bh-$1.service" "$BH_DIR/$1-client.toml" "$BH_DIR/$1-server.toml"
+  systemctl daemon-reload >/dev/null 2>&1; ok "Removed."
+}
+
+backhaul_status() {
+  [[ -x $BH_BIN ]] || { info "Backhaul not installed yet."; return 0; }
+  info "Backhaul: $($BH_BIN --help 2>/dev/null | head -1)"
+  local u
+  for u in $BH_UNIT_DIR/dr-bh-*.service; do
+    [[ -e $u ]] || continue
+    local id; id=$(basename "$u" .service); id=${id#dr-bh-}
+    info "$id: $(systemctl is-active "dr-bh-$id" 2>/dev/null)"
+  done
+}
+
+backhaul_menu() {
+  local c id tr port tok fip
+  banner; echo "  ${C_BLD}Backhaul engine (reverse tunnels)${C_RST}"; echo
+  backhaul_status
+  echo
+  echo "   1) Install Backhaul binary"
+   echo "   2) Add a Backhaul tunnel  (client here, server on kharej)"
+   echo "   3) Remove a tunnel"
+   echo "   4) Show a server config  (to copy to the kharej)"
+   echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) backhaul_install;;
+    2) read -rp "  Kharej IP: " fip; read -rp "  Transport [tcp]: " tr; tr=${tr:-tcp}
+       read -rp "  Tunnel port on kharej: " port; read -rp "  Token [random]: " tok
+       id=$(ls "$BH_DIR"/*.client.toml 2>/dev/null | wc -l); id=$((id + 1))
+       backhaul_conf "$id" "$tr" "$port" "${tok:-}" && backhaul_add "$id" "$tr" "$port" "${tok:-}" "$fip";;
+    3) read -rp "  Tunnel id to remove: " id; backhaul_del "$id";;
+    4) read -rp "  Tunnel id: " id; cat "$BH_DIR/$id-server.toml" 2>/dev/null || info "not found";;
+  esac
+}
 
 # ---------------------------------------------------------- operations ----
 
@@ -5567,6 +5974,22 @@ gre_actions() {   # per-GRE-tunnel management
   done
 }
 
+engines_menu() {
+  local c
+  while true; do
+    banner; echo "  ${C_BLD}Engines${C_RST}"; echo
+    echo "   1) Xray                 VLESS + Reality inbounds"
+    echo "   2) Backhaul             reverse-tunnel engine"
+    echo "   0) Back"; echo
+    read -rp "  Select: " c || return 0; echo
+    case $c in
+      1) xray_menu;;
+      2) backhaul_menu;;
+      0) return 0;;
+    esac
+  done
+}
+
 manage_menu() {   # BackPack: "tunnels, status, health, tests"
   local c
   while true; do
@@ -5577,6 +6000,7 @@ manage_menu() {   # BackPack: "tunnels, status, health, tests"
     echo "   4) Reverse Forwards     ports on kharej that reach services on Iran"
     echo "   5) Status               full status"
     echo "   6) Tunnel Security      IP allow-list, connection and rate limits"
+    echo "   7) Engines              Xray (VLESS-Reality) and Backhaul"
     echo "   0) Back"; echo
     read -rp "  Select: " c || return 0; echo
     case $c in
@@ -5586,6 +6010,7 @@ manage_menu() {   # BackPack: "tunnels, status, health, tests"
       4) reverse_menu;;
       5) status; pause;;
       6) security_menu; pause;;
+      7) engines_menu; pause;;
       0) return 0;;
     esac
   done
@@ -5743,6 +6168,23 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     ctest-close) ctest_close;;
     ctest-daemon) shift; ctest_daemon "$@";;
     web-reload) web_write_files; dns_apply >/dev/null 2>&1 || true; systemctl restart dr-cpanel-web 2>/dev/null; ok "Web panel files regenerated from v$VERSION.";;
+    xray) shift; case "${1:-}" in
+         install) xray_install;;
+         add) shift; xray_add "${1:-}" "${2:-}";;
+         del) shift; xray_del "${1:-}";;
+         on) xray_onoff on;; off) xray_onoff off;;
+         list|status) xray_status;;
+         link) xray_client_link;;
+         *) xray_menu;;
+       esac;;
+    backhaul) shift; case "${1:-}" in
+         install) backhaul_install;;
+         add) shift; backhaul_conf "${1:-}" "${2:-}" "${3:-}" "${4:-}" && backhaul_add "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
+         del) shift; backhaul_del "${1:-}";;
+         status) backhaul_status;;
+         server) shift; cat "$BH_DIR/${1:-}-server.toml" 2>/dev/null || info "not found";;
+         *) backhaul_menu;;
+       esac;;
     dns) shift; case "${1:-}" in
          on) dns_onoff on;; off) dns_onoff off;;
          add) shift; dns_ovr_add "${1:-}" "${2:-}";;
@@ -5759,6 +6201,6 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     rollback) do_rollback;;
     update) bash <(curl -fsSL https://raw.githubusercontent.com/behymin12345-hash/DR-CPanel/main/install.sh);;
     "")    main_menu;;
-    *)     echo "Usage: $0 [apply|list|update|rollback|package|perf NAME|audit|conntest|tunnel|reverse|join LINK|kharej|doctor]"; exit 1;;
+    *)     echo "Usage: $0 [apply|list|update|rollback|package|perf NAME|audit|conntest|tunnel|reverse|join LINK|kharej|doctor|xray|backhaul|dns]"; exit 1;;
   esac
 fi
