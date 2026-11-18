@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.10.0: native GRE tunnels - a new L3 tunnel family alongside WireGuard, built on the kernel's ip_gre/fou: two modes (raw GRE over IP protocol 47, or GRE over UDP via FOU for UDP-only paths), reverse tunnels with the same one-line join link flow (GRE links are static, so the Iran-side link is built the moment the kharej fetches its join link) and direct tunnels, per-tunnel presets, auto-MTU probe over the GRE path, MSS clamping, a GRE tunnel watchdog that rebuilds dead links, its own Manage > GRE Tunnels menu with the full per-tunnel action set, CLI 'dr-cpanel tunnel gre ...', web panel wizard types GRE reverse/direct with a GRE/FOU mode picker, merged tunnel table with GRE rows and a FOU/GRE mode switch, /join/<token> and link/script endpoints serving GRE tunnels, gretunnels.conf included in backups/restore and uninstall cleanup, doctor now checks GRE kernel support; WARNING: GRE is a plain L3 tunnel - fast but NOT encrypted, WireGuard transports stay the choice for sensitive traffic; v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.11.0: Hashem-grade features, natively - (1) IP-Spoof: a spoofed-source pipe for GRE tunnels; the OUTER packets on the wire carry random-looking fake IPs instead of the real server IPs (each side sources its tunnel from its own fake IP and matches the peer's fake IP on a dedicated RX link - kernel double-link construction, works on plain public VPSs wherever the path does not enforce strict uRPF), per-tunnel toggle in the panel table and the CLI ('tunnel gre spoof ID on|off') and baked into the kharej join/foreign scripts; (2) DNS-Spoof: a built-in DNS resolver service (dr-cpanel-dns, UDP :53) with an override table (domain -> IP, or domain -> block, wildcards ok) and clean public-resolver forwarding for everything else - clients pointed at the server bypass DNS hijacking; managed from a new panel DNS tab, the API (/api/dns) and 'dr-cpanel dns on|off|add|del|list|status|menu'; (3) the Link Test now covers GRE rows (direct vs tunnel probes + preset recommendation) and the tunnel table shows the spoof state; (4) an Xtreme UI layer: animated mesh grid + twinkling stars background, gradient headline text, glass cards with a light sweep + hover lift, glowing active nav, springy buttons, pulsing online pills, row-hover glow and a custom scrollbar; v2.10.0: native GRE tunnels - a new L3 tunnel family alongside WireGuard, built on the kernel's ip_gre/fou: two modes (raw GRE over IP protocol 47, or GRE over UDP via FOU for UDP-only paths), reverse tunnels with the same one-line join link flow (GRE links are static, so the Iran-side link is built the moment the kharej fetches its join link) and direct tunnels, per-tunnel presets, auto-MTU probe over the GRE path, MSS clamping, a GRE tunnel watchdog that rebuilds dead links, its own Manage > GRE Tunnels menu with the full per-tunnel action set, CLI 'dr-cpanel tunnel gre ...', web panel wizard types GRE reverse/direct with a GRE/FOU mode picker, merged tunnel table with GRE rows and a FOU/GRE mode switch, /join/<token> and link/script endpoints serving GRE tunnels, gretunnels.conf included in backups/restore and uninstall cleanup, doctor now checks GRE kernel support; WARNING: GRE is a plain L3 tunnel - fast but NOT encrypted, WireGuard transports stay the choice for sensitive traffic; v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="2.10.0"
+VERSION="2.11.0"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
 TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active|preset|type|join_token|name|token_expiry|transport|carrier_port
@@ -568,6 +568,7 @@ gre_up() {   # id : (re)create drgre<id> on THIS side; rev tunnels need a resolv
   gre_need_kmod || return 1
   local src; src=$(gre_src_ip "$fip"); [[ -n $src ]] || { echo "error: no source address for $fip" >&2; return 1; }
   ip link del "drgre$id" 2>/dev/null || true
+  ip link del "drgre$id.r" 2>/dev/null || true
   # FOU is symmetric UDP: BOTH sides register a fou port and BOTH links carry the
   # encap. The row's $port belongs to the LISTENING side; the dialing side uses
   # the derived port $port+1, so each peer sends to the other one's port.
@@ -581,14 +582,33 @@ gre_up() {   # id : (re)create drgre<id> on THIS side; rev tunnels need a resolv
       encap="encap fou encap-sport auto encap-dport $port encap-csum"
     fi
   fi
-  ip link add "drgre$id" type gre local "$src" remote "$fip" key "$key" $encap \
+  # IP spoof: the TX link sources from our fake IP, the RX link matches the peer's fake IP
+  local sp txsrc="$src" F1="" F2=""
+  sp=$(spoof_row "gre$id")
+  if [[ -n $sp ]]; then
+    F1=$(cut -d'|' -f2 <<< "$sp"); F2=$(cut -d'|' -f3 <<< "$sp")
+    ip addr add "$F1/32" dev lo 2>/dev/null || true
+    txsrc="$F1"
+  fi
+  ip link add "drgre$id" type gre local "$txsrc" remote "$fip" key "$key" $encap \
     || { echo "error: could not create the GRE link (mode $mode)" >&2; return 1; }
   (( mtu >= 1200 && mtu <= 1500 )) || mtu=1380
   ip link set dev "drgre$id" mtu "$mtu"
   ip addr add "10.67.$id.1/30" dev "drgre$id" 2>/dev/null || true
   ip link set dev "drgre$id" up
+  if [[ -n $F2 ]]; then   # RX-only link that matches the peer's spoofed source
+    ip link add "drgre$id.r" type gre local "$src" remote "$F2" key "$key" \
+      || { echo "error: could not create the spoof RX link" >&2; return 1; }
+    ip link set dev "drgre$id.r" up
+  fi
   iptables -I INPUT -p gre -m comment --comment "drc-gre$id" -j ACCEPT 2>/dev/null || true
   sysctl -q -w "net.ipv4.conf.drgre$id.route_localnet=1" >/dev/null 2>&1 || true
+  if [[ -n $F2 ]]; then   # spoof: uRPF (strict and loose) drops fake-source packets
+    sysctl -q -w "net.ipv4.conf.all.rp_filter=0" >/dev/null 2>&1 || true
+    sysctl -q -w "net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
+  else
+    sysctl -q -w "net.ipv4.conf.drgre$id.rp_filter=2" >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
@@ -597,6 +617,9 @@ gre_down() {   # id : remove the interface, the FOU port and the firewall rules 
   IFS='|' read -r id fip port mode _ <<< "$r"
   mode=${mode:-gre}; [[ $mode == fou ]] || port=0
   ip link del "drgre$id" 2>/dev/null || true
+  ip link del "drgre$id.r" 2>/dev/null || true
+  local sf; sf=$(spoof_row "gre$id")
+  [[ -n $sf ]] && ip addr del "$(cut -d'|' -f2 <<< "$sf")/32" dev lo 2>/dev/null || true
   [[ $mode == fou && $port != 0 ]] && { gre_fou_port_del "$port"; gre_fou_port_del "$((port + 1))"; }
   local n=0
   while iptables -D INPUT -p gre -m comment --comment "drc-gre$id" -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done
@@ -802,6 +825,8 @@ iptables -I INPUT -p udp --dport $((port + 1)) -m comment --comment drc-gre-fou 
   else
     khlisten="# raw GRE: no UDP ports involved"
   fi
+  local KH_SPOOF
+  KH_SPOOF=$(gre_spoof_block "$id" "$myip")
   cat <<EOS
 # DR-CPanel GRE tunnel: kharej side (mode: $mode, tunnel #$id). Run once, as root.
 set -e
@@ -810,8 +835,10 @@ command -v ip >/dev/null 2>&1 || { echo "iproute2 is required"; exit 1; }
 sysctl -q -w net.ipv4.ip_forward=1 || true
 modprobe ip_gre 2>/dev/null || true; modprobe fou 2>/dev/null; modprobe ip_fou 2>/dev/null || true
 ${khlisten}
+${KH_SPOOF}
 ip link del drgre$id 2>/dev/null || true
-ip link add drgre$id type gre local \$(ip -4 route get $myip 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src"){print \$(i+1); exit}}') remote $myip key $key $khencap
+ip link del drgre$id.r 2>/dev/null || true
+ip link add drgre$id type gre local \${KH_LSRC} remote $myip key $key $khencap
 ip link set dev drgre$id mtu $mtu
 ip addr add 10.67.$id.2/30 dev drgre$id 2>/dev/null || true
 ip link set dev drgre$id up
@@ -879,6 +906,8 @@ iptables -I INPUT -p udp --dport $((port + 1)) -m comment --comment drc-gre-fou 
   else
     khlisten="# raw GRE: no UDP ports involved"
   fi
+  local KH_SPOOF
+  KH_SPOOF=$(gre_spoof_block "$id" "$ephost")
   cat <<EOS
 #!/usr/bin/env bash
 # DR-CPanel GRE join script (tunnel #$id${name:+ "$name"}, type: $ty, mode: $mode). Run once, as root, on the KHAREJ server.
@@ -888,8 +917,10 @@ command -v ip >/dev/null 2>&1 || { echo "iproute2 is required"; exit 1; }
 sysctl -q -w net.ipv4.ip_forward=1 || true
 modprobe ip_gre 2>/dev/null || true; modprobe fou 2>/dev/null; modprobe ip_fou 2>/dev/null || true
 ${khlisten}
+${KH_SPOOF}
 ip link del drgre$id 2>/dev/null || true
-ip link add drgre$id type gre local \$(ip -4 route get $ephost 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src"){print \$(i+1); exit}}') remote $ephost key $key $khencap
+ip link del drgre$id.r 2>/dev/null || true
+ip link add drgre$id type gre local \${KH_LSRC} remote $ephost key $key $khencap
 ip link set dev drgre$id mtu $mtu
 ip addr add 10.67.$id.2/30 dev drgre$id 2>/dev/null || true
 ip link set dev drgre$id up
@@ -936,6 +967,69 @@ gre_preset() {   # ip-or-id [preset] : read or set the per-tunnel preset ("none"
   awk -F'|' -v OFS='|' -v i="$id" -v v="$2" '$1==i{$8=v}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
   [[ $(cut -d'|' -f7 <<< "$r") == 1 ]] && perf_apply "$2" >/dev/null 2>&1 || true
   echo "$2"
+}
+
+# ------------------------------------------------------------- IP spoof ----
+gre_spoof_block() {   # id endpoint : print the kharej-side spoof block (or the plain KH_LSRC line)
+  local id=$1 ep=$2 sp khF1 khF2 key
+  sp=$(spoof_row "gre$id")
+  key=$(cut -d'|' -f5 <<< "$(gre_row "$id")")
+  if [[ -z $sp ]]; then
+    echo "KH_LSRC=\$(ip -4 route get $ep 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src"){print \$(i+1); exit}}')"
+    return 0
+  fi
+  khF1=$(cut -d'|' -f2 <<< "$sp"); khF2=$(cut -d'|' -f3 <<< "$sp")
+  cat <<BLOCK
+KH_LSRC="$khF2"
+ip addr add $khF2/32 dev lo 2>/dev/null || true   # spoof: this side's fake source
+ip link add drgre$id.r type gre local \$(ip -4 route get $ep 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src"){print \$(i+1); exit}}') remote $khF1 key $key 2>/dev/null || true
+ip link set dev drgre$id.r up
+sysctl -q -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+sysctl -q -w net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
+echo "Spoof pipe: this side sources from $khF2, matches the peer $khF1"
+BLOCK
+}
+
+# Spoofed-source pipe for GRE tunnels (Hashem's signature trick, done natively):
+# the OUTER packets on the wire carry a random-looking source instead of the
+# real server IPs, so DPI / source-based throttling cannot correlate the tunnel
+# with either server. Kernel construction (per tunnel, both sides):
+#   TX link  drgre<id>   local=<my fake IP> remote=<peer REAL IP>   (dst real =>
+#              routable anywhere; src fake => DPI sees a stranger)
+#   RX link  drgre<id>.r local=<my real IP> remote=<peer fake IP>   (matches the
+#              peer's spoofed packets; carries no address, RX-only)
+# Each side adds its own fake IP to loopback as a usable source. Rows in
+# spoof.conf: gre<id>|fakeA (this side) |fakeB (peer side). NOTE: works only
+# while no provider on the path enforces strict uRPF on the fake sources.
+SPOOF="$CONF_DIR/spoof.conf"
+
+spoof_row()   { [[ -s $SPOOF ]] && awk -F'|' -v k="$1" '$1==k{print;exit}' "$SPOOF"; }   # k = gre<id>
+spoof_fake() {   # deterministic realistic-looking fake IP from a seed
+  local seed; seed=$(cksum <<< "$1" | cut -d' ' -f1)
+  local firsts=(45 5 91 103 185 141 188 194)
+  echo "${firsts[$((seed % 8))]}.$(( (seed >> 3) % 200 + 20 )).$(( (seed >> 7) % 250 + 2 )).$(( (seed >> 11) % 250 + 2 ))"
+}
+
+gre_spoof() {   # id on|off : toggle the spoofed-source pipe and rebuild the links
+  local id=$1 st=$2 r fip oldF1
+  r=$(gre_row "$id"); [[ -n $r ]] || { echo "error: no GRE tunnel for $id" >&2; return 1; }
+  fip=$(cut -d'|' -f2 <<< "$r")
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null
+  oldF1=$(cut -d'|' -f2 <<< "$(spoof_row "gre$id")" 2>/dev/null)
+  if [[ $st == on ]]; then
+    local F1 F2
+    F1=$(spoof_fake "iran-gre$id-$(cut -d'|' -f5 <<< "$r")")
+    F2=$(spoof_fake "kharej-gre$id-$(cut -d'|' -f5 <<< "$r")")
+    sed -i "/^gre$id|/d" "$SPOOF" 2>/dev/null
+    ( umask 077; echo "gre$id|$F1|$F2" >> "$SPOOF" )
+    [[ $fip != pending ]] && { gre_up "$id" || return 1; }   # pending tunnels build the links at join time
+    echo "$F1 $F2"
+  else
+    sed -i "/^gre$id|/d" "$SPOOF" 2>/dev/null
+    [[ -n $oldF1 ]] && ip addr del "$oldF1/32" dev lo 2>/dev/null || true
+    gre_up "$id"
+    echo "off"
+  fi
 }
 
 # ------------------------------------------------------ reverse forwards ----
@@ -1370,7 +1464,8 @@ tunnel_cli() {
                del)         gre_del "${2:-}";;
                sync)        gre_sync;;
                watch)       gre_watch;;
-               *) echo "Usage: $0 tunnel gre add IP [FOU_PORT] [gre|fou] [key] [mtu] [preset] [name] | join-open [FOU_PORT] [gre|fou] [preset] [name] | link IP-or-ID | script IP | script-join TOKEN HOST CLIENT_IP | use IP | direct IP | mode IP [gre|fou] [port] | mtu IP | preset IP [name] | del IP | sync"; return 1;;
+               spoof)       shift; gre_spoof "${1:-}" "${2:-on}";;
+               *) echo "Usage: $0 tunnel gre add IP [FOU_PORT] [gre|fou] [key] [mtu] [preset] [name] | join-open [FOU_PORT] [gre|fou] [preset] [name] | link IP-or-ID | script IP | script-join TOKEN HOST CLIENT_IP | use IP | direct IP | mode IP [gre|fou] [port] | mtu IP | preset IP [name] | spoof ID [on|off] | del IP | sync"; return 1;;
              esac;;
     repair)  repair_wg;;
     *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] [preset] [fwd|dir] [name] [transport] | join-open [UDP_PORT] [preset] [name] [transport] | link IP-or-ID | script IP | script-join TOKEN HOST CLIENT_IP | transport IP [udp|tcp|ws|wss|kcp|quic] [carrier_port] | use IP | direct IP | mtu IP | mtuprobe IP | preset IP [name] | reverse add|del|list|test ... | sync | repair"; return 1;;
@@ -1745,11 +1840,20 @@ def tunnels():
     except (FileNotFoundError, ValueError): pass
     return out
 
-GREF = D + "/gretunnels.conf"
+GREF = D + "/gretunnels.conf"; SPFF = D + "/spoof.conf"
+
+def spoof_ids():
+    out = set()
+    try:
+        for l in open(SPFF):
+            p = l.rstrip("\n").split("|")
+            if p and p[0]: out.add(p[0])
+    except FileNotFoundError: pass
+    return out
 
 def gretunnels():
     # rows: id|foreign_ip|port|mode|key|mtu|active|preset|type|join_token|name
-    out = {}
+    out = {}; ids = spoof_ids()
     try:
         for l in open(GREF):
             p = l.rstrip("\n").split("|")
@@ -1761,7 +1865,7 @@ def gretunnels():
                 out[key] = dict(id=int(p[0]), ip=("pending" if pend else p[1]), port=int(p[2] or 0), mtu=int(p[5] or 0), active=p[6] == "1",
                                 preset=(p[7] if len(p) > 7 and p[7] in ("balanced", "turbo", "throughput", "gaming") else ""),
                                 type=ty, pending=pend, name=(p[10] if len(p) > 10 else ""), has_link=bool(len(p) > 9 and p[9]),
-                                engine="gre", mode=mode, tr=mode, cport=0)
+                                engine="gre", mode=mode, tr=mode, cport=0, spoof=("gre%s" % p[0]) in ids)
     except (FileNotFoundError, ValueError): pass
     return out
 
@@ -2803,6 +2907,19 @@ class H(BaseHTTPRequestHandler):
             m = re.search(r"lport=(\d+)", self.path); k = m.group(1) if m else ""
             if k not in {str(r["lport"]) for r in read_rules()}: return self.out(404, {"error": "No such rule"})
             t = jload(SUBF).get(k, ""); return self.out(200, {"token": t, "path": "/sub/" + t if t else ""})
+        if p == "/api/dns":
+            dnspy = "/usr/local/lib/dr-cpanel/dns.py"; rows = []
+            try:
+                for l in open(D + "/dns.conf"):
+                    q = l.rstrip("\n").split("|")
+                    if len(q) == 2 and q[0].strip(): rows.append(dict(d=q[0].strip(), v=q[1].strip()))
+            except FileNotFoundError: pass
+            port, on = 53, False
+            try:
+                out = subprocess.run(["python3", dnspy, "info"], capture_output=True, text=True, timeout=10).stdout.split()
+                port, on = int(out[0]), out[1] == "on"
+            except Exception: pass
+            return self.out(200, {"port": port, "on": on, "rows": rows})
         if p == "/api/settings":
             c = cfg(); return self.out(200, {"domain": c.get("domain", ""), "tg_chat": c.get("tg_chat", ""), "tg_api": c.get("tg_api", ""), "has_token": bool(c.get("tg_token")), "port": c.get("port"), "tls": c.get("tls"), "totp": bool(c.get("totp")), "bot": bool(c.get("tg_bot", True)), "report": bool(c.get("tg_report", True)), "backup": bool(c.get("tg_backup", True)), "rhour": c.get("tg_report_hour", 12), "bhour": c.get("tg_backup_hour", 3)})
         if p == "/api/backup":
@@ -2949,9 +3066,12 @@ class H(BaseHTTPRequestHandler):
                 try: ip = str(ipaddress.IPv4Address(str(d.get("ip", "")).strip()))
                 except Exception: raise ValueError("Invalid IP")
                 rowg = tun_by(ip)
-                if rowg and rowg.get("engine") == "gre":   # GRE rows: use/direct/del/preset go to the GRE engine
+                if rowg and rowg.get("engine") == "gre":   # GRE rows: use/direct/del/preset/spoof go to the GRE engine
                     with LOCK:
-                        if a == "use": tun_cmd("gre", "use", ip, t=180)
+                        if a == "spoof":
+                            on = "on" if (d.get("on") in (True, 1, "1", "on")) else "off"
+                            tun_cmd("gre", "spoof", ip, on, t=180)
+                        elif a == "use": tun_cmd("gre", "use", ip, t=180)
                         elif a == "direct": tun_cmd("gre", "direct", ip, t=60)
                         elif a == "del": tun_cmd("gre", "del", ip, t=60)
                         elif a == "preset":
@@ -3042,6 +3162,32 @@ class H(BaseHTTPRequestHandler):
                 if a == "close":
                     subprocess.run([BIN, "ctest-close"], capture_output=True, text=True, timeout=30)
                     log("info", "Two-server test closed"); return self.out(200, {"ok": True})
+                raise ValueError("Bad action")
+            if self.path == "/api/dns":
+                act = d.get("action")
+                if act == "add":
+                    dom = re.sub(r"[^A-Za-z0-9.*-]", "", str(d.get("domain", ""))).strip().lstrip(".")
+                    val = str(d.get("value", "")).strip()
+                    if not dom: raise ValueError("Invalid domain")
+                    if val != "block":
+                        try: ipaddress.IPv4Address(val)
+                        except Exception:
+                            try: ipaddress.IPv6Address(val)
+                            except Exception: raise ValueError("Invalid IP")
+                    r = subprocess.run([BIN, "dns", "add", dom, val], capture_output=True, text=True, timeout=30)
+                    if r.returncode: raise ValueError((r.stderr or r.stdout).strip()[-150:] or "Failed")
+                    log("info", "DNS override %s -> %s" % (dom, val)); audit("dns_add", dom, self.client_address[0])
+                    return self.out(200, {"ok": True})
+                if act == "del":
+                    dom = re.sub(r"[^A-Za-z0-9.*-]", "", str(d.get("domain", ""))).strip().lstrip(".")
+                    subprocess.run([BIN, "dns", "del", dom], capture_output=True, text=True, timeout=30)
+                    log("info", "DNS override removed %s" % dom); audit("dns_del", dom, self.client_address[0])
+                    return self.out(200, {"ok": True})
+                if act in ("on", "off"):
+                    r = subprocess.run([BIN, "dns", act], capture_output=True, text=True, timeout=60)
+                    if r.returncode: raise ValueError((r.stderr or r.stdout).strip()[-150:] or "Failed")
+                    log("info", "DNS resolver turned %s" % act); audit("dns_" + act, "", self.client_address[0])
+                    return self.out(200, {"ok": True})
                 raise ValueError("Bad action")
             if self.path == "/api/totp":
                 c = cfg(); a = d.get("action"); ip = self.client_address[0]
@@ -3395,6 +3541,58 @@ html[dir=ltr] th,html[dir=ltr] td{text-align:left}
 html[dir=ltr] .ltr{text-align:left}
 html[dir=ltr] #login .go .ic{transform:none}
 html[dir=ltr] #login .go:hover .ic{transform:translateX(5px)}
+</style><style id="xt">
+/* ---------- DR-CPanel Xtreme UI layer (v2.11) ---------- */
+body{background:
+ radial-gradient(1200px 800px at 85% -10%,rgba(139,92,246,.20),transparent 60%),
+ radial-gradient(900px 700px at -10% 110%,rgba(236,72,153,.14),transparent 55%),
+ radial-gradient(700px 500px at 50% 50%,rgba(56,189,248,.07),transparent 60%),
+ linear-gradient(160deg,#07060f,#0b0918 55%,#07060f)}
+body::before{content:"";position:fixed;inset:-20%;z-index:0;pointer-events:none;
+ background:linear-gradient(rgba(139,92,246,.045) 1px,transparent 1px),
+ linear-gradient(90deg,rgba(139,92,246,.045) 1px,transparent 1px);
+ background-size:44px 44px;animation:xtgrid 26s linear infinite;
+ -webkit-mask-image:radial-gradient(ellipse at 50% 40%,#000 25%,transparent 72%);
+ mask-image:radial-gradient(ellipse at 50% 40%,#000 25%,transparent 72%)}
+@keyframes xtgrid{to{transform:translate3d(44px,44px,0)}}
+body::after{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.75;
+ background:radial-gradient(2px 2px at 18% 28%,#ffffff22,transparent 55%),
+ radial-gradient(1.6px 1.6px at 72% 18%,#ffffff1a,transparent 55%),
+ radial-gradient(1.6px 1.6px at 45% 58%,#c7d2fe44,transparent 55%),
+ radial-gradient(1.2px 1.2px at 86% 42%,#ffffff18,transparent 55%),
+ radial-gradient(1.2px 1.2px at 8% 70%,#f0abfc22,transparent 55%);
+ animation:xttw 8s ease-in-out infinite alternate}
+@keyframes xttw{to{opacity:1;transform:translateY(8px) scale(1.04)}}
+h1,h2{background:linear-gradient(100deg,#f6f5ff 20%,#c4b5fd 55%,#f0abfc 90%);
+ -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.card,.lg{transition:transform .4s cubic-bezier(.16,1,.3,1),box-shadow .4s}
+.card:hover{transform:translateY(-3px);box-shadow:0 26px 70px -24px rgba(139,92,246,.55)}
+.card::after,.lg::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+ background:linear-gradient(115deg,transparent 30%,rgba(196,181,253,.10) 45%,transparent 60%);
+ background-size:250% 100%;animation:xtshine 7s linear infinite}
+@keyframes xtshine{from{background-position:120% 0}to{background-position:-120% 0}}
+.nav.on{background:linear-gradient(135deg,#8b5cf6,#6366f1)!important;color:#fff!important;
+ box-shadow:0 10px 30px -8px rgba(139,92,246,.85)}
+.btn{transition:transform .22s cubic-bezier(.34,1.56,.64,1),box-shadow .22s,filter .22s}
+.btn:hover{filter:brightness(1.12)}
+.btn:active{transform:scale(.955)}
+.btn.p{box-shadow:0 10px 32px -10px rgba(139,92,246,.9)}
+tbody tr{transition:background .25s,box-shadow .25s}
+tbody tr:hover{background:rgba(139,92,246,.09);box-shadow:inset 3px 0 0 #8b5cf6}
+.pill.up{box-shadow:0 0 12px rgba(34,197,94,.55);animation:xtpulse 2.6s ease-in-out infinite}
+@keyframes xtpulse{0%,100%{box-shadow:0 0 10px rgba(34,197,94,.45)}50%{box-shadow:0 0 20px rgba(34,197,94,.85)}}
+.t{animation:xttoast .45s cubic-bezier(.16,1,.3,1) both}
+@keyframes xttoast{from{opacity:0;transform:translateY(14px) scale(.94)}to{opacity:1;transform:none}}
+input,select,textarea{transition:border-color .25s,box-shadow .25s}
+input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px rgba(139,92,246,.22);border-color:#8b5cf6!important}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:linear-gradient(#8b5cf6,#6366f1);border-radius:99px;border:2px solid #07060f}
+::-webkit-scrollbar-track{background:transparent}
+.tab,.nav{position:relative;overflow:hidden}
+.tab::after{content:"";position:absolute;inset:auto 12% 3px 12%;height:2px;border-radius:99px;
+ background:linear-gradient(90deg,#8b5cf6,#f0abfc);transform:scaleX(0);transition:transform .3s}
+.tab:hover::after{transform:scaleX(1)}
+@media(prefers-reduced-motion:reduce){body::before,body::after,.card::after,.lg::after{animation:none!important}}
 </style></head><body>
 <div id="aur" aria-hidden="true"><i class="a a1"></i><i class="a a2"></i><i class="a a3"></i><i class="st"></i></div>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
@@ -3687,7 +3885,7 @@ let TUNS=[];const tage=a=>a==null?"—":a<90?a+"s":Math.round(a/60)+"m";const PR
 async function trLoad(){try{const r=await api("tunnels");TUNS=r.tunnels;const cur=$("t_ti").value;
  $("tb_t").innerHTML=TUNS.length?TUNS.map((t,i)=>{const key=t.pending?t.id:t.ip;const ty=t.type==="rev"?'<span class="pill up" style="font-size:10px">ریورس</span>':t.type==="dir"?'<span class="pill unknown" style="font-size:10px">دایرکت</span>':"";
   const trb=t.tr&&t.tr!=="udp"?` <span class="pill unknown" style="font-size:10px">${t.tr.toUpperCase()}</span>`:"";
-  return `<tr><td>${t.name?`<b>${esc(t.name)}</b><br>`:""}${t.pending?'<span class="hint">در انتظار اتصال سرور خارج…</span>':'<span class="ltr">'+t.ip+"</span>"} ${ty}${trb}</td><td class="ltr">${t.engine==="gre"&&t.tr==="gre"?"—":t.port}</td><td>${t.pending?'<span class="pill unknown">منتظر اتصال</span>':t.up?'<span class="pill up">متصل</span>':'<span class="pill down">'+(t.engine==="gre"?"بدون لینک":"بدون handshake")+'</span>'}${t.pending?"":' <span class="hint">'+tage(t.age)+"</span>"}</td><td class="ltr">↓${hb(t.rx)} ↑${hb(t.tx)}</td><td>${t.active?'<span class="pill up">🔒 تانل</span>':'<span class="pill unknown">مستقیم</span>'}</td><td><select class="prsel" onchange="trPreset('${key}',this.value)">${["","balanced","turbo","throughput","gaming"].map(p=>`<option value="${p}" ${(t.preset||"")===p?"selected":""}>${p?PRFA[p]:"سیستم"}</option>`).join("")}</select><select class="prsel" style="margin-top:6px" onchange="trTransport('${key}',this.value)">${(t.engine==="gre"?["fou","gre"]:["udp","tcp","ws","wss","kcp","quic"]).map(x=>`<option value="${x}" ${(t.tr||"")===x?"selected":""}>${x.toUpperCase()}</option>`).join("")}</select></td><td><button class="btn" onclick="trLink(${i})">لینک اتصال</button> ${t.pending?"":`<button class="btn" onclick="trAct('script','${t.ip}')">دستور سرور خارج</button> <button class="btn" onclick="trAct('${t.active?"direct":"use"}','${key}')">${t.active?"برگشت به مستقیم":"فعال‌سازی"}</button> `}<button class="btn d" onclick="trAct('del','${key}')">حذف</button></td></tr>`}).join(""):'<tr><td colspan="7" class="empty">هنوز تانلی ساخته نشده</td></tr>';
+  return `<tr><td>${t.name?`<b>${esc(t.name)}</b><br>`:""}${t.pending?'<span class="hint">در انتظار اتصال سرور خارج…</span>':'<span class="ltr">'+t.ip+"</span>"} ${ty}${trb}</td><td class="ltr">${t.engine==="gre"&&t.tr==="gre"?"—":t.port}</td><td>${t.pending?'<span class="pill unknown">منتظر اتصال</span>':t.up?'<span class="pill up">متصل</span>':'<span class="pill down">'+(t.engine==="gre"?"بدون لینک":"بدون handshake")+'</span>'}${t.pending?"":' <span class="hint">'+tage(t.age)+"</span>"}</td><td class="ltr">↓${hb(t.rx)} ↑${hb(t.tx)}</td><td>${t.active?'<span class="pill up">🔒 تانل</span>':'<span class="pill unknown">مستقیم</span>'}</td><td><select class="prsel" onchange="trPreset('${key}',this.value)">${["","balanced","turbo","throughput","gaming"].map(p=>`<option value="${p}" ${(t.preset||"")===p?"selected":""}>${p?PRFA[p]:"سیستم"}</option>`).join("")}</select><select class="prsel" style="margin-top:6px" onchange="trTransport('${key}',this.value)">${(t.engine==="gre"?["fou","gre"]:["udp","tcp","ws","wss","kcp","quic"]).map(x=>`<option value="${x}" ${(t.tr||"")===x?"selected":""}>${x.toUpperCase()}</option>`).join("")}</select></td><td><button class="btn" onclick="trLink(${i})">لینک اتصال</button> ${t.engine==="gre"?`<button class="btn ${t.spoof?"p":""}" onclick="trSpoof('${key}')">${t.spoof?"اسپوف ✔":"اسپوف"}</button> `:""} ${t.pending?"":`<button class="btn" onclick="trAct('script','${t.ip}')">دستور سرور خارج</button> <button class="btn" onclick="trAct('${t.active?"direct":"use"}','${key}')">${t.active?"برگشت به مستقیم":"فعال‌سازی"}</button> `}<button class="btn d" onclick="trAct('del','${key}')">حذف</button></td></tr>`}).join(""):'<tr><td colspan="7" class="empty">هنوز تانلی ساخته نشده</td></tr>';
  const ips=[...new Set((window.LAST?window.LAST.rules:[]).map(r=>r.ip))];
  $("t_ti").innerHTML=[...new Set([...TUNS.filter(t=>!t.pending).map(t=>t.ip),...ips])].map(i=>`<option>${i}</option>`).join("");if(cur)$("t_ti").value=cur;rvIps()}catch(e){toast(e.message,"e")}}
 async function trTransport(key,v){if(!v)return;const t=TUNS.find(x=>(x.pending?x.id:x.ip)==key);if(!t)return;
@@ -3935,8 +4133,134 @@ $("sws").onclick=e=>{const b=e.target.closest(".sw[data-c]");if(b)setAc(b.datase
 document.addEventListener("click",e=>{const m=e.target.closest(".modal");if(m&&e.target===m)m.classList.remove("on")});
 setAc(ACC);setLang(LANG);syncThemeColor();bootStart(0,900);
 api("state").then(()=>{bootGo(1);show(true)}).catch(()=>show(false));
+</script><script>
+/* ---------------- Xtreme layer: DNS tab + IP-Spoof toggle (v2.11) ---------------- */
+(function(){
+ const boot=()=>{try{
+  const sec=document.createElement("section");sec.id="p_dns";sec.className="hide";
+  sec.innerHTML='<div class="bar"><h1 style="margin:0">DNS Spoof</h1><button class="btn p" id="dns_t">تغییر وضعیت</button></div>'+
+   '<div class="card"><div id="dns_st" style="margin-bottom:8px"></div>'+
+   '<div class="row" style="margin-top:10px"><div><label>دامنه (در wildcard هم ok است)</label><input id="dns_d" dir="ltr" placeholder="example.com یا *.site.com"></div>'+
+   '<div><label>مقدار (IP یا block)</label><input id="dns_v" dir="ltr" placeholder="1.2.3.4 یا block"></div>'+
+   '<div style="flex:0 0 auto;align-self:end"><button class="btn p" id="dns_a">افزودن</button></div></div>'+
+   '<div class="tbl"><table><thead><tr><th>دامنه</th><th>مقدار</th><th></th></tr></thead><tbody id="dns_tb"></tbody></table></div>'+
+   '<div class="hint" style="margin-top:10px">کلاینت‌ها DNS را روی همین سرور بگذارند: رکوردهای جدول مستقیم جواب می‌گیرند (یا block می‌شوند) و بقیه از رزالوورهای تمیز پاس می‌گیرند — دور زدن DNS hijacking. سرویس: dr-cpanel-dns</div></div>';
+  const main=document.querySelector("main");if(!main)return;main.appendChild(sec);
+  const nb=document.createElement("button");nb.className="nav";nb.dataset.p="dns";nb.textContent=TX("DNS");
+  const after=document.querySelector(".nav[data-p='set']")||document.querySelector(".nav");
+  if(after)after.after(nb);else main.querySelector(".tabs,nav,.bar").appendChild(nb);
+  nb.onclick=()=>nav("dns");
+  const _nav=nav;window.nav=function(p){_nav(p);const el=$("p_dns");if(el)el.classList.toggle("hide",p!=="dns");if(p==="dns"&&window.dnsLoad)dnsLoad()};
+  window.trSpoof=async(key)=>{const t=TUNS.find(x=>x.ip===key||String(x.id)===String(key)||("gre"+x.id)===key);if(!t)return;
+   try{await api("tunnel","POST",{action:"spoof",ip:t.ip,id:t.id,on:!t.spoof});
+    toast(t.spoof?"اسپوف خاموش شد — لینک سمت سرور خارج را دوباره اجرا کن":"اسپوف روشن شد — لینک سمت سرور خارج را دوباره اجرا کن","s");trLoad()}catch(e){toast(e.message,"e")}};
+  window.dnsLoad=async()=>{try{const r=await api("dns");
+   const st=$("dns_st");if(st)st.innerHTML='<div class="acts"><span class="pill '+(r.on?"up":"down")+'">'+TX(r.on?"روشن":"خاموش")+"</span> <span class='hint'>پورت "+r.port+"/udp</span></div>";
+   const tb=$("dns_tb");if(tb)tb.innerHTML=r.rows.length?r.rows.map(x=>'<tr><td class="ltr">'+esc(x.d)+"</td><td class='ltr'>"+esc(x.v)+"</td><td><button class='btn d' onclick=\"dnsDel('"+esc(x.d)+"')\">"+TX("حذف")+"</button></td></tr>").join(""):'<tr><td colspan="3" class="empty">'+TX("هنوز رکوردی نیست")+"</td></tr>";
+   const bt=$("dns_t");if(bt)bt.textContent=r.on?TX("خاموش‌کردن"):TX("روشن‌کردن")}catch(e){}};
+  window.dnsDel=async(d)=>{try{await api("dns","POST",{action:"del",domain:d});dnsLoad()}catch(e){toast(e.message,"e")}};
+  const bt=$("dns_t");if(bt)bt.onclick=async()=>{try{const r=await api("dns");await api("dns","POST",{action:r.on?"off":"on"});dnsLoad();toast(r.on?"خاموش شد":"روشن شد","s")}catch(e){toast(e.message,"e")}};
+  const ba=$("dns_a");if(ba)ba.onclick=async()=>{try{await api("dns","POST",{action:"add",domain:$("dns_d").value.trim(),value:$("dns_v").value.trim()});
+   $("dns_d").value="";$("dns_v").value="";dnsLoad();toast(TX("ذخیره شد"),"s")}catch(e){toast(e.message,"e")}};
+ }catch(e){console.warn("xt layer",e)}};
+ if(document.readyState!=="loading")boot();else document.addEventListener("DOMContentLoaded",boot);
+})();
 </script></body></html>
 HTMLEOF
+
+  # --- DNS resolver module (dr-cpanel-dns.service) ---
+  cat > "$WEB_DIR/dns.py" <<'DNSEOF'
+#!/usr/bin/env python3
+# DR-CPanel DNS resolver - the "DNS Spoof" module: a local resolver that answers
+# from an override table (domain|ip, domain|block) and forwards everything else
+# to clean public resolvers, so clients bypass local DNS hijacking.
+# dns.conf rows: domain|value    (value = an IP, or "block" = 0.0.0.0)
+import json, os, socket, socketserver, sys
+
+D = "/etc/dr-cpanel"; CFG = D + "/dns.json"; OVR = D + "/dns.conf"
+UP = (("8.8.8.8", 53), ("1.1.1.1", 53), ("9.9.9.9", 53))
+
+def cfg():
+    try: return json.load(open(CFG))
+    except Exception: return {"port": 53, "enabled": True}
+
+def save(c):
+    os.makedirs(D, exist_ok=True)
+    with open(CFG + ".tmp", "w") as f: json.dump(c, f)
+    os.chmod(CFG + ".tmp", 0o600); os.replace(CFG + ".tmp", CFG)
+
+def overrides():
+    out = {}
+    try:
+        for l in open(OVR):
+            p = l.rstrip("\n").split("|")
+            if len(p) == 2 and p[0].strip(): out[p[0].strip().lower().lstrip("*.")] = p[1].strip()
+    except FileNotFoundError: pass
+    return out
+
+def qname(data):
+    try:
+        i = 12; labels = []
+        while True:
+            n = data[i]
+            if n == 0: break
+            labels.append(data[i + 1:i + 1 + n].decode("ascii", "replace")); i += 1 + n
+        return ".".join(labels).lower()
+    except Exception: return None
+
+def reply(data, ip):
+    try:
+        j = 12
+        while data[j]: j += 1 + data[j]
+        j += 5
+        r = data[:2] + b"\x85\x80" + data[4:6] + b"\x00\x01" + b"\x00\x00\x00\x00" + data[12:j]
+        import ipaddress as I
+        if ":" in ip: raw = I.IPv6Address(ip).packed; t = 28
+        else: raw = I.IPv4Address(ip).packed; t = 1
+        r += b"\xc0\x0c" + t.to_bytes(2, "big") + b"\x00\x01" + (120).to_bytes(4, "big") + len(raw).to_bytes(2, "big") + raw
+        return r
+    except Exception: return None
+
+def forward(data):
+    for up, port in UP:
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+            s.sendto(data, (up, port)); d, _ = s.recvfrom(4096); return d
+        except Exception: pass
+        finally:
+            try: s.close()
+            except Exception: pass
+    return None
+
+class UH(socketserver.BaseRequestHandler):
+    def handle(self):
+        data, sock = self.request
+        name = qname(data); ov = overrides(); ip = None
+        if name:
+            if name in ov: ip = ov[name]
+            else:
+                for k, v in ov.items():
+                    if name.endswith("." + k): ip = v; break
+        if ip is not None:
+            rep = reply(data, "0.0.0.0" if ip == "block" else ip)
+            if rep: sock.sendto(rep, self.client_address); return
+        fwd = forward(data)
+        if fwd: sock.sendto(fwd, self.client_address)
+
+class UServer(socketserver.ThreadingUDPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+if __name__ == "__main__":
+    a = sys.argv[1:] or ["serve"]; c = cfg()
+    if a[0] == "setport": c["port"] = int(a[1]); save(c); print("OK")
+    elif a[0] == "seton": c["enabled"] = a[1] == "1"; save(c); print("OK")
+    elif a[0] == "info": print(c.get("port", 53), "on" if c.get("enabled") else "off")
+    else:
+        srv = UServer(("0.0.0.0", int(c.get("port", 53))), UH)
+        srv.serve_forever()
+DNSEOF
 }
 
 web_pubip() {   # public IPv4 of this server (validated, so error pages never leak into the URL)
@@ -4063,6 +4387,90 @@ web_menu() {
     7) web_domain;;
   esac
 }
+
+# ------------------------------------------------------------ DNS spoof ----
+DNSPY="$WEB_DIR/dns.py"
+DNSOVR="$CONF_DIR/dns.conf"
+DNSUNIT="/etc/systemd/system/dr-cpanel-dns.service"
+
+dns_apply() {   # (re)install the resolver unit and start/stop it per dns.json
+  [[ -f $DNSPY ]] || { echo "error: dns.py not found - run 'dr-cpanel web-reload' first" >&2; return 1; }
+  cat > "$DNSUNIT" <<EOF
+[Unit]
+Description=DR-CPanel DNS resolver (overrides + clean forwarding)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/env python3 $DNSPY serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1
+  local on; on=$(python3 "$DNSPY" info 2>/dev/null | awk '{print $2}')
+  if [[ $on == on ]]; then
+    systemctl enable --now dr-cpanel-dns >/dev/null 2>&1
+    systemctl is-active --quiet dr-cpanel-dns && return 0
+    err "DNS service failed to start: journalctl -u dr-cpanel-dns -n 10 (port in use?)"; return 1
+  else
+    systemctl disable --now dr-cpanel-dns >/dev/null 2>&1
+    return 0
+  fi
+}
+
+dns_ovr_add() {   # domain value(ip|block)
+  local d=$(trim "$1"); local v=$(trim "$2")
+  [[ $d =~ ^\*?\.?[A-Za-z0-9.-]+$ ]] || { echo "error: invalid domain" >&2; return 1; }
+  [[ $v == block ]] || valid_ip "$v" || { echo "error: invalid IP (or 'block')" >&2; return 1; }
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null
+  sed -i "/^$d|/Id" "$DNSOVR" 2>/dev/null
+  echo "$d|$v" >> "$DNSOVR" && dns_apply >/dev/null 2>&1 && echo "added $d -> $v"
+}
+
+dns_ovr_del() {
+  sed -i "/^$(trim "$1")|/Id" "$DNSOVR" 2>/dev/null
+  dns_apply >/dev/null 2>&1 && echo "deleted"
+}
+
+dns_ovr_list() {
+  [[ -s $DNSOVR ]] && cat "$DNSOVR" || info "No overrides yet."
+}
+
+dns_onoff() {   # on|off
+  python3 "$DNSPY" seton "$([[ $1 == on ]] && echo 1 || echo 0)" >/dev/null 2>&1 || return 1
+  dns_apply && [[ $1 == on ]] && ok "DNS resolver is ON - point clients at this server, port $(python3 "$DNSPY" info | awk '{print $1}')" && return 0
+  [[ $1 == on ]] || ok "DNS resolver is OFF."
+  return 0
+}
+
+dns_menu() {
+  local c d v port info_out
+  [[ -f $DNSPY ]] || web_write_files
+  info_out=$(python3 "$DNSPY" info 2>/dev/null || echo "53 off")
+  banner; echo "  ${C_BLD}DNS Spoof${C_RST}"; echo
+  info "State: $(awk '{print $2}' <<< "$info_out")   Port: $(awk '{print $1}' <<< "$info_out")/udp"
+  info "A local resolver: override table answers first, everything else goes to"
+  info "clean public resolvers - clients bypass DNS hijacking and custom records."
+  dns_ovr_list
+  echo
+  echo "   1) Enable / Disable the resolver"
+  echo "   2) Change listen port"
+  echo "   3) Add an override     (domain -> IP, or domain -> block)"
+  echo "   4) Remove an override"
+  echo "   5) Show client config hint"
+  echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) read -rp "  on/off [on]: " x; dns_onoff "${x:-on}";;
+    2) read -rp "  New port [53]: " port; port=${port:-53}; valid_port "$port" && { python3 "$DNSPY" setport "$port" >/dev/null && dns_apply && ok "Port: $port"; };;
+    3) read -rp "  Domain (wildcard *.site.com ok): " d; read -rp "  Value (IP or 'block'): " v; dns_ovr_add "$d" "$v";;
+    4) read -rp "  Domain: " d; dns_ovr_del "$d";;
+    5) info "Point clients' DNS at this server (IP), port $(awk '{print $1}' <<< "$info_out").";;
+  esac
+}
+
 
 # ---------------------------------------------------------- operations ----
 
@@ -5069,7 +5477,7 @@ gre_table() {   # the GRE tunnel table; sets GRE_COUNT
   local i=0 id fip port mode mtu a pr ty name st
   GRE_COUNT=0
   [[ -s $GRE ]] || { info "No GRE tunnels yet - build one from Setup Iran / Setup Kharej."; return 1; }
-  printf "  ${C_BLD}%-3s %-18s %-7s %-7s %-9s %-10s %-11s %s${C_RST}\n" "#" "NAME" "MODE" "PORT" "TYPE" "STATE" "PRESET" "FOREIGN IP"
+  printf "  ${C_BLD}%-3s %-18s %-7s %-7s %-9s %-10s %-11s %-7s %s${C_RST}\n" "#" "NAME" "MODE" "PORT" "TYPE" "STATE" "PRESET" "SPOOF" "FOREIGN IP"
   while IFS='|' read -r id fip port mode _ mtu a pr ty tok name; do
     [[ -z $id ]] && continue; i=$((i + 1))
     if [[ $fip == pending ]]; then st="waiting-join"
@@ -5077,9 +5485,9 @@ gre_table() {   # the GRE tunnel table; sets GRE_COUNT
     elif ip link show "drgre$id" >/dev/null 2>&1; then st="no-peer"
     else st="stopped"
     fi
-    printf "  %-3s %-18s %-7s %-7s %-9s %-10s %-11s %s\n" \
+    printf "  %-3s %-18s %-7s %-7s %-9s %-10s %-11s %-7s %s\n" \
       "$i" "${name:-gre$id}" "$mode" "$([[ $mode == fou ]] && echo "$port" || echo '-')" \
-      "$([[ $ty == rev ]] && echo reverse || echo direct)" "$st" "${pr:--}" "$fip"
+      "$([[ $ty == rev ]] && echo reverse || echo direct)" "$st" "${pr:--}" "$([[ -n $(spoof_row "gre$id") ]] && echo ON || echo -)" "$fip"
   done < "$GRE"
   GRE_COUNT=$i
   return 0
@@ -5131,6 +5539,7 @@ gre_actions() {   # per-GRE-tunnel management
     echo "   6) Preset            per-tunnel performance preset"
     echo "   7) Auto MTU          find the largest packet the path passes"
     echo "   8) Delete            remove this GRE tunnel"
+    echo "   9) IP Spoof          spoofed-source pipe: DPI sees random IPs, not the servers"
     echo "   0) Back"; echo
     read -rp "  Select: " c || return 0
     case $c in
@@ -5150,6 +5559,8 @@ gre_actions() {   # per-GRE-tunnel management
          gre_preset "$id" "$got" >/dev/null && ok "Preset: $got";;
       7) got=$(gre_automtu "$id" 2>/dev/null) && ok "Best MTU for this path: $got" || err "Could not measure (the link must be connected first).";;
       8) confirm "Delete GRE tunnel #$id ($fip)?" && { gre_del "$id" && ok "Deleted - its forwards stopped working."; return 0; };;
+      9) if [[ -n $(spoof_row "gre$id") ]]; then gre_spoof "$id" off && ok "Spoof OFF."
+         else got=$(gre_spoof "$id" on) && ok "Spoof ON - this side fakes ${got%% *}, kharej fakes ${got##* }." && warn "Run the kharej join line / foreign script again so the other side matches."; fi;;
       0) return 0;;
     esac
     GROW=$(gre_row "$id")
@@ -5331,7 +5742,15 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     ctest-open) shift; ctest_open;;
     ctest-close) ctest_close;;
     ctest-daemon) shift; ctest_daemon "$@";;
-    web-reload) web_write_files; systemctl restart dr-cpanel-web 2>/dev/null; ok "Web panel files regenerated from v$VERSION.";;
+    web-reload) web_write_files; dns_apply >/dev/null 2>&1 || true; systemctl restart dr-cpanel-web 2>/dev/null; ok "Web panel files regenerated from v$VERSION.";;
+    dns) shift; case "${1:-}" in
+         on) dns_onoff on;; off) dns_onoff off;;
+         add) shift; dns_ovr_add "${1:-}" "${2:-}";;
+         del) shift; dns_ovr_del "${1:-}";;
+         list) dns_ovr_list;;
+         status) python3 "$DNSPY" info 2>/dev/null || echo "53 off";;
+         *) dns_menu;;
+       esac;;
     conntest) conntest_cli;;
     doctor) doctor;;
     perf)  shift; perf_apply "${1:-}";;
