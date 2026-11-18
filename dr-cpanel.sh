@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="2.9.2"
+VERSION="2.9.3"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
 TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active|preset|type|join_token|name|token_expiry|transport|carrier_port
@@ -466,6 +466,13 @@ tun_automtu() {   # foreign_ip : detect the best MTU, save it and bounce the int
   mtu=$(tun_probe_mtu "$id"); (( mtu >= 1200 )) || return 1
   awk -F'|' -v OFS='|' -v i="$id" -v m="$mtu" '$1==i{$4=m}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"
   tun_write_conf "$id"; tun_up "$id"
+  local t0 hs; t0=$(date +%s)   # the bounce reset the handshake: wait (keepalive 25 s) until the link is live again
+  while :; do
+    hs=$(wg show "drwg$id" latest-handshakes 2>/dev/null | awk '{print $2}')
+    (( ${hs:-0} > 0 )) && break
+    (( $(date +%s) - t0 > 40 )) && break
+    sleep 3
+  done
   echo "$mtu"
 }
 
@@ -575,7 +582,11 @@ tun_script() {   # foreign_ip : the script to run on the foreign server
   (( mtu >= 1200 && mtu <= 1500 )) || mtu=$(tr_mtu "$tr")   # 0 = auto: the foreign conf needs a number
   if [[ $ty == rev ]]; then   # kharej dials in: it needs this (Iran) server's address as the WG endpoint
     local myip; myip=$(web_pubip 2>/dev/null || true)
-    [[ -n $myip ]] && epdecl=$'Endpoint = '"$myip:$port"$'\nPersistentKeepalive = 25\n'
+    if [[ $tr == udp ]]; then
+      [[ -n $myip ]] && epdecl=$'Endpoint = '"$myip:$port"$'\nPersistentKeepalive = 25\n'
+    else   # carried transport: the kharej gost client feeds WG from the local port
+      epdecl=$'Endpoint = 127.0.0.1:'"$(tr_local_port "$id")"$'\nPersistentKeepalive = 25\n'
+    fi
   fi
   if [[ -s $REV ]]; then   # embed the reverse forwards of THIS tunnel into the script
     while IFS='|' read -r rf lp dp rp; do
@@ -599,15 +610,19 @@ tun_script() {   # foreign_ip : the script to run on the foreign server
     done < "$CONF"
     [[ -n $fwdin ]] && fwdin=$'sysctl -q -w net.ipv4.conf.drwg'"$id"$'.route_localnet=1 || true\n'"$fwdin"
   fi
-  # when the transport is not plain UDP, the foreign side listens for the gost carrier
+  # when the transport is not plain UDP a gost carrier carries the WG packets:
+  # the LISTENING side runs the server unit, the DIALING side runs a client that
+  # feeds its WireGuard from a local UDP port. This script runs on the KHAREJ:
+  # rev -> the kharej dials the Iran carrier (client), dir/fwd -> the kharej listens (server).
   GOST_SRV=""
   if [[ $tr != udp ]]; then
-    local cp tok
+    local cp tok myip sec="" lfeed
     cp=$(tr_carrier_port "$id" "$cport")
     tok=$(cut -d'|' -f12 <<< "$r")
     [[ ${#tok} -ge 16 ]] || { tok=$(tun_token); awk -F'|' -v OFS='|' -v i="$id" -v v="$tok" '$1==i{$12=v}1' "$TUN" > "$TUN.tmp" && cat "$TUN.tmp" > "$TUN"; rm -f "$TUN.tmp"; }
     gost_have || gost_install >/dev/null 2>&1   # this side too (for the status/preview); the foreign script installs its own copy
-    GOST_SRV="# --- transport carrier: gost listens on $(tr_proto "$tr")/$cp and hands the traffic to the local WireGuard ---
+    lfeed=$(tr_local_port "$id")
+    GOST_SRV="# --- transport carrier: gost carries the WireGuard packets over $tr ---
 if [[ ! -x /usr/local/bin/drc-gost ]]; then
   garch=amd64; [[ \$(uname -m) == aarch64 || \$(uname -m) == arm64 ]] && garch=arm64; [[ \$(uname -m) == armv7l ]] && garch=armv7; [[ \$(uname -m) == i686 || \$(uname -m) == i386 ]] && garch=386
   gtmp=\$(mktemp -d)
@@ -619,7 +634,26 @@ if [[ ! -x /usr/local/bin/drc-gost ]]; then
   tar xzf \$gtmp/g.tgz -C \$gtmp gost 2>/dev/null || tar xzf \$gtmp/g.tgz -C \$gtmp
   install -m 755 \$gtmp/gost /usr/local/bin/drc-gost && rm -rf \$gtmp
 fi
-cat > /etc/systemd/system/drc-goss$id.service <<GEOF
+"
+    if [[ $ty == rev ]]; then   # the kharej dials the Iran carrier: gost client + local WG feed
+      myip=$(web_pubip 2>/dev/null || true); [[ -n $myip ]] || myip="IRAN_IP"
+      [[ $tr == wss ]] && sec="?secure=false"
+      GOST_SRV+="cat > /etc/systemd/system/drc-gosc$id.service <<GEOF
+[Unit]
+Description=DR-CPanel transport carrier (tunnel $id, client)
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/drc-gost -L \"udp://127.0.0.1:$lfeed/127.0.0.1:$port?keepalive=true\" -F \"relay+$tr://$tok@$myip:$cp$sec\"
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+GEOF
+systemctl daemon-reload; systemctl enable --now drc-gosc$id >/dev/null 2>&1
+echo \"Transport carrier: $tr client to $myip:$cp (local WG feed 127.0.0.1:$lfeed)\"
+"
+    else                        # the kharej listens; the Iran client dials in
+      GOST_SRV+="cat > /etc/systemd/system/drc-goss$id.service <<GEOF
 [Unit]
 Description=DR-CPanel transport carrier (tunnel $id)
 After=network-online.target
@@ -635,6 +669,7 @@ command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q \"Status: act
 systemctl daemon-reload; systemctl enable --now drc-goss$id >/dev/null 2>&1
 echo \"Transport carrier: $tr on port $cp\"
 "
+    fi
   fi
   cat <<EOS
 # DR-CPanel: foreign-server side of the encrypted tunnel. Run once, as root.
@@ -751,14 +786,16 @@ PersistentKeepalive = 25
     fi
   fi
   (( mtu >= 1200 && mtu <= 1500 )) || mtu=$(tr_mtu "$tr")
-  # when the transport is not plain UDP, the foreign side runs a gost client that feeds WG
+  # when the transport is not plain UDP a gost carrier carries the WG packets:
+  # rev -> the kharej DIALS the Iran carrier (client), dir/fwd -> the kharej
+  # LISTENS (server) and the Iran side's client feeds it. Mirrors tun_script.
   GOST_CLI=""
   if [[ $tr != udp ]]; then
     local cp tok sec=""
     cp=$(tr_carrier_port "$id" "$cport")
     tok=$(cut -d'|' -f12 <<< "$r")
     [[ $tr == wss ]] && sec="?secure=false"
-    GOST_CLI="# --- transport carrier: a gost client feeds the local WireGuard through $tr to Iran:$cp ---
+    GOST_CLI="# --- transport carrier: gost carries the local WireGuard over $tr ---
 if [[ ! -x /usr/local/bin/drc-gost ]]; then
   garch=amd64; [[ \$(uname -m) == aarch64 || \$(uname -m) == arm64 ]] && garch=arm64; [[ \$(uname -m) == armv7l ]] && garch=armv7; [[ \$(uname -m) == i686 || \$(uname -m) == i386 ]] && garch=386
   gtmp=\$(mktemp -d)
@@ -770,7 +807,9 @@ if [[ ! -x /usr/local/bin/drc-gost ]]; then
   tar xzf \$gtmp/g.tgz -C \$gtmp gost 2>/dev/null || tar xzf \$gtmp/g.tgz -C \$gtmp
   install -m 755 \$gtmp/gost /usr/local/bin/drc-gost && rm -rf \$gtmp
 fi
-cat > /etc/systemd/system/drc-gosc$id.service <<GEOF
+"
+    if [[ $ty == rev ]]; then   # the kharej dials the Iran carrier port
+      GOST_CLI+="cat > /etc/systemd/system/drc-gosc$id.service <<GEOF
 [Unit]
 Description=DR-CPanel transport carrier (tunnel $id, client)
 After=network-online.target
@@ -784,6 +823,24 @@ GEOF
 systemctl daemon-reload; systemctl enable --now drc-gosc$id >/dev/null 2>&1
 echo \"Transport carrier: $tr to $ephost:$cp (local feed 127.0.0.1:$lp)\"
 "
+    else                        # the kharej listens; the Iran side dials in
+      GOST_CLI+="cat > /etc/systemd/system/drc-goss$id.service <<GEOF
+[Unit]
+Description=DR-CPanel transport carrier (tunnel $id, server)
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/drc-gost -L \"relay+$tr://$tok@:$cp\"
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+GEOF
+iptables -I INPUT -p $(tr_proto "$tr") --dport $cp -j ACCEPT 2>/dev/null || true
+command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q \"Status: active\" && ufw allow $cp/$(tr_proto "$tr") >/dev/null 2>&1
+systemctl daemon-reload; systemctl enable --now drc-goss$id >/dev/null 2>&1
+echo \"Transport carrier: $tr listening on port $cp (the Iran side dials in)\"
+"
+    fi
   fi
   cat <<EOS
 #!/usr/bin/env bash
@@ -2144,6 +2201,10 @@ def do_cert(cert, key):
     log("info", "Own certificate installed"); restart_later()
 
 # ------------------------------------------------------------------- http
+class HSrv(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128   # a 5-slot backlog filled up once under heavy tunnel churn and wedged new logins
+
 class H(BaseHTTPRequestHandler):
     server_version = "DR-CPanel"
     def log_message(self, *a): pass
@@ -2554,8 +2615,23 @@ if __name__ == "__main__":
         try: subprocess.run([BIN, "apply"], timeout=20)
         except Exception: pass
         threading.Thread(target=quota_loop, daemon=True).start()
+        def self_watchdog():
+            # the accept loop once froze silently under heavy tunnel churn; if the
+            # local listen port stops answering, exit so systemd restarts the panel
+            time.sleep(30); misses = 0
+            while True:
+                port = cfg().get("port", 8443)
+                try:
+                    socket.create_connection(("127.0.0.1", port), 5).close(); misses = 0
+                except Exception:
+                    misses += 1
+                    if misses >= 3:
+                        log("warn", "Panel watchdog: port %s stopped answering locally - restarting" % port)
+                        audit("panel_watchdog_restart", "", "127.0.0.1"); os._exit(1)
+                time.sleep(60)
+        threading.Thread(target=self_watchdog, daemon=True).start()
         log("info", "DR-CPanel web panel started on port %s" % c.get("port", 8443))
-        srv = ThreadingHTTPServer(("0.0.0.0", c.get("port", 8443)), H)
+        srv = HSrv(("0.0.0.0", c.get("port", 8443)), H)
         if c.get("tls"):
             x = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             try: x.load_cert_chain(c.get("cert") or CERT, c.get("key") or KEY)
@@ -3697,7 +3773,7 @@ uninstall() {
   web_remove >/dev/null 2>&1
   local spec t parent chain fip
   for fip in $(cut -d'|' -f2 "$TUN" 2>/dev/null); do tun_del "$fip" >/dev/null 2>&1; done
-  for spec in "mangle PREROUTING DRC_SEC" "mangle FORWARD DRC_MSS" "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD"; do
+  for spec in "mangle PREROUTING DRC_SEC" "mangle FORWARD DRC_MSS" "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD" "filter INPUT DRC_IN"; do
     set -- $spec; t=$1; parent=$2; chain=$3
     iptables -t "$t" -D "$parent" -j "$chain" 2>/dev/null
     iptables -t "$t" -F "$chain" 2>/dev/null
@@ -3858,13 +3934,13 @@ PYEOF
 conntest_cli() {   # BackPack-style connection test, via the installed web backend (no panel needed)
   [[ -f $WEB_PY ]] || { echo "error: install the web panel first (menu option 9), then run this again" >&2; return 1; }
   python3 "$WEB_PY" conntest 2>/dev/null | python3 -c '
-import json,sys
+import json,sys,time
 try: r=json.load(sys.stdin)
 except Exception: print("conntest failed"); raise SystemExit(1)
 def row(n,x,extra=""):
     if x is None: print("  %-26s %s" % (n, "n/a")); return
     print("  %-26s %s%s" % (n, ("%5s ms · loss %s%%" % (x.get("avg","-"), x.get("loss","-"))) if x.get("ok") else "unreachable", extra))
-print("DR-CPanel connection test  (%s)" % time.strftime("%F %T", __import__("time").localtime(r.get("t", 0))) if True else "")
+print("DR-CPanel connection test  (%s)" % time.strftime("%F %T", time.localtime(r.get("t", 0))))
 row("Cloudflare 1.1.1.1", r.get("g2"))
 row("Google DNS 8.8.8.8→4.2.2.4", r.get("g1"))
 print("  %-26s %s" % ("Download (Cloudflare)", ("%s Mbit/s" % r["dl"]) if r.get("dl") else "n/a"))
@@ -4488,7 +4564,9 @@ doctor() {   # the first stop when a tunnel will not build
   command -v curl     >/dev/null 2>&1 && cok "curl"                        || cbad "curl MISSING"
   command -v iptables >/dev/null 2>&1 && cok "iptables"                    || cbad "iptables MISSING"
   command -v wg       >/dev/null 2>&1 && cok "wireguard tools"             || cbad "wireguard tools MISSING - run the installer again"
-  modprobe wireguard  2>/dev/null     && cok "wireguard kernel module"     || cbad "wireguard kernel module FAILED to load"
+  { modprobe wireguard 2>/dev/null || [[ -d /sys/module/wireguard ]]; } \
+    && cok "wireguard kernel module" \
+    || { ip link add drwgchk type wireguard 2>/dev/null && ip link del drwgchk 2>/dev/null && cok "wireguard kernel module (built-in)" || cbad "wireguard kernel module FAILED to load"; }
   [[ -x /usr/local/bin/drc-gost ]]     && cok "gost carrier installed"     || info "gost carrier: installs on the first carried tunnel"
   [[ -f $WEB_PY ]]                     && cok "web backend installed"      || warn "web backend NOT installed (join/test links need it - menu 5)"
   systemctl is-active dr-cpanel-web >/dev/null 2>&1 && cok "web backend running" || warn "web backend NOT running (menu 5 -> Restart)"
