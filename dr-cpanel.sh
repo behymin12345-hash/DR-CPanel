@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v3.0.0: two more engines built in - (1) Xray (VLESS + Reality): Xray-core installs from the panel/CLI, every inbound is a VLESS listener with Reality TLS-camouflage (a real SNI destination it borrows the TLS handshake from, automatic x25519 keys + short-id + flow xtls-rprx-vision), full lifecycle from the new Engines tab in the panel (/api/engines) and 'dr-cpanel xray add|del|on|off|list|link', one-click vless:// client links; (2) Backhaul (Musixal/Backhaul) reverse-tunnel engine: binary install, commented TOML client/server templates per tunnel (client service on Iran, server config ready to copy to the kharej), systemd per tunnel, Manage -> Engines in the CLI; the Engines panel tab shows both engines' state with one-click vless links; plus the Xtreme UI v3 (a visible aurora field with three moving color blobs, gradient headline flow, real gradient card borders with a light sweep, gradient pill nav and primary buttons, glowing status pills, section entrance transitions, custom gradient scrollbar) and a completely rewritten README; v2.11.0: Hashem-grade features, natively - (1) IP-Spoof: a spoofed-source pipe for GRE tunnels; the OUTER packets on the wire carry random-looking fake IPs instead of the real server IPs (each side sources its tunnel from its own fake IP and matches the peer's fake IP on a dedicated RX link - kernel double-link construction, works on plain public VPSs wherever the path does not enforce strict uRPF), per-tunnel toggle in the panel table and the CLI ('tunnel gre spoof ID on|off') and baked into the kharej join/foreign scripts; (2) DNS-Spoof: a built-in DNS resolver service (dr-cpanel-dns, UDP :53) with an override table (domain -> IP, or domain -> block, wildcards ok) and clean public-resolver forwarding for everything else - clients pointed at the server bypass DNS hijacking; managed from a new panel DNS tab, the API (/api/dns) and 'dr-cpanel dns on|off|add|del|list|status|menu'; (3) the Link Test now covers GRE rows (direct vs tunnel probes + preset recommendation) and the tunnel table shows the spoof state; (4) an Xtreme UI layer: animated mesh grid + twinkling stars background, gradient headline text, glass cards with a light sweep + hover lift, glowing active nav, springy buttons, pulsing online pills, row-hover glow and a custom scrollbar; v2.10.0: native GRE tunnels - a new L3 tunnel family alongside WireGuard, built on the kernel's ip_gre/fou: two modes (raw GRE over IP protocol 47, or GRE over UDP via FOU for UDP-only paths), reverse tunnels with the same one-line join link flow (GRE links are static, so the Iran-side link is built the moment the kharej fetches its join link) and direct tunnels, per-tunnel presets, auto-MTU probe over the GRE path, MSS clamping, a GRE tunnel watchdog that rebuilds dead links, its own Manage > GRE Tunnels menu with the full per-tunnel action set, CLI 'dr-cpanel tunnel gre ...', web panel wizard types GRE reverse/direct with a GRE/FOU mode picker, merged tunnel table with GRE rows and a FOU/GRE mode switch, /join/<token> and link/script endpoints serving GRE tunnels, gretunnels.conf included in backups/restore and uninstall cleanup, doctor now checks GRE kernel support; WARNING: GRE is a plain L3 tunnel - fast but NOT encrypted, WireGuard transports stay the choice for sensitive traffic; v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v3.1.0: Hashem's signature views, natively - (1) Nodes map on the dashboard: every tunnel drawn as Iran -> kharej columns joined by a health-colored line (live CPU/RAM/traffic per node, spoof and transport badges) plus a cluster-node registry ('dr-cpanel node add|del|list', pinged live in /api/engines); (2) Autopilot: a tunnel that stays down >10 minutes is path-tested and moved to the best surviving carrier (UDP -> KCP on loss, -> TCP when UDP egress dies, back to UDP when healed, max one attempt per 30 min per tunnel) - toggle in the panel health page (with the status hero + failure bar) or 'dr-cpanel autopilot on|off'; (3) SSH tunnel pool (Bagher-style): persistent ssh -L/-R forwards with keepalive + auto-restart as their own services ('dr-cpanel sshpool add|del|status', Manage -> Engines); v3.0.0: two more engines built in - (1) Xray (VLESS + Reality): Xray-core installs from the panel/CLI, every inbound is a VLESS listener with Reality TLS-camouflage (a real SNI destination it borrows the TLS handshake from, automatic x25519 keys + short-id + flow xtls-rprx-vision), full lifecycle from the new Engines tab in the panel (/api/engines) and 'dr-cpanel xray add|del|on|off|list|link', one-click vless:// client links; (2) Backhaul (Musixal/Backhaul) reverse-tunnel engine: binary install, commented TOML client/server templates per tunnel (client service on Iran, server config ready to copy to the kharej), systemd per tunnel, Manage -> Engines in the CLI; the Engines panel tab shows both engines' state with one-click vless links; plus the Xtreme UI v3 (a visible aurora field with three moving color blobs, gradient headline flow, real gradient card borders with a light sweep, gradient pill nav and primary buttons, glowing status pills, section entrance transitions, custom gradient scrollbar) and a completely rewritten README; v2.11.0: Hashem-grade features, natively - (1) IP-Spoof: a spoofed-source pipe for GRE tunnels; the OUTER packets on the wire carry random-looking fake IPs instead of the real server IPs (each side sources its tunnel from its own fake IP and matches the peer's fake IP on a dedicated RX link - kernel double-link construction, works on plain public VPSs wherever the path does not enforce strict uRPF), per-tunnel toggle in the panel table and the CLI ('tunnel gre spoof ID on|off') and baked into the kharej join/foreign scripts; (2) DNS-Spoof: a built-in DNS resolver service (dr-cpanel-dns, UDP :53) with an override table (domain -> IP, or domain -> block, wildcards ok) and clean public-resolver forwarding for everything else - clients pointed at the server bypass DNS hijacking; managed from a new panel DNS tab, the API (/api/dns) and 'dr-cpanel dns on|off|add|del|list|status|menu'; (3) the Link Test now covers GRE rows (direct vs tunnel probes + preset recommendation) and the tunnel table shows the spoof state; (4) an Xtreme UI layer: animated mesh grid + twinkling stars background, gradient headline text, glass cards with a light sweep + hover lift, glowing active nav, springy buttons, pulsing online pills, row-hover glow and a custom scrollbar; v2.10.0: native GRE tunnels - a new L3 tunnel family alongside WireGuard, built on the kernel's ip_gre/fou: two modes (raw GRE over IP protocol 47, or GRE over UDP via FOU for UDP-only paths), reverse tunnels with the same one-line join link flow (GRE links are static, so the Iran-side link is built the moment the kharej fetches its join link) and direct tunnels, per-tunnel presets, auto-MTU probe over the GRE path, MSS clamping, a GRE tunnel watchdog that rebuilds dead links, its own Manage > GRE Tunnels menu with the full per-tunnel action set, CLI 'dr-cpanel tunnel gre ...', web panel wizard types GRE reverse/direct with a GRE/FOU mode picker, merged tunnel table with GRE rows and a FOU/GRE mode switch, /join/<token> and link/script endpoints serving GRE tunnels, gretunnels.conf included in backups/restore and uninstall cleanup, doctor now checks GRE kernel support; WARNING: GRE is a plain L3 tunnel - fast but NOT encrypted, WireGuard transports stay the choice for sensitive traffic; v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
 TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active|preset|type|join_token|name|token_expiry|transport|carrier_port
@@ -2282,6 +2282,8 @@ def monitor():
             except Exception as e: log("warn", "wg_watch error: %s" % type(e).__name__)
             try: subprocess.run([BIN, "tunnel", "gre", "watch"], timeout=90)
             except Exception: pass
+            try: subprocess.run([BIN, "autopilot-tick"], timeout=120)
+            except Exception: pass
             try: traffic_tick()
             except Exception: pass
             try: tg_daily_jobs()
@@ -2925,7 +2927,16 @@ class H(BaseHTTPRequestHandler):
                         active = subprocess.run(["systemctl", "is-active", "--quiet", "dr-bh-" + tid], timeout=8).returncode == 0
                         bh["tunnels"].append(dict(id=tid, active=active))
             except Exception: pass
-            return self.out(200, {"xray": xr, "backhaul": bh})
+            nodes = []
+            try:
+                for l in open(D + "/nodes.conf"):
+                    q = l.rstrip("\n").split("|")
+                    if len(q) >= 2 and q[0].strip():
+                        try: ms = subprocess.run(["ping", "-c", "1", "-W", "1", q[1].strip()], capture_output=True, timeout=5).returncode
+                        except Exception: ms = 1
+                        nodes.append(dict(name=q[0].strip(), ip=q[1].strip(), note=(q[2].strip() if len(q) > 2 else ""), up=(ms == 0)))
+            except FileNotFoundError: pass
+            return self.out(200, {"xray": xr, "backhaul": bh, "nodes": nodes, "autopilot": os.path.exists(D + "/autopilot") and "on" in open(D + "/autopilot").read()})
         if p == "/api/dns":
             dnspy = "/usr/local/lib/dr-cpanel/dns.py"; rows = []
             try:
@@ -3238,6 +3249,14 @@ class H(BaseHTTPRequestHandler):
                         return self.out(200, {"ok": True})
                     raise ValueError("Bad action")
                 raise ValueError("Bad engine")
+            if self.path == "/api/autopilot":
+                if d.get("on") in (True, 1, "1", "on"):
+                    open(D + "/autopilot", "w").write("on"); log("info", "Autopilot ON"); audit("autopilot_on", "", self.client_address[0])
+                else:
+                    try: os.remove(D + "/autopilot")
+                    except FileNotFoundError: pass
+                    log("info", "Autopilot OFF"); audit("autopilot_off", "", self.client_address[0])
+                return self.out(200, {"ok": True})
             if self.path == "/api/totp":
                 c = cfg(); a = d.get("action"); ip = self.client_address[0]
                 if a == "setup":
@@ -3689,6 +3708,47 @@ section{animation:xtin .5s cubic-bezier(.16,1,.3,1) both}
 /* ---- meter bars: gradient fill ---- */
 meter,[class*=meter] i{background:linear-gradient(90deg,var(--xt2),var(--xt1),var(--xt3))!important}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style><style id="xt2">
+/* ============ Hashem-style sidebar layout ============ */
+#app{display:grid!important;grid-template-columns:236px minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);max-width:1560px;margin:0 auto;column-gap:22px;padding:0 18px 46px}
+header.top{grid-column:1;grid-row:1;padding:20px 8px 8px;border-bottom:none!important}
+nav.tabs{grid-column:1;grid-row:2;position:sticky;top:0;align-self:start;max-height:calc(100vh - 30px);overflow-y:auto;padding:4px 2px 20px;border:none!important}
+.tabs .seg{display:flex!important;flex-direction:column!important;gap:8px;padding:6px 2px;background:transparent!important;border:none!important;box-shadow:none!important;position:static!important}
+.tabs .seg .ind{display:none!important}
+.nav{width:100%;justify-content:flex-start!important;padding:12px 14px!important;font-size:14px;gap:10px}
+.nav span{display:inline!important}
+main{grid-column:2;grid-row:1/3;padding-top:26px!important;min-width:0}
+/* ---- wizard modal fix: visible backdrop, roomy dialog ---- */
+#wm{background:rgba(5,4,12,.5)!important;backdrop-filter:blur(7px)!important}
+#wm>div,#wm .card,#wm main{max-width:640px!important;max-height:88vh!important;overflow-y:auto!important}
+/* ---- nodes map (cluster view) ---- */
+.xtmap{display:flex;gap:12px;flex-wrap:wrap;align-items:stretch}
+.xtnode{min-width:148px;flex:1;border-radius:16px;padding:12px 14px;background:rgba(139,92,246,.07);
+ border:1px solid rgba(139,92,246,.28);transition:transform .3s,box-shadow .3s}
+.xtnode:hover{transform:translateY(-3px);box-shadow:0 14px 40px -16px rgba(139,92,246,.6)}
+.xtnode b{display:block;font-size:13.5px;margin-bottom:4px}
+.xtnode small{color:#9d99b8;font-size:11px;display:block;line-height:1.8;direction:ltr;text-align:left}
+.xtnode.ok{border-color:rgba(34,197,94,.45)}
+.xtnode.bad{border-color:rgba(239,68,68,.45)}
+.xtline{flex:0 0 44px;align-self:center;height:2.5px;border-radius:99px;position:relative}
+.xtline.ok{background:linear-gradient(90deg,#22c55e,#4ade80);box-shadow:0 0 10px rgba(34,197,94,.6)}
+.xtline.bad{background:linear-gradient(90deg,#ef4444,#f87171);box-shadow:0 0 10px rgba(239,68,68,.6)}
+.xtline.wait{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+/* ---- autopilot hero ---- */
+.xthero{display:flex;gap:16px;align-items:center;justify-content:space-between;border-radius:18px;padding:15px 18px;
+ background:linear-gradient(135deg,rgba(139,92,246,.18),rgba(34,211,238,.08));
+ border:1px solid rgba(139,92,246,.32);margin-bottom:16px}
+.xthero b{font-size:14px}
+.xtfail{flex:1;height:10px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;min-width:120px}
+.xtfail i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#22c55e 55%,#f59e0b 78%,#ef4444);transition:width .6s}
+/* ---- sidebar on small screens collapses to a top bar ---- */
+@media(max-width:980px){
+ #app{display:block!important;padding:0 10px 34px}
+ nav.tabs{position:sticky;top:0;z-index:30;height:auto;background:rgba(5,4,12,.92);backdrop-filter:blur(12px);padding:8px 4px}
+ .tabs .seg{flex-direction:row!important;overflow-x:auto;gap:6px}
+ .nav{width:auto;white-space:nowrap;padding:9px 12px!important}
+ main{padding-top:16px!important}
+}
 </style></head><body>
 <div id="aur" aria-hidden="true"><i class="a a1"></i><i class="a a2"></i><i class="a a3"></i><i class="st"></i></div>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
@@ -4230,6 +4290,43 @@ document.addEventListener("click",e=>{const m=e.target.closest(".modal");if(m&&e
 setAc(ACC);setLang(LANG);syncThemeColor();bootStart(0,900);
 api("state").then(()=>{bootGo(1);show(true)}).catch(()=>show(false));
 </script><script>
+/* ---------------- Xtreme layer: Nodes map + Autopilot (v3.1) ---------------- */
+(function(){
+ window.nodeCol=(name,lines,ok)=>'<div class="xtnode '+(ok===false?"bad":ok===true?"ok":"")+'"><b>'+esc(name)+"</b>"+lines.map(l=>"<small>"+l+"</small>").join("")+"</div>";
+ window.nodesMap=()=>{ if(page!=="dash")return; const el=$("p_dash"); if(!el)return;
+  let card=$("xt_nodes");
+  if(!card){card=document.createElement("div");card.className="card";card.id="xt_nodes";card.style.marginBottom="16px";el.insertBefore(card,el.firstChild)}
+  const sys=(window.LAST||{}).sys||{};
+  const cpu=sys.cpu!=null?sys.cpu+"%":"—";
+  const ram=sys.ram_total?Math.round(100*sys.ram_used/sys.ram_total)+"%":"—";
+  const net=(sys.rx!=null?hb(sys.rx)+" ↓ / "+hb(sys.tx)+" ↑":"—");
+  let h='<div class="xtmap">'+nodeCol("🇮🇷 "+TX("ایران — پنل"),["CPU "+cpu+" · RAM "+ram,net],true);
+  const tuns=(window.TUNS||[]);
+  if(!tuns.length)h+='<div class="xtline wait"></div>'+nodeCol(TX("سروری ثبت نشده"),[TX("اول یک تانل بساز یا نود ثبت کن")],null);
+  tuns.forEach(t=>{const ok=t.up===true?true:t.up===false?false:null;
+   h+='<div class="xtline '+(ok?"ok":ok===false?"bad":"wait")+'"></div>';
+   h+=nodeCol((t.engine==="gre"?"⚡ ":"🔒 ")+(t.name||t.ip),
+    [TX("حالت")+" "+(t.engine==="gre"?(t.mode||"gre").toUpperCase():((t.tr||"udp").toUpperCase()))+" · "+(t.type==="rev"?TX("ریورس"):TX("دایرکت")),
+     (ok?TX("متصل")+" · "+(t.age!=null?tage(t.age):"—"):TX(t.pending?"در انتظار اتصال":"قطع"))+
+     (t.spoof?" · 🕶 "+TX("اسپوف"):"")],ok)});
+  h+="</div>";
+  if((window.LAST||{}).perf)h+='<div class="hint" style="margin-top:10px">'+TX("پریست فعال")+": <b>"+((window.LAST.perf.preset)||"default")+"</b></div>";
+  card.innerHTML=h;
+ };
+ const apHero=()=>{const el=$("p_health");if(!el)return;let h=$("xt_ap");
+  if(!h){h=document.createElement("div");h.className="xthero";h.id="xt_ap";el.insertBefore(h,el.firstChild)}
+  const ap=window._apOn;
+  h.innerHTML='<div><b>🤖 '+TX("Autopilot")+'</b><br><small style="color:#9d99b8">'+TX("تانلی که قطع بماند مسیر تست می‌شود و به بهترین ترنسپورتِ در دسترس می‌رود")+'</small></div>'+
+   '<div class="xtfail"><i style="width:'+(ap?100:8)+'%"></i></div>'+
+   '<button class="btn '+(ap?"":"p")+'" id="xt_apb">'+(ap?TX("خاموش‌کردن"):TX("روشن‌کردن"))+"</button>";
+  const b=$("xt_apb");if(b)b.onclick=async()=>{try{await api("autopilot","POST",{on:!ap});window._apOn=!ap;toast(TX("Autopilot")+" "+(ap?TX("خاموش"):TX("روشن")),"s");apHero()}catch(e){toast(e.message,"e")}};
+ };
+ window._xtApLoad=async()=>{try{const r=await api("engines");window._apOn=!!r.autopilot;window._xtNodes=r.nodes||[]}catch(e){}};
+ window._nodesTick=()=>{ if(window._nodesTimer)clearTimeout(window._nodesTimer);
+  _xtApLoad().then(()=>{nodesMap();apHero()});
+  window._nodesTimer=setTimeout(window._nodesTick,15000) };
+ window._nodesTick();
+})();
 /* ---------------- Xtreme layer: Engines tab (Xray + Backhaul) ---------------- */
 (function(){
  const boot=()=>{try{
@@ -4878,6 +4975,127 @@ backhaul_menu() {
     4) read -rp "  Tunnel id: " id; cat "$BH_DIR/$id-server.toml" 2>/dev/null || info "not found";;
   esac
 }
+
+# ------------------------------------------------- Autopilot (Pro-grade) ----
+# Autopilot: when a tunnel stays down for >10 minutes, the path is probed and
+# the tunnel is moved to the best surviving carrier (UDP -> KCP on loss, -> TCP
+# when UDP egress dies, back to UDP when the path heals). One attempt per 30
+# minutes per tunnel. Flag file: /etc/dr-cpanel/autopilot ("on").
+AUTOPILOTF="$CONF_DIR/autopilot"
+
+autopilot_on() { [[ -f $AUTOPILOTF ]] && grep -q on "$AUTOPILOTF" 2>/dev/null; }
+
+udp_probe() { python3 -c "import socket
+q=b'\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01'
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(2)
+try:
+ s.sendto(q,('1.1.1.1',53));s.recvfrom(512);print('ok')
+except Exception: print('no')"; }
+
+autopilot_tick() {   # called from the web monitor every 15 s
+  autopilot_on || return 0
+  [[ -s $TUN ]] || return 0
+  local tids; tids=$(python3 - <<PY 2>/dev/null
+import json, time
+try: st = json.load(open("/etc/dr-cpanel/wgstate.json"))
+except Exception: raise SystemExit
+now = time.time()
+print(" ".join(k for k, v in st.items()
+    if (v.get("down_since") or 0) and now - v["down_since"] > 600 and now - v.get("ap", 0) > 1800))
+PY
+  )
+  [[ -n $tids ]] || return 0
+  local tid
+  for tid in $tids; do
+    local fip; fip=$(awk -F"|" -v i="$tid" '$1==i{print $2}' "$TUN" 2>/dev/null)
+    [[ -n $fip && $fip != pending ]] || continue
+    python3 -c "import json,time;p='/etc/dr-cpanel/wgstate.json';d=json.load(open(p));d.get('$tid',{})['ap']=time.time();json.dump(d,open(p,'w'))" 2>/dev/null
+    local cur; cur=$(tun_transport "$tid" 2>/dev/null); cur=${cur:-udp}
+    local loss; loss=$(ping -c 8 -W 2 -q "$fip" 2>/dev/null | grep -oE "[0-9.]+%" | head -1 | tr -d "%"); loss=${loss:-100}
+    local newtr=""
+    if [[ $(udp_probe) != ok ]]; then newtr=tcp
+    elif awk "BEGIN{exit !($loss > 5)}" 2>/dev/null; then [[ $cur == udp ]] && newtr=kcp
+    elif [[ $cur != udp && $loss == 0 ]]; then newtr=udp
+    fi
+    if [[ -n $newtr && $newtr != $cur ]]; then
+      if tun_transport "$tid" "$newtr" >/dev/null 2>&1; then
+        log "warn" "Autopilot: tunnel #$tid moved $cur -> $newtr (loss ${loss}%)"
+      fi
+    fi
+  done
+  return 0
+}
+
+# --------------------------------------------- SSH tunnel pool (Bagher) ----
+# When only SSH passes, plain ssh -L/-R forwards in a pool of persistent
+# connections (ServerAlive keepalives + ExitOnForwardFailure + auto restart).
+SSHP_DIR="$CONF_DIR/sshpool"
+
+sshpool_add() {   # id host sshport user keypath forwards("L:h:p;R:h:p")
+  local id=$1 host=$2 sport=$3 user=$4 key=$5 fwd=$6 fargs="" f
+  mkdir -p "$SSHP_DIR"; chmod 700 "$SSHP_DIR" 2>/dev/null
+  local IFS=";"
+  for f in $fwd; do
+    f=$(trim "$f"); [[ -z $f ]] && continue
+    case $f in
+      L:*) f=${f#L:}; fargs+=" -L $f";;
+      R:*) f=${f#R:}; fargs+=" -R $f";;
+      *) echo "error: forward spec must start with L: or R:" >&2; return 1;;
+    esac
+  done
+  unset IFS
+  [[ -n $fargs ]] || { echo "error: no forwards given" >&2; return 1; }
+  [[ -r $key ]] || { echo "error: key file not readable: $key" >&2; return 1; }
+  cat > "$SSHP_DIR/$id.env" <<EOF
+HOST=$host
+SPORT=$sport
+USER=$user
+KEY=$key
+FWD="$fargs"
+EOF
+  cat > "$BH_UNIT_DIR/dr-ssh-$id.service" <<EOF
+[Unit]
+Description=DR-CPanel SSH tunnel pool #$id ($user@$host)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -i $key -p $sport $user@$host $fargs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now "dr-ssh-$id" >/dev/null 2>&1
+  systemctl is-active --quiet "dr-ssh-$id" && ok "SSH pool #$id running." || warn "Service started with issues - check: journalctl -u dr-ssh-$id -n 10"
+}
+
+sshpool_del() { systemctl disable --now "dr-ssh-$1" >/dev/null 2>&1; rm -f "$BH_UNIT_DIR/dr-ssh-$1.service" "$SSHP_DIR/$1.env"; systemctl daemon-reload >/dev/null 2>&1; ok "Removed."; }
+
+sshpool_status() {
+  local u id
+  for u in "$BH_UNIT_DIR"/dr-ssh-*.service; do
+    [[ -e $u ]] || continue
+    id=$(basename "$u" .service); id=${id#dr-ssh-}
+    info "ssh #$id: $(systemctl is-active "dr-ssh-$id" 2>/dev/null)"
+  done
+  return 0
+}
+
+# ---------------------------------------------------- Cluster node registry ----
+# A light registry of the other servers (kharej or a second Iran): the nodes
+# show up live (ping) in the panel's Nodes map. Rows: name|ip|note
+NODESF="$CONF_DIR/nodes.conf"
+
+node_add() { local n=$(trim "$1") ip=$2 note=$(trim "${3:-}")
+  [[ $n =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: invalid node name" >&2; return 1; }
+  valid_ip "$ip" || { echo "error: invalid IP" >&2; return 1; }
+  sed -i "/^$n|/d" "$NODESF" 2>/dev/null
+  echo "$n|$ip|$note" >> "$NODESF" && ok "Node $n ($ip) registered."
+}
+node_del() { sed -i "/^$(trim "$1")|/d" "$NODESF" 2>/dev/null && ok "Removed."; }
+node_list() { [[ -s $NODESF ]] && cat "$NODESF" || info "No nodes registered."; }
 
 # ---------------------------------------------------------- operations ----
 
@@ -5974,17 +6192,54 @@ gre_actions() {   # per-GRE-tunnel management
   done
 }
 
+sshpool_menu() {
+  local c id host sport user key fwd
+  banner; echo "  ${C_BLD}SSH Tunnel Pool (Bagher)${C_RST}"; echo
+  sshpool_status
+  echo
+   echo "   1) Add an SSH tunnel    (key auth; forwards L:h:p;R:h:p)"
+   echo "   2) Remove an SSH tunnel"
+   echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) read -rp "  Tunnel name: " id; read -rp "  SSH host: " host; read -rp "  SSH port [22]: " sport; sport=${sport:-22}
+       read -rp "  User: " user; read -rp "  Key path [/root/.ssh/id_rsa]: " key; key=${key:-/root/.ssh/id_rsa}
+       read -rp "  Forwards (L:8443:127.0.0.1:8443;R:2222:127.0.0.1:22): " fwd
+       sshpool_add "$id" "$host" "$sport" "$user" "$key" "$fwd";;
+    2) read -rp "  Tunnel name: " id; sshpool_del "$id";;
+  esac
+}
+
+nodes_menu() {
+  local c n ip note
+  banner; echo "  ${C_BLD}Cluster Nodes${C_RST}"; echo
+  node_list
+  echo
+   echo "   1) Register a node     (shows live in the panel's Nodes map)"
+   echo "   2) Remove a node"
+   echo "   0) Back"; echo
+  read -rp "  Select: " c; echo
+  case $c in
+    1) read -rp "  Node name: " n; read -rp "  IP: " ip; read -rp "  Note (optional): " note; node_add "$n" "$ip" "$note";;
+    2) read -rp "  Node name: " n; node_del "$n";;
+  esac
+}
+
 engines_menu() {
   local c
   while true; do
     banner; echo "  ${C_BLD}Engines${C_RST}"; echo
     echo "   1) Xray                 VLESS + Reality inbounds"
     echo "   2) Backhaul             reverse-tunnel engine"
+    echo "   3) SSH Pool (Bagher)    forwards over persistent SSH"
+    echo "   4) Cluster Nodes        register nodes for the map + autopilot"
     echo "   0) Back"; echo
     read -rp "  Select: " c || return 0; echo
     case $c in
       1) xray_menu;;
       2) backhaul_menu;;
+      3) sshpool_menu;;
+      4) nodes_menu;;
       0) return 0;;
     esac
   done
@@ -6168,6 +6423,24 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     ctest-close) ctest_close;;
     ctest-daemon) shift; ctest_daemon "$@";;
     web-reload) web_write_files; dns_apply >/dev/null 2>&1 || true; systemctl restart dr-cpanel-web 2>/dev/null; ok "Web panel files regenerated from v$VERSION.";;
+    autopilot-tick) autopilot_tick;;
+    autopilot) shift; case "${1:-}" in
+         on) echo on > "$AUTOPILOTF" && ok "Autopilot ON - down tunnels get path-tested and moved.";;
+         off) echo off > "$AUTOPILOTF" && ok "Autopilot OFF.";;
+         *) autopilot_on && info "Autopilot: ON" || info "Autopilot: OFF";;
+       esac;;
+    sshpool) shift; case "${1:-}" in
+         add) shift; sshpool_add "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}";;
+         del) shift; sshpool_del "${1:-}";;
+         status) sshpool_status;;
+         *) info "Usage: dr-cpanel sshpool add ID HOST SSHPORT USER KEYPATH FWD[L:h:p;R:h:p] | del ID | status";;
+       esac;;
+    node) shift; case "${1:-}" in
+         add) shift; node_add "${1:-}" "${2:-}" "${3:-}";;
+         del) shift; node_del "${1:-}";;
+         list) node_list;;
+         *) node_list;;
+       esac;;
     xray) shift; case "${1:-}" in
          install) xray_install;;
          add) shift; xray_add "${1:-}" "${2:-}";;
