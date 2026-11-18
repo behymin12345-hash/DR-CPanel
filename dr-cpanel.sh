@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DR-CPanel - menu-driven port-forward tunnel manager (iptables DNAT) + web panel
-# v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
+# v2.10.0: native GRE tunnels - a new L3 tunnel family alongside WireGuard, built on the kernel's ip_gre/fou: two modes (raw GRE over IP protocol 47, or GRE over UDP via FOU for UDP-only paths), reverse tunnels with the same one-line join link flow (GRE links are static, so the Iran-side link is built the moment the kharej fetches its join link) and direct tunnels, per-tunnel presets, auto-MTU probe over the GRE path, MSS clamping, a GRE tunnel watchdog that rebuilds dead links, its own Manage > GRE Tunnels menu with the full per-tunnel action set, CLI 'dr-cpanel tunnel gre ...', web panel wizard types GRE reverse/direct with a GRE/FOU mode picker, merged tunnel table with GRE rows and a FOU/GRE mode switch, /join/<token> and link/script endpoints serving GRE tunnels, gretunnels.conf included in backups/restore and uninstall cleanup, doctor now checks GRE kernel support; WARNING: GRE is a plain L3 tunnel - fast but NOT encrypted, WireGuard transports stay the choice for sensitive traffic; v2.9.3: carried-transport direction fixes - the classic Foreign Script (tun_script) for a REVERSE tunnel with a non-UDP transport (tcp/ws/wss/kcp/quic) now builds a gost CLIENT on the kharej that dials the Iran carrier port, and the kharej WireGuard Endpoint becomes the local gost feed 127.0.0.1:<30000+id*37> (it wrongly built a gost server + a dead direct Endpoint before); the one-line join link (tun_script_join) for a DIRECT/FORWARD tunnel with a non-UDP transport now builds a gost SERVER on the kharej and leaves WG passive (it wrongly built a client dialing itself before) - so every direction x transport combination now gets the right carrier on both sides; fixed 'dr-cpanel conntest' crashing with NameError (time was not imported); auto-MTU now waits (up to 40 s) for the handshake to come back after bouncing the interface so an immediate re-activate no longer fails with "no handshake yet"; doctor no longer false-alarms "wireguard kernel module FAILED" on kernels with built-in WireGuard; uninstall now also removes the filter INPUT DRC_IN chain; web backend hardening - the HTTP listen backlog raised from 5 to 128 and a self-watchdog thread now probes the local panel port every minute and exits (systemd restarts within 3 s) if the accept loop ever freezes again; v2.9.2: all tunnels in ONE place (web: single Tunnels tab, Transport tab removed, link test moved under Connection test; CLI: Manage > Tunnels lists tunnels + port forwards together, Forward is the third Setup Iran direction, menu item 11 removed); brand mentions removed; v2.9.1: the CLI menu rebuilt 1:1 after BackPack - 0) Connection Test (Iran prints one test link, kharej pastes it, real ICMP+TCP+UDP table on both sides), 1) Setup Iran and 2) Setup Kharej ask the Direction first (Reverse = kharej dials Iran, Direct = Iran dials kharej) then run BackPack's exact wizard (transport family -> variant, IP, tunnel port, forwarded ports e.g. 443, 8080=2096 served through the tunnel, name, per-tunnel preset "How Should The Tunnel Be Tuned?", summary -> Create This Tunnel), one-line join link for BOTH directions (script-join now serves direct tunnels too), 3) Manage (per-tunnel Start/Stop/Restart/Setup Link/Foreign Script/Transport/Preset/Auto-MTU/Route/Live Log/Delete + forward ports + reverse forwards + status + security), 7) Telegram Bot menu, 8) Update menu with rollback, 11) Forward Port as our one extra top-level item, new 'dr-cpanel doctor'; fixed: tunnel creation is no longer buried under the transport menu and Setup Iran -> Reverse -> Create works end to end; v2.9.0: per-tunnel transports like BackPack (UDP / TCP / WebSocket / WSS / KCP / QUIC - gost v3 carries the WireGuard packets, sha256-verified install, transport switchable per tunnel from the panel and CLI), Setup Kharej in the same script (dr-cpanel join '<link>' + menu item 13 - the same file now sets up BOTH servers), two-server connection test (panel builds a test link; running it on the kharej measures real ICMP + TCP-echo + UDP-echo between the two servers, prints the table on both sides and recommends a transport), BackPack-style tunnel wizard in the web panel (Type: Reverse/Direct -> Tunnel -> Performance -> Optional -> Done, per-tunnel performance preset picked at create), join one-liner (bash <(curl .../join/<token>) run once on the kharej server establishes the tunnel; reverse tunnels need no foreign IP at all), Reverse/Direct tunnel types (who dials whom), new Connection-test page (latency/jitter/loss to public resolvers + Cloudflare download speed + per-tunnel link test + MTU probe + preset recommendation, also available as "dr-cpanel conntest"), reverse forwards (ports on the foreign server reach services on the Iran server through the tunnel, script regenerated for the foreign side), BackPack-style link test (12 TCP probes + UDP egress check + preset recommendation); v2.8.0: performance presets (Balanced/Turbo/Throughput/Gaming + conntrack), auto MTU (ping -M do), tunnel watchdog with auto-heal + downtime stats, Telegram bot (/status /traffic /report) + daily report + nightly backup, periodic quotas (day/week/month) + expiry dates, TOTP 2FA + recovery codes, audit log, 24h traffic chart, iperf3 bandwidth test, sub-page chart + days left, offline package + rollback; v2.7.0: web panel redesigned - galaxy neon lighting (aurora + stars), sliding tab indicator, animated counters, tunnel search, click-to-copy destination, GitHub/Telegram footer; fixed: UDP-port input ignored on tunnel create, tunnel-table click loss every 3 s, session-expired toast; v2.6.0: WireGuard encrypted transport, transport test, grouped tunnels, tunnel security; v2.4.2: web panel accepts several listen ports at once (8899,2044); v2.4.1: added "dr-cpanel update" command; v2.4.0: FA/EN language switch, accent colors, animated loading screen; v2.3.0: new web panel UI (dark, tab bar, segmented meters, effects); v2.2.1: fixed login typing bug
 # v2.2: per-forward traffic quota, user usage link (/sub/<token>), domain + HTTPS
 # Run this on the Iran server. Users connect to it, traffic is forwarded
 # to the foreign node. Nothing is needed on the foreign server.
@@ -10,7 +10,7 @@
 
 set -u
 
-VERSION="2.9.3"
+VERSION="2.10.0"
 CONF_DIR="/etc/dr-cpanel"
 SEC="$CONF_DIR/security.conf"         # lines: listen_port|allowed_ips(comma, CIDR ok)|max_conn_per_ip|new_conn_per_min_per_ip
 TUN="$CONF_DIR/tunnels.conf"      # id|foreign_ip|udp_port|mtu|iran_priv|foreign_priv|iran_pub|foreign_pub|active|preset|type|join_token|name|token_expiry|transport|carrier_port
@@ -510,6 +510,434 @@ tun_sync() {   # rebuild interfaces from tunnels.conf (after a restore)
   apply_rules
 }
 
+# ------------------------------------------------------------- GRE tunnels ----
+# GRE = plain IP-in-IP (kernel) L3 tunnel: very fast, NO encryption. Two modes:
+#   gre  raw GRE over IP protocol 47 (needs proto-47 to pass the path)
+#   fou  GRE inside a UDP datagram (Foo-over-UDP) - survives UDP-only paths;
+#        the LISTENING side registers `ip fou add port P ipproto 47`, the
+#        DIALING side builds its link with encap fou / encap-dport P.
+# Rows in gretunnels.conf: id|foreign_ip|port|mode|key|mtu|active|preset|type|join_token|name
+# Inner addresses: 10.67.<id>.1 (this server) <-> 10.67.<id>.2 (foreign), interface drgre<id>.
+# GRE links are STATIC (both endpoint IPs fixed, no handshake like WireGuard):
+# a "rev" tunnel therefore has no listening state - the link is created on THIS
+# side the moment the kharej fetches its join link (the web backend runs
+# gre_join_setip, which calls gre_up), and gre_sync rebuilds every link after a
+# reboot. Forwards can target 10.67.<id>.2 directly from the wizards.
+GRE="$CONF_DIR/gretunnels.conf"
+
+gre_row()     { [[ -s $GRE ]] && awk -F'|' -v k="$1" '$2==k||$1==k{print;exit}' "$GRE"; }   # matches the foreign IP or the tunnel id
+gre_peer()    { echo "10.67.$1.2"; }
+gre_port_ok() { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+gre_mode_ok() { [[ $1 == gre || $1 == fou ]]; }
+gre_src_ip()  {   # best local source address toward a peer (fall back to the public IP)
+  local s; s=$(ip -4 route get "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  [[ $s =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || s=$(web_pubip 2>/dev/null || true)
+  echo "$s"
+}
+
+gre_need_kmod() {   # load ip_gre/fou and prove the kernel can actually build a GRE link
+  modprobe ip_gre 2>/dev/null || true; modprobe fou 2>/dev/null; modprobe ip_fou 2>/dev/null || true
+  if ip link add drgrechk type gre local 127.0.0.1 remote 127.0.0.2 2>/dev/null; then
+    ip link del drgrechk 2>/dev/null; return 0
+  fi
+  echo "error: this kernel has no GRE support (ip_gre module)" >&2; return 1
+}
+
+gre_fou_port_add() {   # port [local_ip] : register the FOU demux port on the LISTENING side
+  local port=$1 lip=${2:-}
+  ip fou add port "$port" ipproto 47 ${lip:+local "$lip"} 2>/dev/null || true
+  iptables -I INPUT -p udp --dport "$port" -m comment --comment "drc-gre-fou" -j ACCEPT 2>/dev/null || true
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then ufw allow "$port/udp" >/dev/null 2>&1 || true; fi
+}
+
+gre_fou_port_del() {   # port : remove the FOU demux port and its firewall rule
+  ip fou del port "$1" ipproto 47 2>/dev/null || true
+  local n=0
+  while iptables -D INPUT -p udp --dport "$1" -m comment --comment "drc-gre-fou" -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done
+}
+
+gre_up() {   # id : (re)create drgre<id> on THIS side; rev tunnels need a resolved foreign IP first
+  local r id fip port mode key mtu ty a; r=$(gre_row "$1"); [[ -n $r ]] || return 1
+  IFS='|' read -r id fip port mode key mtu a _ ty _ <<< "$r"
+  mode=${mode:-gre}; [[ $mode == fou ]] || port=0
+  ty=${ty:-dir}
+  if [[ $fip == pending ]]; then   # rev, kharej not joined yet: only the FOU listener can be prepared
+    [[ $mode == fou ]] && gre_fou_port_add "$port" ""
+    return 0
+  fi
+  gre_need_kmod || return 1
+  local src; src=$(gre_src_ip "$fip"); [[ -n $src ]] || { echo "error: no source address for $fip" >&2; return 1; }
+  ip link del "drgre$id" 2>/dev/null || true
+  # FOU is symmetric UDP: BOTH sides register a fou port and BOTH links carry the
+  # encap. The row's $port belongs to the LISTENING side; the dialing side uses
+  # the derived port $port+1, so each peer sends to the other one's port.
+  local encap=""
+  if [[ $mode == fou ]]; then
+    if [[ $ty == rev ]]; then   # this side listens on $port; replies ride the kharej's derived port
+      gre_fou_port_add "$port" ""
+      encap="encap fou encap-sport auto encap-dport $((port + 1)) encap-csum"
+    else                        # this side dials the kharej listener on $port; replies ride $port+1 here
+      gre_fou_port_add "$((port + 1))" "$src"
+      encap="encap fou encap-sport auto encap-dport $port encap-csum"
+    fi
+  fi
+  ip link add "drgre$id" type gre local "$src" remote "$fip" key "$key" $encap \
+    || { echo "error: could not create the GRE link (mode $mode)" >&2; return 1; }
+  (( mtu >= 1200 && mtu <= 1500 )) || mtu=1380
+  ip link set dev "drgre$id" mtu "$mtu"
+  ip addr add "10.67.$id.1/30" dev "drgre$id" 2>/dev/null || true
+  ip link set dev "drgre$id" up
+  iptables -I INPUT -p gre -m comment --comment "drc-gre$id" -j ACCEPT 2>/dev/null || true
+  sysctl -q -w "net.ipv4.conf.drgre$id.route_localnet=1" >/dev/null 2>&1 || true
+  return 0
+}
+
+gre_down() {   # id : remove the interface, the FOU port and the firewall rules of THIS side
+  local r id fip port mode; r=$(gre_row "$1"); [[ -n $r ]] || return 0
+  IFS='|' read -r id fip port mode _ <<< "$r"
+  mode=${mode:-gre}; [[ $mode == fou ]] || port=0
+  ip link del "drgre$id" 2>/dev/null || true
+  [[ $mode == fou && $port != 0 ]] && { gre_fou_port_del "$port"; gre_fou_port_del "$((port + 1))"; }
+  local n=0
+  while iptables -D INPUT -p gre -m comment --comment "drc-gre$id" -j ACCEPT 2>/dev/null; do (( ++n > 50 )) && break; done
+  return 0
+}
+
+gre_add() {   # foreign_ip [port] [mode] [key] [mtu] [preset] [name] : DIRECT GRE (this server dials out)
+  local fip=$1 port=${2:-0} mode=${3:-gre} key=${4:-} mtu=${5:-0} preset=${6:-} name=${7:-} id=1
+  valid_ip "$fip" || { echo "error: invalid IP" >&2; return 1; }
+  [[ $fip == 10.67.* || $fip == 10.66.* ]] && { echo "error: the foreign IP is inside a tunnel range" >&2; return 1; }
+  gre_mode_ok "$mode" || { echo "error: invalid mode (gre|fou)" >&2; return 1; }
+  if [[ $mode == fou ]]; then gre_port_ok "$port" || { echo "error: invalid FOU UDP port" >&2; return 1; }
+  else port=0; fi
+  [[ $key =~ ^[0-9]+$ ]] || key=$(( (RANDOM * 32768 + RANDOM) % 900000 + 100000 ))   # 6-digit GRE key
+  [[ $mtu =~ ^[0-9]+$ ]] && (( mtu == 0 || (mtu >= 1200 && mtu <= 1500) )) || { echo "error: invalid MTU" >&2; return 1; }
+  [[ -z $preset || $preset =~ ^(balanced|turbo|throughput|gaming)$ ]] || { echo "error: invalid preset" >&2; return 1; }
+  name=$(printf '%s' "$name" | sed 's/[^A-Za-z0-9._-]/_/g' | cut -c1-40)
+  [[ -n $(gre_row "$fip") ]] && { echo "error: a GRE tunnel to $fip already exists" >&2; return 1; }
+  [[ $mode == fou ]] && awk -F"|" -v p="$port" '$3==p && $4=="fou"{f=1} END{exit !f}' "$GRE" 2>/dev/null \
+    && { echo "error: another GRE tunnel already uses UDP port $port" >&2; return 1; }
+  gre_need_kmod || return 1
+  while [[ -s $GRE ]] && cut -d'|' -f1 "$GRE" | grep -qx "$id"; do id=$((id + 1)); done
+  (( id <= 200 )) || { echo "error: too many GRE tunnels" >&2; return 1; }
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  ( umask 077; echo "$id|$fip|$port|$mode|$key|$mtu|0|$preset|dir||$name" >> "$GRE" )
+  gre_up "$id" || { gre_down "$id"; sed -i "/^$id|/d" "$GRE"; echo "error: could not create the GRE interface" >&2; return 1; }
+  echo "$id"
+}
+
+gre_add_rev() {   # [port] [mode] [preset] [name] : PENDING REVERSE GRE - the kharej joins with the one-line link
+  local port=${1:-5555} mode=${2:-fou} preset=${3:-turbo} name=${4:-} id=1 key tok
+  gre_mode_ok "$mode" || { echo "error: invalid mode (gre|fou)" >&2; return 1; }
+  if [[ $mode == fou ]]; then gre_port_ok "$port" || { echo "error: invalid FOU UDP port" >&2; return 1; }
+  else port=0; fi
+  [[ -z $preset || $preset =~ ^(balanced|turbo|throughput|gaming)$ ]] || { echo "error: invalid preset" >&2; return 1; }
+  awk -F"|" -v p="$port" '$3==p && $4=="fou"{f=1} END{exit !f}' "$GRE" 2>/dev/null \
+    && { echo "error: another GRE tunnel already uses UDP port $port" >&2; return 1; }
+  name=$(printf '%s' "$name" | sed 's/[^A-Za-z0-9._-]/_/g' | cut -c1-40)
+  gre_need_kmod || return 1
+  while [[ -s $GRE ]] && cut -d'|' -f1 "$GRE" | grep -qx "$id"; do id=$((id + 1)); done
+  (( id <= 200 )) || { echo "error: too many GRE tunnels" >&2; return 1; }
+  key=$(( (RANDOM * 32768 + RANDOM) % 900000 + 100000 ))
+  tok=$(tun_token); [[ ${#tok} -ge 16 ]] || { echo "error: no entropy for the join token" >&2; return 1; }
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  ( umask 077; echo "$id|pending|$port|$mode|$key|0|0|${preset:-turbo}|rev|$tok|$name" >> "$GRE" )
+  gre_up "$id"   # prepares the FOU listener now; the link itself is built when the kharej joins
+  echo "$tok"
+}
+
+gre_join_setip() {   # token client_ip : a kharej fetched its join link - resolve the pending GRE tunnel and build the link
+  local tok=$1 cip=$2 r id
+  [[ $tok =~ ^[0-9a-f]{16,64}$ ]] || { echo "error: bad token" >&2; return 1; }
+  valid_ip "$cip" || { echo "error: bad IP" >&2; return 1; }
+  [[ -s $GRE ]] || { echo "error: unknown or expired link" >&2; return 1; }
+  r=$(awk -F'|' -v t="$tok" '$10==t{print;exit}' "$GRE")
+  [[ -n $r ]] || { echo "error: unknown or expired link" >&2; return 1; }
+  id=${r%%|*}
+  if [[ $(cut -d'|' -f2 <<< "$r") == pending ]]; then
+    awk -F'|' -v OFS='|' -v i="$id" -v v="$cip" '$1==i{$2=v}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+    gre_up "$id" || true   # GRE is static: build THIS side's link now that the kharej IP is known
+  fi
+  echo "$id"
+}
+
+gre_mode_switch() {   # ip-or-id [gre|fou] [port] : rebuild the tunnel in another mode
+  local r id mode port; r=$(gre_row "$1"); [[ -n $r ]] || { echo "error: no GRE tunnel for $1" >&2; return 1; }
+  id=${r%%|*}; mode=$(cut -d'|' -f4 <<< "$r"); port=$(cut -d'|' -f3 <<< "$r")
+  if [[ -z ${2:-} ]]; then echo "$mode"; return 0; fi
+  gre_mode_ok "$2" || { echo "error: invalid mode (gre|fou)" >&2; return 1; }
+  if [[ $2 == fou ]]; then
+    port=${3:-$port}
+    [[ $port == 0 || -z $port ]] && { read -rp "  FOU UDP port on the listening side [5555]: " port; port=${port:-5555}; }
+    gre_port_ok "$port" || { echo "error: invalid FOU UDP port" >&2; return 1; }
+    awk -F"|" -v p="$port" -v i="$id" '$3==p && $4=="fou" && $1!=i{f=1} END{exit !f}' "$GRE" 2>/dev/null \
+      && { echo "error: another GRE tunnel already uses UDP port $port" >&2; return 1; }
+  else
+    port=0
+  fi
+  local oldmode=$mode oldport=$port
+  awk -F'|' -v OFS='|' -v i="$id" -v m="$2" -v p="$port" '$1==i{$3=p;$4=m}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+  [[ $oldmode == fou && $oldport != 0 ]] && { gre_fou_port_del "$oldport"; gre_fou_port_del "$((oldport + 1))"; }
+  gre_up "$id"   # builds the new encap / re-registers the new FOU ports
+  echo "$2"
+}
+
+gre_automtu() {   # ip-or-id : find the largest inner MTU the GRE path passes, save it and apply
+  local r id best=0 lo=1200 hi=1500 mid; r=$(gre_row "$1"); [[ -n $r ]] || return 1
+  id=${r%%|*}
+  ip link show "drgre$id" >/dev/null 2>&1 || return 1
+  ping -c 2 -W 2 "10.67.$id.2" >/dev/null 2>&1 || return 1   # needs a live peer
+  while (( lo <= hi )); do
+    mid=$(( (lo + hi) / 2 ))
+    if ping -M do -s $((mid - 28)) -c1 -W1 "10.67.$id.2" >/dev/null 2>&1; then best=$mid; lo=$((mid + 1)); else hi=$((mid - 1)); fi
+  done
+  (( best >= 1200 )) || return 1
+  awk -F'|' -v OFS='|' -v i="$id" -v m="$best" '$1==i{$6=m}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+  ip link set dev "drgre$id" mtu "$best" 2>/dev/null || true
+  echo "$best"
+}
+
+gre_use() {   # ip-or-id 1|0 : 1 = build/keep the link (+auto MTU + preset), 0 = tear it down
+  local r id; r=$(gre_row "$1"); [[ -n $r ]] || { echo "error: no GRE tunnel for $1" >&2; return 1; }
+  id=${r%%|*}
+  if [[ $2 == 1 ]]; then
+    [[ $(cut -d'|' -f2 <<< "$r") == pending ]] && { echo "error: the kharej has not joined yet (no foreign IP)" >&2; return 1; }
+    gre_up "$id" || return 1
+    local t0; t0=$(date +%s)
+    while ! ping -c 1 -W 2 "10.67.$id.2" >/dev/null 2>&1; do
+      (( $(date +%s) - t0 > 30 )) && { echo "error: the GRE peer does not answer (check the kharej side)" >&2; return 1; }
+      sleep 2
+    done
+    awk -F'|' -v OFS='|' -v i="$id" '$1==i{$7=1}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+    local pr; pr=$(cut -d'|' -f8 <<< "$r")
+    [[ $pr =~ ^(balanced|turbo|throughput|gaming)$ ]] && perf_apply "$pr" >/dev/null 2>&1 || true
+    if [[ $(cut -d'|' -f6 <<< "$r") == 0 ]]; then gre_automtu "$id" >/dev/null 2>&1 || true; fi   # MTU "auto"
+  else
+    gre_down "$id"
+    awk -F'|' -v OFS='|' -v i="$id" '$1==i{$7=0}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+  fi
+  return 0
+}
+
+gre_del() {   # ip-or-id
+  local r id fip; r=$(gre_row "$1"); [[ -n $r ]] || { echo "error: no GRE tunnel for $1" >&2; return 1; }
+  id=${r%%|*}; fip=$(cut -d'|' -f2 <<< "$r")
+  gre_down "$id"
+  sed -i "/^$id|/d" "$GRE"
+  [[ -s $REV ]] && sed -i "/^$fip|/d" "$REV"   # drop this tunnel's reverse forwards too
+  rm -f "$CONF_DIR/gre-restart-$id"
+  echo "deleted"
+}
+
+gre_sync() {   # rebuild every GRE link from gretunnels.conf (after a reboot / restore)
+  [[ -s $GRE ]] || return 0
+  gre_need_kmod >/dev/null 2>&1 || return 1
+  local id fip mode port ty
+  while IFS='|' read -r id fip port mode _ _ _ _ ty _; do
+    [[ -z $id ]] && continue
+    mode=${mode:-gre}
+    if [[ $ty == rev && $fip == pending ]]; then
+      [[ $mode == fou ]] && gre_fou_port_add "$port" ""
+      continue
+    fi
+    gre_up "$id" >/dev/null 2>&1 || true
+  done < "$GRE"
+  return 0
+}
+
+gre_watch() {   # tunnel watchdog for GRE: rebuild missing/dead links of active tunnels (max once per 10 min)
+  [[ -s $GRE ]] || return 0
+  local id fip a statefile last
+  while IFS='|' read -r id fip _ _ _ _ a _ _ _; do
+    [[ -z $id || $a != 1 || $fip == pending ]] && continue
+    if ! ip link show "drgre$id" >/dev/null 2>&1; then gre_up "$id" >/dev/null 2>&1 || true; continue; fi
+    ping -c 1 -W 2 "10.67.$id.2" >/dev/null 2>&1 && continue
+    statefile="$CONF_DIR/gre-restart-$id"
+    last=0; [[ -s $statefile ]] && last=$(<"$statefile")
+    (( $(date +%s) - last > 600 )) || continue
+    echo "$(date +%s)" > "$statefile"
+    log "warn" "GRE tunnel $id: peer does not answer - rebuilding the link"
+    gre_up "$id" >/dev/null 2>&1 || true
+  done < "$GRE"
+  return 0
+}
+
+gre_script() {   # foreign-ip-or-id : the full script to run on the kharej (classic alternative)
+  local r id fip port mode key mtu ty revn=0 revrules="" rf lp dp rp p fwdin="" fwdn=0 fn fp fl fi fd
+  r=$(gre_row "$1"); [[ -n $r ]] || { echo "error: no GRE tunnel for $1" >&2; return 1; }
+  IFS='|' read -r id fip port mode key mtu _ _ ty _ _ <<< "$r"
+  mode=${mode:-gre}; [[ $mode == fou ]] || port=0
+  (( mtu >= 1200 && mtu <= 1500 )) || mtu=1380
+  local myip; myip=$(web_pubip 2>/dev/null || true); [[ -n $myip ]] || myip="IRAN_IP"
+  if [[ -s $REV ]]; then
+    while IFS='|' read -r rf lp dp rp; do
+      [[ $rf == "$fip" ]] || continue
+      for p in $(proto_list "$rp"); do
+        revrules+="iptables -t nat -A DRC_REV -p $p --dport $lp -j DNAT --to-destination 10.67.$id.1:$dp"$'\n'
+      done
+      revn=$((revn + 1))
+    done < "$REV"
+  fi
+  if [[ -s $CONF ]]; then
+    while IFS='|' read -r fn fp fl fi fd; do
+      [[ $fi == "10.67.$id.2" ]] || continue
+      for p in $(proto_list "$fp"); do
+        fwdin+="iptables -t nat -A DRC_REV -i drgre$id -p $p -d 10.67.$id.2 --dport $fd -j DNAT --to-destination 127.0.0.1:$fd"$'\n'
+      done
+      fwdn=$((fwdn + 1))
+    done < "$CONF"
+    [[ -n $fwdin ]] && fwdin=$'sysctl -q -w net.ipv4.conf.drgre'"$id"$'.route_localnet=1 || true\n'"$fwdin"
+  fi
+  local khlisten="" khencap=""
+  if [[ $mode == fou ]]; then   # FOU is symmetric: BOTH sides register a port, BOTH links carry the encap
+    if [[ $ty != rev ]]; then   # direct: kharej listens on $port, replies ride Iran's derived $port+1
+      khlisten="ip fou add port $port ipproto 47 2>/dev/null || true
+iptables -I INPUT -p udp --dport $port -m comment --comment drc-gre-fou -j ACCEPT 2>/dev/null || true"
+      khencap="encap fou encap-sport auto encap-dport $((port + 1)) encap-csum"
+    else                        # rev: kharej dials Iran:$port; its own replies port is the derived $port+1
+      khlisten="ip fou add port $((port + 1)) ipproto 47 2>/dev/null || true
+iptables -I INPUT -p udp --dport $((port + 1)) -m comment --comment drc-gre-fou -j ACCEPT 2>/dev/null || true"
+      khencap="encap fou encap-sport auto encap-dport $port encap-csum"
+    fi
+  else
+    khlisten="# raw GRE: no UDP ports involved"
+  fi
+  cat <<EOS
+# DR-CPanel GRE tunnel: kharej side (mode: $mode, tunnel #$id). Run once, as root.
+set -e
+[ "\$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+command -v ip >/dev/null 2>&1 || { echo "iproute2 is required"; exit 1; }
+sysctl -q -w net.ipv4.ip_forward=1 || true
+modprobe ip_gre 2>/dev/null || true; modprobe fou 2>/dev/null; modprobe ip_fou 2>/dev/null || true
+${khlisten}
+ip link del drgre$id 2>/dev/null || true
+ip link add drgre$id type gre local \$(ip -4 route get $myip 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src"){print \$(i+1); exit}}') remote $myip key $key $khencap
+ip link set dev drgre$id mtu $mtu
+ip addr add 10.67.$id.2/30 dev drgre$id 2>/dev/null || true
+ip link set dev drgre$id up
+iptables -I INPUT -p udp --dport $port -m comment --comment drc-gre-fou -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p gre -m comment --comment drc-gre$id -j ACCEPT 2>/dev/null || true
+command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active" && { ufw allow $port/udp 2>/dev/null || true; ufw allow proto gre 2>/dev/null || true; }
+iptables -t nat    -N DRC_REV     2>/dev/null || true; iptables -t nat    -F DRC_REV
+iptables -t nat    -C PREROUTING  -j DRC_REV 2>/dev/null || iptables -t nat -I PREROUTING 1 -j DRC_REV
+iptables -t nat    -N DRC_REVPOST 2>/dev/null || true; iptables -t nat    -F DRC_REVPOST
+iptables -t nat    -C POSTROUTING -j DRC_REVPOST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j DRC_REVPOST
+iptables -t nat    -A DRC_REVPOST -o drgre$id -j MASQUERADE
+iptables -t filter -N DRC_REVFWD  2>/dev/null || true; iptables -t filter -F DRC_REVFWD
+iptables -t filter -C FORWARD -j DRC_REVFWD 2>/dev/null || iptables -t filter -I FORWARD 1 -j DRC_REVFWD
+iptables -t filter -A DRC_REVFWD -i drgre$id -j ACCEPT
+${revrules}${fwdin}
+sysctl -q -w "net.ipv4.conf.drgre$id.route_localnet=1" || true
+echo "Done. GRE tunnel #$id ($mode) is up - this server: 10.67.$id.2 · reverse forwards: $revn · forwarded ports: $fwdn"
+EOS
+}
+
+gre_script_join() {   # token host client_ip : the one-line join script served at /join/<token> for GRE tunnels
+  local tok=$1 host=$2 cip=$3 r id fip port mode key mtu ty name revn=0 revrules="" rf lp dp rp p fwdin="" fwdn=0 fn fp fl fi fd ephost
+  r=$(awk -F'|' -v t="$tok" '$10==t{print;exit}' "$GRE" 2>/dev/null)
+  [[ -n $r ]] || { echo "error: unknown or expired join link" >&2; return 1; }
+  IFS='|' read -r id fip port mode key mtu _ _ ty _ name <<< "$r"
+  mode=${mode:-gre}; [[ $mode == fou ]] || port=0
+  if [[ $(cut -d'|' -f2 <<< "$r") == pending ]]; then
+    gre_join_setip "$tok" "$cip" >/dev/null || return 1
+    fip=$cip
+  fi
+  ephost=$host
+  [[ $ephost == *:* ]] && [[ ${ephost##*:} =~ ^[0-9]+$ ]] && ephost=${ephost%:*}
+  [[ -n $ephost ]] || ephost=$(web_pubip 2>/dev/null || true)
+  (( mtu >= 1200 && mtu <= 1500 )) || mtu=1380
+  if [[ -s $REV ]]; then
+    while IFS='|' read -r rf lp dp rp; do
+      [[ $rf == "$fip" ]] || continue
+      for p in $(proto_list "$rp"); do
+        revrules+="iptables -t nat -A DRC_REV -p $p --dport $lp -j DNAT --to-destination 10.67.$id.1:$dp"$'\n'
+      done
+      revn=$((revn + 1))
+    done < "$REV"
+  fi
+  if [[ -s $CONF ]]; then
+    while IFS='|' read -r fn fp fl fi fd; do
+      [[ $fi == "10.67.$id.2" ]] || continue
+      for p in $(proto_list "$fp"); do
+        fwdin+="iptables -t nat -A DRC_REV -i drgre$id -p $p -d 10.67.$id.2 --dport $fd -j DNAT --to-destination 127.0.0.1:$fd"$'\n'
+      done
+      fwdn=$((fwdn + 1))
+    done < "$CONF"
+    [[ -n $fwdin ]] && fwdin=$'sysctl -q -w net.ipv4.conf.drgre'"$id"$'.route_localnet=1 || true\n'"$fwdin"
+  fi
+  local khlisten="" khencap=""
+  if [[ $mode == fou ]]; then   # FOU is symmetric: BOTH sides register a port, BOTH links carry the encap
+    if [[ $ty != rev ]]; then   # direct: kharej listens on $port, replies ride Iran's derived $port+1
+      khlisten="ip fou add port $port ipproto 47 2>/dev/null || true
+iptables -I INPUT -p udp --dport $port -m comment --comment drc-gre-fou -j ACCEPT 2>/dev/null || true"
+      khencap="encap fou encap-sport auto encap-dport $((port + 1)) encap-csum"
+    else                        # rev: kharej dials Iran:$port; its own replies port is the derived $port+1
+      khlisten="ip fou add port $((port + 1)) ipproto 47 2>/dev/null || true
+iptables -I INPUT -p udp --dport $((port + 1)) -m comment --comment drc-gre-fou -j ACCEPT 2>/dev/null || true"
+      khencap="encap fou encap-sport auto encap-dport $port encap-csum"
+    fi
+  else
+    khlisten="# raw GRE: no UDP ports involved"
+  fi
+  cat <<EOS
+#!/usr/bin/env bash
+# DR-CPanel GRE join script (tunnel #$id${name:+ "$name"}, type: $ty, mode: $mode). Run once, as root, on the KHAREJ server.
+set -e
+[ "\$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+command -v ip >/dev/null 2>&1 || { echo "iproute2 is required"; exit 1; }
+sysctl -q -w net.ipv4.ip_forward=1 || true
+modprobe ip_gre 2>/dev/null || true; modprobe fou 2>/dev/null; modprobe ip_fou 2>/dev/null || true
+${khlisten}
+ip link del drgre$id 2>/dev/null || true
+ip link add drgre$id type gre local \$(ip -4 route get $ephost 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="src"){print \$(i+1); exit}}') remote $ephost key $key $khencap
+ip link set dev drgre$id mtu $mtu
+ip addr add 10.67.$id.2/30 dev drgre$id 2>/dev/null || true
+ip link set dev drgre$id up
+iptables -I INPUT -p udp --dport $port -m comment --comment drc-gre-fou -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p gre -m comment --comment drc-gre$id -j ACCEPT 2>/dev/null || true
+command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active" && { ufw allow $port/udp 2>/dev/null || true; ufw allow proto gre 2>/dev/null || true; }
+iptables -t nat    -N DRC_REV     2>/dev/null || true; iptables -t nat    -F DRC_REV
+iptables -t nat    -C PREROUTING  -j DRC_REV 2>/dev/null || iptables -t nat -I PREROUTING 1 -j DRC_REV
+iptables -t nat    -N DRC_REVPOST 2>/dev/null || true; iptables -t nat    -F DRC_REVPOST
+iptables -t nat    -C POSTROUTING -j DRC_REVPOST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j DRC_REVPOST
+iptables -t nat    -A DRC_REVPOST -o drgre$id -j MASQUERADE
+iptables -t filter -N DRC_REVFWD  2>/dev/null || true; iptables -t filter -F DRC_REVFWD
+iptables -t filter -C FORWARD -j DRC_REVFWD 2>/dev/null || iptables -t filter -I FORWARD 1 -j DRC_REVFWD
+iptables -t filter -A DRC_REVFWD -i drgre$id -j ACCEPT
+${revrules}${fwdin}
+sysctl -q -w "net.ipv4.conf.drgre$id.route_localnet=1" || true
+echo "Done. GRE tunnel #$id ($mode) joined - this server: 10.67.$id.2 · reverse forwards: $revn · forwarded ports: $fwdn"
+EOS
+}
+
+gre_link() {   # ip-or-id [new_token] : print (or rotate) the join token of a GRE tunnel
+  local r id tok
+  r=$(gre_row "$1"); [[ -n $r ]] || { echo "error: no GRE tunnel for $1" >&2; return 1; }
+  id=${r%%|*}
+  if [[ -n ${2:-} ]]; then
+    awk -F'|' -v OFS='|' -v i="$id" -v v="$2" '$1==i{$10=v}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+    echo "$2"; return 0
+  fi
+  tok=$(cut -d'|' -f10 <<< "$r")
+  if [[ -z $tok ]]; then tok=$(tun_token) && gre_link "$id" "$tok" >/dev/null || return 1; fi
+  echo "$tok"
+}
+
+gre_preset() {   # ip-or-id [preset] : read or set the per-tunnel preset ("none" clears it)
+  local r id cur
+  r=$(gre_row "$1"); [[ -n $r ]] || { echo "error: no GRE tunnel for $1" >&2; return 1; }
+  id=${r%%|*}; cur=$(cut -d'|' -f8 <<< "$r")
+  if [[ -z ${2:-} ]]; then echo "$cur"; return 0; fi
+  if [[ $2 == none ]]; then
+    awk -F'|' -v OFS='|' -v i="$id" -v v="" '$1==i{$8=v}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+    echo ""; return 0
+  fi
+  [[ $2 =~ ^(balanced|turbo|throughput|gaming)$ ]] || { echo "error: invalid preset" >&2; return 1; }
+  awk -F'|' -v OFS='|' -v i="$id" -v v="$2" '$1==i{$8=v}1' "$GRE" > "$GRE.tmp" && cat "$GRE.tmp" > "$GRE"; rm -f "$GRE.tmp"
+  [[ $(cut -d'|' -f7 <<< "$r") == 1 ]] && perf_apply "$2" >/dev/null 2>&1 || true
+  echo "$2"
+}
+
 # ------------------------------------------------------ reverse forwards ----
 # Reverse = the port opens on the FOREIGN server and lands on a service of the
 # IRAN server, through the encrypted tunnel. Needed on both sides: the Iran
@@ -928,6 +1356,22 @@ tunnel_cli() {
                test) rev_test "${3:-}" "${4:-}";;
                *) echo "Usage: $0 reverse add IP LPORT DPORT [proto] | del IP LPORT | list | test IP LPORT"; return 1;;
              esac;;
+    gre)     shift; case "${1:-}" in
+               add)         shift; gre_add "${1:-}" "${2:-0}" "${3:-gre}" "${4:-}" "${5:-0}" "${6:-}" "${7:-}";;
+               join-open)   shift; gre_add_rev "${1:-5555}" "${2:-fou}" "${3:-turbo}" "${4:-}";;
+               link)        gre_link "${2:-}";;
+               script)      gre_script "${2:-}";;
+               script-join) shift; gre_script_join "${1:-}" "${2:-}" "${3:-}";;
+               use)         gre_use "${2:-}" 1;;
+               direct|stop) gre_use "${2:-}" 0;;
+               mode)        shift; gre_mode_switch "${1:-}" "${2:-}" "${3:-}";;
+               mtu)         gre_automtu "${2:-}";;
+               preset)      gre_preset "${2:-}" "${3:-}";;
+               del)         gre_del "${2:-}";;
+               sync)        gre_sync;;
+               watch)       gre_watch;;
+               *) echo "Usage: $0 tunnel gre add IP [FOU_PORT] [gre|fou] [key] [mtu] [preset] [name] | join-open [FOU_PORT] [gre|fou] [preset] [name] | link IP-or-ID | script IP | script-join TOKEN HOST CLIENT_IP | use IP | direct IP | mode IP [gre|fou] [port] | mtu IP | preset IP [name] | del IP | sync"; return 1;;
+             esac;;
     repair)  repair_wg;;
     *) echo "Usage: $0 tunnel add IP [UDP_PORT] [MTU] [preset] [fwd|dir] [name] [transport] | join-open [UDP_PORT] [preset] [name] [transport] | link IP-or-ID | script IP | script-join TOKEN HOST CLIENT_IP | transport IP [udp|tcp|ws|wss|kcp|quic] [carrier_port] | use IP | direct IP | mtu IP | mtuprobe IP | preset IP [name] | reverse add|del|list|test ... | sync | repair"; return 1;;
   esac
@@ -1015,6 +1459,11 @@ apply_rules() {
     while IFS='|' read -r tid _; do
       [[ -n $tid ]] && iptables -t mangle -A DRC_MSS -o "drwg$tid" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     done < "$TUN"
+  fi
+  if [[ -s $GRE ]]; then   # same MSS clamp for GRE tunnel interfaces
+    while IFS='|' read -r tid _; do
+      [[ -n $tid ]] && iptables -t mangle -A DRC_MSS -o "drgre$tid" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    done < "$GRE"
   fi
   # reverse forwards: packets arriving from the foreign side for a service on this (Iran) server.
   # The foreign script DNATs kharej:listen -> 10.66.<id>.1:port; here we steer it to 127.0.0.1
@@ -1292,13 +1741,38 @@ def tunnels():
                 out[key] = dict(id=int(p[0]), ip=("pending" if pend else p[1]), port=int(p[2]), mtu=int(p[3]), active=p[8] == "1",
                                 preset=(p[9] if len(p) > 9 and p[9] in ("balanced", "turbo", "throughput", "gaming") else ""),
                                 type=ty, pending=pend, name=(p[12] if len(p) > 12 else ""), has_link=bool(len(p) > 11 and p[11]),
-                                tr=tr, cport=cp)
+                                tr=tr, cport=cp, engine="wg")
     except (FileNotFoundError, ValueError): pass
     return out
 
-def tun_by(k):   # look a tunnel up by its foreign IP, its id, or its pending-<id> key
-    ts = tunnels()
-    return ts.get(k) or next((t for t in ts.values() if str(t["id"]) == str(k)), None)
+GREF = D + "/gretunnels.conf"
+
+def gretunnels():
+    # rows: id|foreign_ip|port|mode|key|mtu|active|preset|type|join_token|name
+    out = {}
+    try:
+        for l in open(GREF):
+            p = l.rstrip("\n").split("|")
+            if len(p) >= 9:
+                pend = p[1] == "pending"
+                ty = p[8] if len(p) > 8 and p[8] in ("rev", "dir") else "dir"
+                mode = p[3] if len(p) > 3 and p[3] in ("gre", "fou") else "gre"
+                key = ("pending%s" % p[0]) if pend else ("gre%s" % p[0])   # unique: two GRE tunnels may share one kharej IP
+                out[key] = dict(id=int(p[0]), ip=("pending" if pend else p[1]), port=int(p[2] or 0), mtu=int(p[5] or 0), active=p[6] == "1",
+                                preset=(p[7] if len(p) > 7 and p[7] in ("balanced", "turbo", "throughput", "gaming") else ""),
+                                type=ty, pending=pend, name=(p[10] if len(p) > 10 else ""), has_link=bool(len(p) > 9 and p[9]),
+                                engine="gre", mode=mode, tr=mode, cport=0)
+    except (FileNotFoundError, ValueError): pass
+    return out
+
+def tun_by(k):   # look a tunnel up by its foreign IP, its id, or its pending-<id> key (WireGuard or GRE)
+    ts = tunnels(); gt = gretunnels()
+    if k in ts: return ts[k]
+    if k in gt: return gt[k]
+    for m in (ts, gt):
+        f = next((t for t in m.values() if str(t["id"]) == str(k)), None)
+        if f: return f
+    return next((t for t in gt.values() if t["ip"] == k), None)   # GRE rows are keyed gre<id>, so scan by IP too
 
 REVF = D + "/reverse.conf"
 
@@ -1311,7 +1785,7 @@ def rev_rows():
     except (FileNotFoundError, ValueError): pass
     return out
 
-def peer(t): return "10.66.%d.2" % t["id"]
+def peer(t): return ("10.67.%d.2" if t.get("engine") == "gre" else "10.66.%d.2") % t["id"]
 
 def eff_ip(ip):   # where traffic for this foreign IP really goes (the tunnel address when the tunnel is switched on)
     t = tunnels().get(ip)
@@ -1320,12 +1794,18 @@ def eff_ip(ip):   # where traffic for this foreign IP really goes (the tunnel ad
 def tunnel_info():
     now = time.time(); out = []
     for t in tunnels().values():
-        d = dict(t, up=False, age=None, rx=0, tx=0, peer=peer(t))
+        d = dict(t, up=False, age=None, rx=0, tx=0, peer=peer(t), engine="wg")
         try:
             ln = subprocess.run(["wg", "show", "drwg%d" % t["id"], "dump"], capture_output=True, text=True, timeout=5).stdout.splitlines()
             if len(ln) > 1:
                 f = ln[1].split("\t"); hs = int(f[4]); d.update(rx=int(f[5]), tx=int(f[6]))
                 if hs: d.update(age=int(now - hs), up=now - hs < 240)
+        except Exception: pass
+        out.append(d)
+    for t in gretunnels().values():
+        d = dict(t, up=False, age=None, rx=0, tx=0, peer=peer(t), engine="gre")
+        try:   # GRE has no handshake: the link is up when the drgre interface exists
+            if os.path.exists("/sys/class/net/drgre%d" % t["id"]): d["up"] = True
         except Exception: pass
         out.append(d)
     return out
@@ -1551,9 +2031,11 @@ def conntest_run():
     for t in tunnel_info():
         e = dict(id=t["id"], ip=t["ip"], name=t.get("name", ""), up=t["up"], type=t.get("type", "fwd"), active=t["active"])
         if t["up"]:
-            e.update(ping_stats("10.66.%d.2" % t["id"]) or {"ok": False})
-            try: e["mtu"] = int(tun_cmd("mtuprobe", str(t["id"]), t=150).strip() or 0) or None
-            except Exception: e["mtu"] = None
+            e.update(ping_stats(t["peer"]) or {"ok": False})
+            if t.get("engine") == "wg":   # GRE rows have no WG dump; their MTU comes from the saved value
+                try: e["mtu"] = int(tun_cmd("mtuprobe", str(t["id"]), t=150).strip() or 0) or None
+                except Exception: e["mtu"] = None
+            else: e["mtu"] = t.get("mtu") or None
         res["tunnels"].append(e)
     # the BackPack-style banner: best method, its numbers, and the preset to go with it
     tun = next((x for x in res["tunnels"] if x.get("up") and x.get("ok")), None)
@@ -1694,6 +2176,8 @@ def monitor():
             watchdog()
             try: wg_watch()
             except Exception as e: log("warn", "wg_watch error: %s" % type(e).__name__)
+            try: subprocess.run([BIN, "tunnel", "gre", "watch"], timeout=90)
+            except Exception: pass
             try: traffic_tick()
             except Exception: pass
             try: tg_daily_jobs()
@@ -1857,7 +2341,13 @@ def tg_bot():
 
 # ------------------------------------------------------------ views / ops
 def state():
-    c = counters(); rs = []; qd = jload(QUOTA); sb = jload(SUBF); bk = blocked(); sec = sec_read(); tun = tunnels()
+    c = counters(); rs = []; qd = jload(QUOTA); sb = jload(SUBF); bk = blocked(); sec = sec_read()
+    tun = dict(tunnels()); tun.update(gretunnels())
+    encmap = {}
+    for t in tun.values():
+        encmap[t["ip"]] = t
+        try: encmap[peer(t)] = t
+        except Exception: pass
     for r in read_rules():
         pk = by = 0
         for p in (["tcp", "udp"] if r["proto"] == "both" else [r["proto"]]):
@@ -1866,7 +2356,7 @@ def state():
         st = "unknown" if not h or h["ok"] is None else ("up" if h["ok"] else "down")
         e = qd.get(str(r["lport"]), {}); by = int(e.get("used", by))
         expired = bool(e.get("expires")) and time.time() > exp_ts(e["expires"])
-        rs.append(dict(r, packets=pk, bytes=by, limit=int(e.get("limit", 0)), blocked=str(r["lport"]) in bk, sub=str(r["lport"]) in sb, sec=sec.get(str(r["lport"]), {}), enc=bool(tun.get(r["ip"], {}).get("active")), status=st, ms=h["ms"] if h else None,
+        rs.append(dict(r, packets=pk, bytes=by, limit=int(e.get("limit", 0)), blocked=str(r["lport"]) in bk, sub=str(r["lport"]) in sb, sec=sec.get(str(r["lport"]), {}), enc=bool(encmap.get(r["ip"], {}).get("active")), status=st, ms=h["ms"] if h else None,
                        hist=list(h["hist"]) if h else [], since=h["since"] if h else None,
                        period=e.get("period", ""), reset_at=e.get("reset_at", 0), expires=e.get("expires", ""), expired=expired, hours=e.get("h") or []))
     pc = perf_current_py()
@@ -1924,7 +2414,7 @@ def health_check():
 def make_backup():
     b = io.BytesIO()
     with tarfile.open(fileobj=b, mode="w:gz") as t:
-        for n in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf", "web.json", "web.crt", "web.key", "traffic24.json", "wgstate.json", "perf_preset"):
+        for n in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf", "gretunnels.conf", "web.json", "web.crt", "web.key", "traffic24.json", "wgstate.json", "perf_preset"):
             if os.path.exists(D + "/" + n): t.add(D + "/" + n, arcname=n)
     return b.getvalue()
 
@@ -1932,7 +2422,7 @@ def restore(data):
     n = 0
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
         for m in t.getmembers():
-            if m.name in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf") and m.isfile() and m.size < 1000000:
+            if m.name in ("rules.conf", "default_ip", "quota.json", "sub.json", "security.conf", "tunnels.conf", "gretunnels.conf") and m.isfile() and m.size < 1000000:
                 open(D + "/" + m.name, "wb").write(t.extractfile(m).read()); os.chmod(D + "/" + m.name, 0o600); n += 1
     if not n: raise ValueError("No forwards found in this file")
     subprocess.run([BIN, "tunnel", "sync"], timeout=120)
@@ -2249,7 +2739,11 @@ class H(BaseHTTPRequestHandler):
             try:
                 sc = tun_cmd("script-join", m.group(1), self.headers.get("Host", ""), ip, t=60)
             except ValueError as e:
-                return self.out(404, {"error": str(e)})
+                if "unknown or expired" not in str(e): return self.out(404, {"error": str(e)})
+                try:   # not a WireGuard token - try the GRE tunnel table
+                    sc = tun_cmd("gre", "script-join", m.group(1), self.headers.get("Host", ""), ip, t=60)
+                except Exception:
+                    return self.out(404, {"error": str(e)})
             log("info", "Join link fetched by %s (tunnel joined from that IP)" % ip); audit("join_served", ip, ip)
             return self.out(200, sc.encode(), "text/plain; charset=utf-8",
                             [("X-Robots-Tag", "noindex, nofollow"), ("Content-Disposition", "inline")])
@@ -2290,8 +2784,11 @@ class H(BaseHTTPRequestHandler):
             return self.out(200, out)
         if p == "/api/tunnel/link":
             mm = re.search(r"ip=([0-9.]+)", self.path)
+            tok = ""
             try: tok = tun_cmd("link", mm.group(1) if mm else "", t=20).strip()
-            except ValueError as e: return self.out(400, {"error": str(e)})
+            except ValueError:
+                try: tok = tun_cmd("gre", "link", mm.group(1) if mm else "", t=20).strip()   # GRE tunnel row?
+                except ValueError as e: return self.out(400, {"error": str(e)})
             if not re.fullmatch(r"[0-9a-f]{16,64}", tok): return self.out(500, {"error": "Token error"})
             host = self.headers.get("Host") or socket.gethostname()
             sch = "https" if cfg().get("tls") else "http"
@@ -2299,7 +2796,9 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/tunnel/script":
             m = re.search(r"ip=([\d.]+)", self.path)
             try: return self.out(200, {"script": tun_cmd("script", m.group(1) if m else "", t=20)})
-            except ValueError as e: return self.out(400, {"error": str(e)})
+            except ValueError:
+                try: return self.out(200, {"script": tun_cmd("gre", "script", m.group(1) if m else "", t=20)})
+                except ValueError as e: return self.out(400, {"error": str(e)})
         if p == "/api/sub":
             m = re.search(r"lport=(\d+)", self.path); k = m.group(1) if m else ""
             if k not in {str(r["lport"]) for r in read_rules()}: return self.out(404, {"error": "No such rule"})
@@ -2401,6 +2900,24 @@ class H(BaseHTTPRequestHandler):
                     if self.path.endswith("/test"): return self.out(200, transport_test(ip, int(d.get("port") or 0)))
                     return self.out(200, bwtest(ip))
                 a = d.get("action")
+                if a == "add" and str(d.get("type") or "").startswith("gre"):
+                    # GRE wizard: type gre-rev (pending row + one-line join link) or gre-dir (kharej IP now)
+                    gty = str(d.get("type"))
+                    pr = str(d.get("preset") or "turbo")
+                    if pr not in ("balanced", "turbo", "throughput", "gaming"): raise ValueError("Bad preset")
+                    mode = str(d.get("mode") or ("fou" if gty == "gre-rev" else "gre"))
+                    if mode not in ("gre", "fou"): raise ValueError("Bad mode")
+                    nm = re.sub(r"[^A-Za-z0-9_.-]", "_", str(d.get("name") or ""))[:40]
+                    with LOCK:
+                        if gty == "gre-rev":
+                            tun_cmd("gre", "join-open", str(int(d.get("port") or 5555)), mode, pr, nm, t=120)
+                        else:
+                            try: ipg = str(ipaddress.IPv4Address(str(d.get("ip", "")).strip()))
+                            except Exception: raise ValueError("Invalid IP")
+                            tun_cmd("gre", "add", ipg, str(int(d.get("port") or 0)), mode, "", str(int(d.get("mtu") or 0)), pr, nm, t=120)
+                    log("info", "GRE tunnel created (type %s, mode %s)" % (gty, mode))
+                    audit("tunnel_" + gty, "%s %s" % (mode, d.get("ip") or "-"), self.client_address[0])
+                    return self.out(200, {"ok": True, "pending": gty == "gre-rev"})
                 if a == "add" and str(d.get("type") or "") == "rev":
                     # reverse wizard: no foreign IP needed - the kharej dials in with the one-line join link
                     pr = str(d.get("preset") or "turbo")
@@ -2415,6 +2932,14 @@ class H(BaseHTTPRequestHandler):
                 if a == "transport":
                     # works for pending rev tunnels too: the join script reads the row at join time
                     tr = str(d.get("tr") or "")
+                    key0 = str(d.get("id") or "").strip()
+                    ip20 = key0 if re.fullmatch(r"\d+", key0) else str(d.get("ip", "")).strip()
+                    row0 = tun_by(ip20) or tun_by(key0)
+                    if row0 and row0.get("engine") == "gre":   # GRE rows switch between raw GRE and FOU
+                        if tr not in ("gre", "fou"): raise ValueError("Bad mode")
+                        with LOCK: tun_cmd("gre", "mode", ip20, tr, str(int(d.get("cport") or 5555)), t=120)
+                        log("info", "GRE tunnel mode -> %s (%s)" % (tr, ip20)); audit("tunnel_mode", "%s %s" % (ip20, tr), self.client_address[0])
+                        return self.out(200, {"ok": True})
                     if tr not in ("udp", "tcp", "ws", "wss", "kcp", "quic"): raise ValueError("Bad transport")
                     key = str(d.get("id") or "").strip()
                     ip2 = key if re.fullmatch(r"\d+", key) else str(d.get("ip", "")).strip()
@@ -2423,6 +2948,19 @@ class H(BaseHTTPRequestHandler):
                     return self.out(200, {"ok": True})
                 try: ip = str(ipaddress.IPv4Address(str(d.get("ip", "")).strip()))
                 except Exception: raise ValueError("Invalid IP")
+                rowg = tun_by(ip)
+                if rowg and rowg.get("engine") == "gre":   # GRE rows: use/direct/del/preset go to the GRE engine
+                    with LOCK:
+                        if a == "use": tun_cmd("gre", "use", ip, t=180)
+                        elif a == "direct": tun_cmd("gre", "direct", ip, t=60)
+                        elif a == "del": tun_cmd("gre", "del", ip, t=60)
+                        elif a == "preset":
+                            pr = str(d.get("preset") or "none")
+                            if pr != "none" and pr not in ("balanced", "turbo", "throughput", "gaming"): raise ValueError("Bad preset")
+                            tun_cmd("gre", "preset", ip, pr, t=60)
+                        else: raise ValueError("Bad action")
+                    log("info", "GRE tunnel %s: %s" % (a, ip)); audit("gre_" + str(a), ip, self.client_address[0])
+                    return self.out(200, {"ok": True})
                 with LOCK:
                     if a == "add":
                         ty = str(d.get("type") or "fwd")
@@ -3006,6 +3544,7 @@ const FA={"Wrong password": "رمز اشتباه است", "Too many attempts, tr
 Object.assign(EN,{"ترنسپورت":"Transport","تانل رمزنگاری‌شده (WireGuard)":"Encrypted tunnel (WireGuard)","سرور خارج":"Foreign server","پورت UDP":"UDP port","وضعیت لینک":"Link status","ترافیک":"Traffic","مسیر فورواردها":"Forwards via","متصل":"Linked","بدون handshake":"No handshake","مستقیم":"Direct","ساخت تانل":"Create tunnel","دستور سرور خارج":"Foreign setup script","برگشت به مستقیم":"Back to direct","فعال‌سازی":"Activate","کپی":"Copy","کپی شد":"Copied","انجام شد":"Done","هنوز تانلی ساخته نشده":"No tunnels yet","تست ترنسپورت":"Transport test","اجرای تست":"Run test","پاسخ می‌دهد":"Responds","بی‌پاسخ":"No answer","میانگین":"Average","کمترین / بیشترین":"Min / Max","نوسان":"Jitter","ازدست‌رفتن":"Loss","حذف همه":"Delete all","این تانل حذف شود؟ فورواردها به حالت مستقیم برمی‌گردند.":"Remove this tunnel? Its forwards go back to direct.","همه پورت‌های این سرور حذف شوند؟":"Delete every port of this server?","در حال تست… (حدود ۲۰ ثانیه)":"Testing… (about 20 s)","در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…":"Creating (installing WireGuard can take a moment)…","این دستور را روی سرور خارج (root) اجرا کن":"Run this on the foreign server (root)","IP سرور خارج":"Foreign server IP","حذف شد":"Deleted","امنیت تانل ذخیره شد":"Tunnel security saved","امنیت تانل":"Tunnel security","امنیت":"Security","این محدودیت‌ها فقط روی پورت همین تانل اعمال می‌شوند و ترافیک را دست‌نخورده عبور می‌دهند.":"These limits apply only to this tunnel's port and pass traffic through untouched.","آی‌پی‌های مجاز (هر خط یا با کاما؛ خالی = همه)":"Allowed IPs (one per line or comma-separated; empty = anyone)","حداکثر اتصال همزمان هر آی‌پی (۰ = خاموش)":"Max simultaneous connections per IP (0 = off)","اتصال جدید در دقیقه برای هر آی‌پی (۰ = خاموش)":"New connections per minute per IP (0 = off)","فقط آی‌پی‌های داخل لیست به این پورت می‌رسند. مطمئن شو آی‌پی مشتری‌ها داخل لیست است.":"Only the listed IPs can reach this port. Make sure your clients' IPs are in the list.","پورت":"port","جستجو (نام، پورت، آی‌پی)…":"Search name, port, IP…","موردی پیدا نشد":"No matches found","پاک کردن":"Clear","نشست منقضی شد":"Session expired — sign in again"});
 Object.assign(FA,{"Invalid IP or network":"آی‌پی یا شبکه نامعتبر است","Too many IPs":"تعداد آی‌پی‌ها زیاد است","Numbers out of range":"عدد خارج از محدوده است","Session expired — sign in again":"نشست منقضی شد — دوباره وارد شوید","Wrong code":"کد اشتباه است","Setup first":"اول «فعال‌سازی» را بزنید","no_tunnel":"تانل رمزنگاری‌شده‌ای برای این سرور ساخته نشده","no_iperf":"iperf3 نصب نشد (دسترسی مخازن؟)","bw_nosvc":"سرور خارج آماده تست نیست — اسکریپت سمت خارج را دوباره اجرا کن","bw_fail":"تست پهنای باند ناموفق بود","Bad preset":"پریست نامعتبر","Preset failed":"اعمال پریست ناموفق بود"});
 Object.assign(EN,{"کانکشن تست":"Connection test","تست بین ایران و خارج":"Iran ⇄ abroad test","دوطرفه — مثل Connection Test بک‌پک":"two-sided","ساخت لینک تست":"Create test link","یک لینک می‌سازد که روی سرور خارج اجرا می‌کنی (root) — پینگ ICMP، اکوی TCP و UDP واقعی بین دو سرور اندازه‌گیری می‌شود؛ جدول روی هر دو سرور نمایش داده می‌شود و پیشنهاد ترنسپورت می‌دهد.":"Builds a link to run on the foreign server (root) — it measures real ICMP, TCP-echo and UDP-echo probes between the two servers, prints the table on both sides and recommends a transport.","هنوز لینکی ساخته نشده":"No test link yet","این یک خط را روی سرور خارج اجرا کن (root):":"Run this one line on the foreign server (root):","لینک تا ۱۵ دقیقه اعتبار دارد.":"The link is valid for 15 minutes.","بستن تست":"Close test","آخرین نتیجه از سرور خارج (":"Latest result from the foreign server (","مسیر":"Path","میانگین ms":"avg ms","نوسان ms":"jitter ms","پینگ (ICMP)":"Ping (ICMP)","اکوی TCP":"TCP echo","اکوی UDP":"UDP echo","ترنسپورت (مسیر تانل — برای هر تانل جدا)":"Transport (how the tunnel crosses — BackPack-style, per tunnel)","پورت ترنسپورت (روی سرور شنونده)":"Carrier port (on the listening server)","خالی = خودکار":"empty = automatic","ترافیک سرور":"Server traffic","برای شروع «اجرای تست» را بزن — حدود ۲۰ ثانیه طول می‌کشد: پینگ، نوسان، پکت‌خسری، سرعت دانلود، خروجی UDP و سلامت تانل‌ها":"Press “Run test” to start — takes about 20 s: ping, jitter, loss, download speed, UDP egress and tunnel health","هنوز تستی اجرا نشده":"No test has run yet","آخرین تست:":"Last run:","دانلود مستقیم (Cloudflare)":"Direct download (Cloudflare)","UDP خروجی":"UDP egress","باز":"open","بسته":"blocked","پکت‌خسری":"Loss","تانل ":"Tunnel ","+ ساخت تانل جدید":"+ New tunnel","ویزارد مثل بک‌پک: نوع (ریورس / دایرکت / فوروارد) ← مشخصات ← کارایی ← اتصال. «لینک اتصال» هر تانل همیشه از ستون آخر قابل کپی است.":"BackPack-style wizard: type (reverse / direct / forward) → details → performance → connect. Each tunnel's join link stays copyable from the last column.","ساخت تانل جدید":"New tunnel","نوع":"Type","اختیاری":"Optional","اتصال":"Connect","بازگشت":"Back","ادامه":"Continue","ساخت تانل و نمایش لینک":"Create tunnel & show the link","ریورس":"Reverse","دایرکت":"Direct","پورت فوروارد":"Port forward","پیشنهادی":"Recommended","ایران — همین سرور.":"Iran — this server.","دو سرور چطور به هم وصل شوند؟":"How should the two servers connect?","سرور خارج به ایران dial می‌زند. فقط یک دستور روی سرور خارج اجرا می‌کنی؛ حتی لازم نیست IP خارج را بدانی — مناسب وقتی خارج پشت NAT است یا ایران خروجی آزاد ندارد.":"The foreign server dials in to Iran (like BackPack). You run one command on the foreign server; you don't even need to know its IP — ideal when the foreign side is behind NAT or the Iran side has no free egress.","ایران به سرور خارج وصل می‌شود (حالت کلاسیک). IP سرور خارج و پورت UDP آن را داری.":"Iran dials out to the foreign server (the classic way). You have the foreign server's IP and its UDP port.","همان حالت همیشگی: فورواردهای این سرور از داخل تانل رمزنگاری‌شده رد می‌شوند. IP سرور خارج لازم است.":"The usual mode: this server's forwards ride the encrypted tunnel. Needs the foreign server's IP.","نام تانل (اختیاری)":"Tunnel name (optional)","پورت UDP تانل":"Tunnel UDP port","تصادفی":"Random","ریورس — سرور خارج به ایران وصل می‌شود؛ IP خارج لازم نیست.":"Reverse — the foreign server connects to Iran; no foreign IP needed.","ایران به سرور خارج وصل می‌شود؛ آدرس خارج را بده.":"Iran connects to the foreign server; enter its address.","حالت کارایی ":"Performance of ","— برای هر تانل جدا ذخیره می‌شود و موقع «فعال‌سازی» خودکار اعمال می‌شود.":"— stored per tunnel and applied automatically when you activate it.","اختیاری — اولین فوروارد را همین‌جا بساز یا خالی بگذار و بعداً از تب «تانل‌ها» اضافه کن.":"Optional — create the first forward here, or leave it empty and add it later from the Tunnels tab.","پورت ورودی (این سرور)":"Listen port (this server)","پورت مقصد (خالی = برابر)":"Destination port (empty = same)","مقصد این فوروارد خودکار آدرس داخلی تانل می‌شود.":"This forward's destination is the tunnel's internal address automatically.","مقصد:":"Destination:","این یک خط را روی ":"Run this one line on the ","سرور خارج":"foreign server"," اجرا کن (root) — WireGuard را نصب می‌کند، تانل را برپا می‌کند و به ایران dial می‌زند. چند ثانیه بعد وضعیت لینک در جدول «متصل» می‌شود:":" (root) — it installs WireGuard, brings the tunnel up and dials back to Iran. The link status turns “Linked” within seconds:","کپی دستور":"Copy command","اسکریپت کامل (جایگزین)":"Full script (alternative)","این لینک محرمانه است — کلید خصوصی سمت خارج داخلش است؛ جایی منتشرش نکن. دکمه «لینک اتصال» در جدول همیشه دوباره همین دستور را می‌دهد.":"This link is secret — it contains the foreign side's private key; do not publish it. The “Join link” button in the table always serves the same command again.","لینک اتصال تانل":"Tunnel join link","لینک اتصال":"Join link","منتظر اتصال":"Waiting to join","در انتظار اتصال سرور خارج…":"Waiting for the foreign server…","در حال تست… (حدود ۲۰ ثانیه)":"Testing… (about 20 s)","ثانیه) — پینگ، دانلود و تانل‌ها":"s) — ping, download and tunnels"});
+Object.assign(EN,{"GRE ریورس":"GRE reverse","GRE دایرکت":"GRE direct","حالت GRE":"GRE mode","GRE over UDP (FOU) — پیشنهادی":"GRE over UDP (FOU) — recommended","Raw GRE (protocol 47)":"Raw GRE (protocol 47)","⚠ GRE رمزنگاری ندارد — برای ترافیک حساس از ترنسپورت‌های WireGuard استفاده کن.":"⚠ GRE has no encryption — use WireGuard transports for sensitive traffic.","پورت UDP تانل (روی سرور شنونده)":"Tunnel UDP port (on the listening server)","GRE ریورس — سرور خارج با یک لینک وصل می‌شود؛ لینک GRE روی هر دو سرور خودکار ساخته می‌شود.":"GRE reverse — the foreign server joins with one link; the GRE link is built on both servers automatically.","GRE دایرکت — ایران به سرور خارج GRE می‌زند؛ آدرس خارج را بده.":"GRE direct — Iran dials the foreign server with GRE; enter its address.","بدون لینک":"No link","در حال ساخت تانل GRE…":"Building the GRE tunnel…","GRE: the kharej running that line also builds the Iran-side link automatically.":"GRE: the kharej running that line also builds the Iran-side link automatically."});
 const RE=new RegExp(Object.keys(EN).sort((a,b)=>b.length-a.length).map(k=>k.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|"),"g");
 const TX=s=>{s=String(s);return LANG==="en"?s.replace(RE,m=>EN[m]):(FA[s]||s)};
 const cf=s=>confirm(TX(s));
@@ -3148,7 +3687,7 @@ let TUNS=[];const tage=a=>a==null?"—":a<90?a+"s":Math.round(a/60)+"m";const PR
 async function trLoad(){try{const r=await api("tunnels");TUNS=r.tunnels;const cur=$("t_ti").value;
  $("tb_t").innerHTML=TUNS.length?TUNS.map((t,i)=>{const key=t.pending?t.id:t.ip;const ty=t.type==="rev"?'<span class="pill up" style="font-size:10px">ریورس</span>':t.type==="dir"?'<span class="pill unknown" style="font-size:10px">دایرکت</span>':"";
   const trb=t.tr&&t.tr!=="udp"?` <span class="pill unknown" style="font-size:10px">${t.tr.toUpperCase()}</span>`:"";
-  return `<tr><td>${t.name?`<b>${esc(t.name)}</b><br>`:""}${t.pending?'<span class="hint">در انتظار اتصال سرور خارج…</span>':'<span class="ltr">'+t.ip+"</span>"} ${ty}${trb}</td><td class="ltr">${t.port}</td><td>${t.pending?'<span class="pill unknown">منتظر اتصال</span>':t.up?'<span class="pill up">متصل</span>':'<span class="pill down">بدون handshake</span>'}${t.pending?"":' <span class="hint">'+tage(t.age)+"</span>"}</td><td class="ltr">↓${hb(t.rx)} ↑${hb(t.tx)}</td><td>${t.active?'<span class="pill up">🔒 تانل</span>':'<span class="pill unknown">مستقیم</span>'}</td><td><select class="prsel" onchange="trPreset('${key}',this.value)">${["","balanced","turbo","throughput","gaming"].map(p=>`<option value="${p}" ${(t.preset||"")===p?"selected":""}>${p?PRFA[p]:"سیستم"}</option>`).join("")}</select><select class="prsel" style="margin-top:6px" onchange="trTransport('${key}',this.value)">${["udp","tcp","ws","wss","kcp","quic"].map(x=>`<option value="${x}" ${(t.tr||"udp")===x?"selected":""}>${x.toUpperCase()}</option>`).join("")}</select></td><td><button class="btn" onclick="trLink(${i})">لینک اتصال</button> ${t.pending?"":`<button class="btn" onclick="trAct('script','${t.ip}')">دستور سرور خارج</button> <button class="btn" onclick="trAct('${t.active?"direct":"use"}','${key}')">${t.active?"برگشت به مستقیم":"فعال‌سازی"}</button> `}<button class="btn d" onclick="trAct('del','${key}')">حذف</button></td></tr>`}).join(""):'<tr><td colspan="7" class="empty">هنوز تانلی ساخته نشده</td></tr>';
+  return `<tr><td>${t.name?`<b>${esc(t.name)}</b><br>`:""}${t.pending?'<span class="hint">در انتظار اتصال سرور خارج…</span>':'<span class="ltr">'+t.ip+"</span>"} ${ty}${trb}</td><td class="ltr">${t.engine==="gre"&&t.tr==="gre"?"—":t.port}</td><td>${t.pending?'<span class="pill unknown">منتظر اتصال</span>':t.up?'<span class="pill up">متصل</span>':'<span class="pill down">'+(t.engine==="gre"?"بدون لینک":"بدون handshake")+'</span>'}${t.pending?"":' <span class="hint">'+tage(t.age)+"</span>"}</td><td class="ltr">↓${hb(t.rx)} ↑${hb(t.tx)}</td><td>${t.active?'<span class="pill up">🔒 تانل</span>':'<span class="pill unknown">مستقیم</span>'}</td><td><select class="prsel" onchange="trPreset('${key}',this.value)">${["","balanced","turbo","throughput","gaming"].map(p=>`<option value="${p}" ${(t.preset||"")===p?"selected":""}>${p?PRFA[p]:"سیستم"}</option>`).join("")}</select><select class="prsel" style="margin-top:6px" onchange="trTransport('${key}',this.value)">${(t.engine==="gre"?["fou","gre"]:["udp","tcp","ws","wss","kcp","quic"]).map(x=>`<option value="${x}" ${(t.tr||"")===x?"selected":""}>${x.toUpperCase()}</option>`).join("")}</select></td><td><button class="btn" onclick="trLink(${i})">لینک اتصال</button> ${t.pending?"":`<button class="btn" onclick="trAct('script','${t.ip}')">دستور سرور خارج</button> <button class="btn" onclick="trAct('${t.active?"direct":"use"}','${key}')">${t.active?"برگشت به مستقیم":"فعال‌سازی"}</button> `}<button class="btn d" onclick="trAct('del','${key}')">حذف</button></td></tr>`}).join(""):'<tr><td colspan="7" class="empty">هنوز تانلی ساخته نشده</td></tr>';
  const ips=[...new Set((window.LAST?window.LAST.rules:[]).map(r=>r.ip))];
  $("t_ti").innerHTML=[...new Set([...TUNS.filter(t=>!t.pending).map(t=>t.ip),...ips])].map(i=>`<option>${i}</option>`).join("");if(cur)$("t_ti").value=cur;rvIps()}catch(e){toast(e.message,"e")}}
 async function trTransport(key,v){if(!v)return;const t=TUNS.find(x=>(x.pending?x.id:x.ip)==key);if(!t)return;
@@ -3175,7 +3714,11 @@ $("t_add").onclick=wOpen;
 /* ---------------- tunnel wizard (BackPack-style) ---------------- */
 const WTY={rev:{t:"ریورس",b:"پیشنهادی",d:"سرور خارج به ایران dial می‌زند (مثل بک‌پک). فقط یک دستور روی سرور خارج اجرا می‌کنی؛ حتی لازم نیست IP خارج را بدانی — مناسب وقتی خارج پشت NAT است یا ایران خروجی آزاد ندارد."},
 dir:{t:"دایرکت",d:"ایران به سرور خارج وصل می‌شود (حالت کلاسیک). IP سرور خارج و پورت UDP آن را داری."},
-fwd:{t:"پورت فوروارد",d:"همان حالت همیشگی: فورواردهای این سرور از داخل تانل رمزنگاری‌شده رد می‌شوند. IP سرور خارج لازم است."}};
+fwd:{t:"پورت فوروارد",d:"همان حالت همیشگی: فورواردهای این سرور از داخل تانل رمزنگاری‌شده رد می‌شوند. IP سرور خارج لازم است."},
+"gre-rev":{t:"GRE ریورس",b:"سریع‌ترین",d:"تانل GRE سه‌لایه — خیلی سریع ولی رمزنگاری ندارد. سرور خارج با یک لینک وصل می‌شود و لینک GRE روی هر دو سرور خودکار ساخته می‌شود."},
+"gre-dir":{t:"GRE دایرکت",d:"ایران به سرور خارج GRE می‌زند — نیاز به IP سرور خارج دارد. سریع‌ترین حالت، بدون رمزنگاری."}};
+const WGRE=[["fou","GRE over UDP (FOU) — پیشنهادی","تانل GRE داخل یک پورت UDP معمولی سفر می‌کند — از مسیرهای UDP-only هم رد می‌شود."],
+["gre","Raw GRE (protocol 47)","سریع‌ترین حالت — به شرطی که IP protocol 47 بین دو سرور باز باشد."]];
 const WTR=[["udp","UDP — سریع‌ترین (پیشنهادی)","دیتاگرام خام UDP؛ کمترین سربار. اگر UDP باز است همین را بردار."],
 ["tcp","TCP","وقتی UDP بسته یا throttle می‌شود؛ بسته‌های تانل داخل یک اتصال TCP ساده سفر می‌کنند."],
 ["ws","WebSocket","تونل داخل HTTP عادی — از فیلترهای HTTP-only و CDN رد می‌شود."],
@@ -3187,7 +3730,10 @@ const WSTEPS=["نوع","تانل","کارایی","اختیاری","اتصال"];
 let WZ=null;
 function wOpen(){WZ={step:0,type:"rev",name:"",port:51820,ip:"",tr:"udp",cport:"",preset:"turbo",lport:"",dport:""};$("w_t").textContent="ساخت تانل جدید";$("wm").classList.add("on");wDraw()}
 function wClose(){WZ=null;$("wm").classList.remove("on")}
-function wSet(k,v){if(WZ){WZ[k]=v;wDraw()}}
+function wSet(k,v){if(WZ){WZ[k]=v;
+ if(k==="type"){if(v&&v.startsWith("gre")){if(WZ.tr!=="fou"&&WZ.tr!=="gre")WZ.tr="fou";if(WZ.port===51820)WZ.port=5555}
+  else{if(WZ.tr==="fou"||WZ.tr==="gre"){WZ.tr="udp"}if(WZ.port===5555)WZ.port=51820}}
+ wDraw()}}
 function wRand(){if(WZ){WZ.port=10000+Math.floor(Math.random()*50000);wDraw()}}
 function wGrab(){const w=WZ;if(!w)return;
  if(w.step===1){if($("w_n"))w.name=$("w_n").value.trim().slice(0,40);if($("w_i"))w.ip=$("w_i").value.trim();if($("w_p"))w.port=+$("w_p").value||51820;if($("w_tr"))w.tr=$("w_tr").value;if($("w_c"))w.cport=$("w_c").value.trim()}
@@ -3197,12 +3743,18 @@ function wDraw(){const w=WZ;if(!w)return;
  const h=[];
  if(w.step===0){h.push('<div class="hint" style="margin:0 0 10px"><b>ایران — همین سرور.</b> دو سرور چطور به هم وصل شوند؟</div>');
   for(const[k,v]of Object.entries(WTY))h.push(`<div class="wcard ${w.type===k?"on":""}" onclick="wSet('type','${k}')"><b>${v.t}${v.b?` <span class="pill up" style="font-size:10px">${v.b}</span>`:""}</b><small>${v.d}</small></div>`)}
- else if(w.step===1){h.push(`<div class="hint" style="margin:0 0 10px">${w.type==="rev"?"ریورس — سرور خارج به ایران وصل می‌شود؛ IP خارج لازم نیست.":"ایران به سرور خارج وصل می‌شود؛ آدرس خارج را بده."}</div>`);
+ else if(w.step===1){const gt=w.type==="gre-rev"||w.type==="gre-dir";
+  h.push(`<div class="hint" style="margin:0 0 10px">${w.type==="rev"?"ریورس — سرور خارج به ایران وصل می‌شود؛ IP خارج لازم نیست.":w.type==="gre-rev"?"GRE ریورس — سرور خارج با یک لینک وصل می‌شود؛ لینک GRE روی هر دو سرور خودکار ساخته می‌شود.":w.type==="gre-dir"?"GRE دایرکت — ایران به سرور خارج GRE می‌زند؛ آدرس خارج را بده.":"ایران به سرور خارج وصل می‌شود؛ آدرس خارج را بده."}</div>`);
   h.push(`<label>نام تانل (اختیاری)</label><input id="w_n" placeholder="tanl-1" value="${esc(w.name)}">`);
-  if(w.type!=="rev")h.push(`<label>IP سرور خارج</label><input id="w_i" placeholder="1.2.3.4" dir="ltr" value="${esc(w.ip)}">`);
-  h.push(`<label>پورت UDP تانل</label><div style="display:flex;gap:8px;margin-top:4px"><input id="w_p" inputmode="numeric" value="${w.port}" style="flex:1"><button class="btn" type="button" onclick="wRand()">تصادفی</button></div>`);
-  h.push(`<label style="margin-top:10px">ترنسپورت (مسیر تانل — مثل بک‌پک برای هر تانل جدا)</label><select id="w_tr" onchange="wSet('tr',this.value)">${WTR.map(x=>`<option value="${x[0]}" ${w.tr===x[0]?"selected":""}>${x[1]}</option>`).join("")}</select><div class="hint" style="margin:6px 0 0">${(WTR.find(x=>x[0]===w.tr)||["","",""])[2]}</div>`);
-  if(w.tr!=="udp")h.push(`<label style="margin-top:8px">پورت ترنسپورت (روی سرور شنونده)</label><input id="w_c" inputmode="numeric" placeholder="خالی = خودکار" value="${esc(w.cport)}" dir="ltr">`)}
+  if(w.type!=="rev"&&w.type!=="gre-rev")h.push(`<label>IP سرور خارج</label><input id="w_i" placeholder="1.2.3.4" dir="ltr" value="${esc(w.ip)}">`);
+  if(gt){
+   h.push(`<label style="margin-top:10px">حالت GRE</label><select id="w_tr" onchange="wSet('tr',this.value)">${WGRE.map(x=>`<option value="${x[0]}" ${w.tr===x[0]?"selected":""}>${x[1]}</option>`).join("")}</select><div class="hint" style="margin:6px 0 0">${(WGRE.find(x=>x[0]===w.tr)||WGRE[0])[2]}</div>`);
+   h.push(`<div class="hint" style="margin:6px 0 0;color:#f59e0b">⚠ GRE رمزنگاری ندارد — برای ترافیک حساس از ترنسپورت‌های WireGuard استفاده کن.</div>`);
+   if(w.tr==="fou")h.push(`<label style="margin-top:8px">پورت UDP تانل (روی سرور شنونده)</label><div style="display:flex;gap:8px;margin-top:4px"><input id="w_p" inputmode="numeric" value="${w.port}" style="flex:1"><button class="btn" type="button" onclick="wRand()">تصادفی</button></div>`);}
+  else{
+   h.push(`<label>پورت UDP تانل</label><div style="display:flex;gap:8px;margin-top:4px"><input id="w_p" inputmode="numeric" value="${w.port}" style="flex:1"><button class="btn" type="button" onclick="wRand()">تصادفی</button></div>`);
+   h.push(`<label style="margin-top:10px">ترنسپورت (مسیر تانل — مثل بک‌پک برای هر تانل جدا)</label><select id="w_tr" onchange="wSet('tr',this.value)">${WTR.map(x=>`<option value="${x[0]}" ${w.tr===x[0]?"selected":""}>${x[1]}</option>`).join("")}</select><div class="hint" style="margin:6px 0 0">${(WTR.find(x=>x[0]===w.tr)||["","",""])[2]}</div>`);
+   if(w.tr!=="udp")h.push(`<label style="margin-top:8px">پورت ترنسپورت (روی سرور شنونده)</label><input id="w_c" inputmode="numeric" placeholder="خالی = خودکار" value="${esc(w.cport)}" dir="ltr">`)}}
  else if(w.step===2){h.push('<div class="hint" style="margin:0 0 10px">حالت کارایی <b>همین تانل</b> — برای هر تانل جدا ذخیره می‌شود و موقع «فعال‌سازی» خودکار اعمال می‌شود.</div>');
   for(const[k,n,d]of WPR)h.push(`<div class="wcard ${w.preset===k?"on":""}" onclick="wSet('preset','${k}')"><b>${n}</b><small>${d}</small></div>`)}
  else if(w.step===3){h.push('<div class="hint" style="margin:0 0 10px">اختیاری — اولین فوروارد را همین‌جا بساز یا خالی بگذار و بعداً از تب «تانل‌ها» اضافه کن.</div>');
@@ -3212,29 +3764,30 @@ function wDraw(){const w=WZ;if(!w)return;
  $("w_back").style.visibility=(w.step===0||w.step===4)?"hidden":"visible";
  $("w_next").textContent=w.step===3?"ساخت تانل و نمایش لینک":w.step===4?"بستن":"ادامه"}
 async function wFinish(){const w=WZ,b=$("w_next");if(!w)return;b.disabled=true;
- try{toast("در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…","");
-  if(w.type==="rev")await api("tunnel","POST",{action:"add",type:"rev",port:w.port,preset:w.preset,name:w.name,tr:w.tr,cport:w.cport});
-  else await api("tunnel","POST",{action:"add",type:w.type,ip:w.ip,port:w.port,preset:w.preset,name:w.name,tr:w.tr,cport:w.cport});
+ try{const gt=w.type==="gre-rev"||w.type==="gre-dir";
+  toast(gt?"در حال ساخت تانل GRE…":"در حال ساخت (نصب WireGuard ممکن است کمی طول بکشد)…","");
+  if(w.type==="rev"||w.type==="gre-rev")await api("tunnel","POST",{action:"add",type:w.type,port:w.port,preset:w.preset,name:w.name,tr:w.tr,mode:w.tr,cport:w.cport});
+  else await api("tunnel","POST",{action:"add",type:w.type,ip:w.ip,port:w.port,preset:w.preset,name:w.name,tr:w.tr,mode:w.tr,cport:w.cport});
   await trLoad();
-  const t=w.type==="rev"?[...TUNS].filter(x=>x.pending).sort((a,c)=>c.id-a.id)[0]:TUNS.find(x=>x.ip===w.ip);
-  if(w.lport&&t){const dip=w.type==="rev"?"10.66."+t.id+".2":w.ip;
+  const t=(w.type==="rev"||w.type==="gre-rev")?[...TUNS].filter(x=>x.pending&&(gt?x.engine==="gre":x.engine!=="gre")).sort((a,c)=>c.id-a.id)[0]:TUNS.find(x=>x.ip===w.ip);
+  if(w.lport&&t){const dip=gt?"10.67."+t.id+".2":(w.type==="rev"?"10.66."+t.id+".2":w.ip);
    try{await api("rules","POST",{lport:w.lport,ip:dip,dport:w.dport||w.lport,proto:"tcp",name:w.name?("fw-"+w.name):""});await load()}catch(e){}}
   else load();
   let url="";try{const rr=await api("tunnel/link?ip="+(t?(t.pending?t.id:t.ip):w.ip));url=rr.url}catch(e){}
   wDone(url,t)}catch(e){toast(e.message,"e")}b.disabled=false}
 function wDone(url,t){WZ={step:4};$("w_t").textContent="لینک اتصال تانل"+(t&&t.name?" — "+t.name:"");$("wm").classList.add("on");
  $("w_st").innerHTML='<i class="done"></i>'.repeat(5);
- $("w_b").innerHTML=`<div class="hl" style="margin:0 0 12px"><b class="ok">✔</b><div>این یک خط را روی <b>سرور خارج</b> اجرا کن (root) — WireGuard را نصب می‌کند، تانل را برپا می‌کند و به ایران dial می‌زند. چند ثانیه بعد وضعیت لینک در جدول «متصل» می‌شود:</div></div>
+ $("w_b").innerHTML=`<div class="hl" style="margin:0 0 12px"><b class="ok">✔</b><div>این یک خط را روی <b>سرور خارج</b> اجرا کن (root) — ${t&&t.engine==="gre"?"لینک GRE روی هر دو سرور همان لحظه ساخته و بالا می‌آید":"WireGuard را نصب می‌کند، تانل را برپا می‌کند و به ایران dial می‌زند. چند ثانیه بعد وضعیت لینک در جدول «متصل» می‌شود"}:</div></div>
   <textarea id="w_lnk" rows="3" readonly dir="ltr" style="font-size:12.5px">${esc(url||"—")}</textarea>
   <div class="acts"><button class="btn p" id="w_cp">کپی دستور</button>${t&&!t.pending?'<button class="btn" id="w_scr">اسکریپت کامل (جایگزین)</button>':""}</div>
-  <div class="hint" style="margin-top:8px">این لینک محرمانه است — کلید خصوصی سمت خارج داخلش است؛ جایی منتشرش نکن. دکمه «لینک اتصال» در جدول همیشه دوباره همین دستور را می‌دهد.</div>`;
+  <div class="hint" style="margin-top:8px">این لینک محرمانه است — ${t&&t.engine==="gre"?"پیوند اتصال تانل GRE داخلش است":"کلید خصوصی سمت خارج داخلش است"}؛ جایی منتشرش نکن. دکمه «لینک اتصال» در جدول همیشه دوباره همین دستور را می‌دهد.</div>`;
  $("w_back").style.visibility="hidden";$("w_next").textContent="بستن";
  $("w_cp").onclick=async()=>{try{await navigator.clipboard.writeText($("w_lnk").value)}catch(e){$("w_lnk").select();document.execCommand("copy")}toast("کپی شد","s")};
  if($("w_scr"))$("w_scr").onclick=async()=>{try{const r=await api("tunnel/script?ip="+(t.pending?t.id:t.ip));$("w_lnk").value=r.script;$("w_lnk").rows=16;if($("w_scr"))$("w_scr").style.display="none"}catch(e){toast(e.message,"e")}}}
 async function trLink(i){const t=TUNS[i];if(!t)return;try{const r=await api("tunnel/link?ip="+(t.pending?t.id:t.ip));wDone(r.url,t)}catch(e){toast(e.message,"e")}}
 $("w_next").onclick=()=>{const w=WZ;if(!w)return;
  if(w.step===4){wClose();trLoad();load();return}
- if(w.step===1){wGrab();if(w.type!=="rev"&&!/^\d{1,3}(\.\d{1,3}){3}$/.test(w.ip)){toast("آی‌پی سرور خارج را درست وارد کن","e");return}
+ if(w.step===1){wGrab();if(w.type!=="rev"&&w.type!=="gre-rev"&&!/^\d{1,3}(\.\d{1,3}){3}$/.test(w.ip)){toast("آی‌پی سرور خارج را درست وارد کن","e");return}
   if(!(w.port>=1&&w.port<=65535)){toast("پورت نامعتبر است","e");return}}
  if(w.step===3){wGrab();wFinish();return}
  w.step++;wDraw()};
@@ -3771,8 +4324,11 @@ uninstall() {
   banner; echo "  ${C_BLD}Uninstall${C_RST}"; echo
   confirm "Remove all forwards, the web panel, the boot service and this tool?" || return
   web_remove >/dev/null 2>&1
-  local spec t parent chain fip
+  local spec t parent chain fip gid
   for fip in $(cut -d'|' -f2 "$TUN" 2>/dev/null); do tun_del "$fip" >/dev/null 2>&1; done
+  if [[ -s $GRE ]]; then
+    for gid in $(cut -d'|' -f1 "$GRE" 2>/dev/null); do gre_down "$gid" >/dev/null 2>&1; done
+  fi
   for spec in "mangle PREROUTING DRC_SEC" "mangle FORWARD DRC_MSS" "nat PREROUTING DRC_PRE" "nat POSTROUTING DRC_POST" "filter FORWARD DRC_FWD" "filter INPUT DRC_IN"; do
     set -- $spec; t=$1; parent=$2; chain=$3
     iptables -t "$t" -D "$parent" -j "$chain" 2>/dev/null
@@ -4001,7 +4557,8 @@ choose_transport() {   # BackPack two-level picker; echoes the transport ("" = c
   fam=$(pick_menu "Select Transport Family" \
     "1|TCP|reliable and simple - the safe default" \
     "2|UDP|lower latency, better on lossy or throttled links" \
-    "3|WebSocket|looks like normal web traffic - CDN friendly") || return 0
+    "3|WebSocket|looks like normal web traffic - CDN friendly" \
+    "4|GRE|plain L3 tunnel - very fast, NO encryption (FOU rides UDP)") || return 0
   [[ -z $fam ]] && return 0
   case $fam in
     1) tr=$(pick_menu "Select TCP Transport" \
@@ -4013,11 +4570,15 @@ choose_transport() {   # BackPack two-level picker; echoes the transport ("" = c
     3) tr=$(pick_menu "Select WebSocket Transport" \
          "1|WS|WebSocket - HTTP camouflage, CDN friendly" \
          "2|WSS|secure WebSocket - TLS encrypted (self-signed certificate is automatic)");;
+    4) tr=$(pick_menu "Select GRE Mode" \
+         "1|GRE over UDP (FOU)|recommended - the tunnel rides a normal UDP port" \
+         "2|Raw GRE (protocol 47)|the fastest - needs IP protocol 47 end to end");;
   esac
   case $fam:$tr in
     1:1) echo tcp;;
     2:1) echo udp;; 2:2) echo kcp;; 2:3) echo quic;;
     3:1) echo ws;; 3:2) echo wss;;
+    4:1) echo gre-fou;; 4:2) echo gre-raw;;
     *)   echo "";;
   esac
 }
@@ -4077,24 +4638,34 @@ web_base_url() {   # https://host:port of the web backend ("" when unavailable)
 }
 
 wizard_rev_iran() {   # Reverse Tunnel - Iran: listens; the kharej joins with one link
-  local tr host port name preset spec id tok url l d fwdn=0 det
+  local tr host port name preset spec id tok url l d fwdn=0 det gre_mode=""
   banner; echo "  ${C_BLD}Reverse Tunnel - Iran${C_RST}"; echo
   info "Kharej dials IN and joins with one link; users connect to THIS server."
   tr=$(choose_transport)
   [[ -z $tr ]] && { warn "No transport chosen - canceled."; return 0; }
+  if [[ $tr == gre-* ]]; then gre_mode=${tr#gre-}; tr=gre; fi
   echo
   det=$(web_pubip 2>/dev/null); [[ -z $det || $det == "-" ]] && det=$(hostname -I 2>/dev/null | awk '{print $1}')
   read -rp "  Iran IP Or Domain (What Kharej Dials)${det:+ [$det]}: " host; host=$(trim "${host:-$det}")
-  read -rp "  Tunnel Port [51820]: " port; port=${port:-51820}
+  if [[ $tr == gre ]]; then
+    if [[ $gre_mode == fou ]]; then
+      read -rp "  FOU UDP Port (IRAN listens) [5555]: " port; port=${port:-5555}
+    else
+      port=0
+    fi
+  else
+    read -rp "  Tunnel Port [51820]: " port; port=${port:-51820}
+  fi
   valid_port "$port" || { err "Invalid port."; return 0; }
   read -rp "  Forwarded Ports (users hit IRAN, service runs on KHAREJ; e.g. 443, 8080=2096) [none]: " spec
-  read -rp "  Tunnel Name [server-$port]: " name; name=$(trim "${name:-server-$port}")
+  read -rp "  Tunnel Name [server-${port:-51820}]: " name; name=$(trim "${name:-server-${port:-51820}}")
   preset=$(wiz_preset)
   echo
   echo "  ${C_BLD}--- Summary ---${C_RST}"
-  echo "  Type: Reverse (kharej dials Iran)   Transport: $tr   Preset: $preset"
-  echo "  Iran endpoint: ${host:-<kharej will ask>}   Tunnel port: $port"
+  echo "  Type: Reverse (kharej dials Iran)   Transport: $([[ $tr == gre ]] && echo "GRE ($gre_mode)" || echo "$tr")   Preset: $preset"
+  echo "  Iran endpoint: ${host:-<kharej will ask>}   Tunnel port: $([[ $tr == gre && $gre_mode == gre ]] && echo '-' || echo "$port")"
   echo "  Forwarded ports: $(trim "${spec:-none}")"
+  [[ $tr == gre ]] && warn "  GRE is a plain L3 tunnel - fast but NOT encrypted. For encryption pick WireGuard transports."
   echo
   confirm "Create This Tunnel?" || { info "Canceled."; return 0; }
   if [[ ! -f $WEB_PY ]]; then
@@ -4105,12 +4676,18 @@ wizard_rev_iran() {   # Reverse Tunnel - Iran: listens; the kharej joins with on
     parse_ports_spec "$spec" > "$CONF_DIR/.ports.$$" 2>/dev/null \
       || { rm -f "$CONF_DIR/.ports.$$"; err "No forwards were added."; spec=""; }
   fi
-  tok=$(tun_add_rev "$port" "$preset" "$name" "$tr" "") \
-    || { err "Tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
-  id=$(awk -F'|' -v t="$tok" '$12==t{print $1; exit}' "$TUN")
+  if [[ $tr == gre ]]; then
+    tok=$(gre_add_rev "$port" "$gre_mode" "$preset" "$name") \
+      || { rm -f "$CONF_DIR/.ports.$$"; err "GRE tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
+    id=$(awk -F'|' -v t="$tok" '$10==t{print $1; exit}' "$GRE")
+  else
+    tok=$(tun_add_rev "$port" "$preset" "$name" "$tr" "") \
+      || { rm -f "$CONF_DIR/.ports.$$"; err "Tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
+    id=$(awk -F'|' -v t="$tok" '$12==t{print $1; exit}' "$TUN")
+  fi
   if [[ -s $CONF_DIR/.ports.$$ ]]; then
     while read -r l d; do
-      add_forward_auto "rv$l" both "$l" "10.66.$id.2" "$d" \
+      add_forward_auto "rv$l" both "$l" "10.$([[ $tr == gre ]] && echo 67 || echo 66).$id.2" "$d" \
         && { ok "Forward  :$l -> kharej :$d  (through the tunnel)"; fwdn=$((fwdn + 1)); }
     done < "$CONF_DIR/.ports.$$"
     (( fwdn > 0 )) && warn "If the service on kharej listens only on 127.0.0.1, re-run the kharej join line once after any change."
@@ -4121,37 +4698,52 @@ wizard_rev_iran() {   # Reverse Tunnel - Iran: listens; the kharej joins with on
   if [[ -n $url ]]; then
     ok "Tunnel #$id created - this side is listening. Run this ONE line on the KHAREJ server (as root):"
     echo; echo "  ${C_BLD}${C_GRN}bash <(curl -fsSLk $url/join/$tok)${C_RST}"; echo
-    info "The link stays valid: Manage -> Tunnels -> #$id -> Setup Link."
+    [[ $tr == gre ]] && info "GRE: the kharej running that line also builds the Iran-side link automatically."
+    info "The link stays valid: Manage -> $([[ $tr == gre ]] && echo 'GRE Tunnels' || echo Tunnels) -> #$id -> Setup Link."
   else
     ok "Tunnel #$id created - this side is listening."
-    warn "The web backend is not reachable, so there is no one-line link. Install it (menu 5), then: Manage -> Tunnels -> #$id -> Setup Link."
+    warn "The web backend is not reachable, so there is no one-line link. Install it (menu 5), then: Manage -> $([[ $tr == gre ]] && echo 'GRE Tunnels' || echo Tunnels) -> #$id -> Setup Link."
   fi
 }
 
 wizard_direct_iran() {   # Direct Tunnel - Iran: Iran dials out to the kharej
-  local tr fip port name preset spec id tok url l d fwdn=0 mtu
+  local tr fip port name preset spec id tok url l d fwdn=0 mtu gre_mode=""
   banner; echo "  ${C_BLD}Direct Tunnel - Iran${C_RST}"; echo
   info "Iran dials OUT to the kharej server - use it when inbound to Iran is blocked."
   tr=$(choose_transport)
   [[ -z $tr ]] && { warn "No transport chosen - canceled."; return 0; }
+  if [[ $tr == gre-* ]]; then gre_mode=${tr#gre-}; tr=gre; fi
   echo
   read -rp "  Kharej IP Or Domain (What Iran Dials): " fip; fip=$(trim "$fip")
   if ! valid_ip "$fip"; then
     local rip; rip=$(getent hosts "$fip" 2>/dev/null | awk '{print $1; exit}')
     if [[ -n $rip ]]; then ok "  $fip -> $rip"; fip=$rip; else err "Invalid IP or unresolvable domain."; return 0; fi
   fi
-  read -rp "  Tunnel Port [51820]: " port; port=${port:-51820}
+  if [[ $tr == gre ]]; then
+    if [[ $gre_mode == fou ]]; then
+      read -rp "  FOU UDP Port (on KHAREJ - the listener) [5555]: " port; port=${port:-5555}
+    else
+      port=0
+    fi
+  else
+    read -rp "  Tunnel Port [51820]: " port; port=${port:-51820}
+  fi
   valid_port "$port" || { err "Invalid port."; return 0; }
   read -rp "  Forwarded Ports (users hit IRAN, service runs on KHAREJ; e.g. 443, 8080=2096) [none]: " spec
-  read -rp "  MTU [auto]: " mtu; mtu=$(trim "$mtu"); [[ -z $mtu ]] && mtu=0
-  [[ $mtu =~ ^[0-9]+$ ]] && (( mtu == 0 || (mtu >= 1200 && mtu <= 1500) )) || { err "Invalid MTU."; return 0; }
-  read -rp "  Tunnel Name [direct-$port]: " name; name=$(trim "${name:-direct-$port}")
+  if [[ $tr == gre ]]; then
+    mtu=0   # GRE: auto MTU is measured once the link is live
+  else
+    read -rp "  MTU [auto]: " mtu; mtu=$(trim "$mtu"); [[ -z $mtu ]] && mtu=0
+    [[ $mtu =~ ^[0-9]+$ ]] && (( mtu == 0 || (mtu >= 1200 && mtu <= 1500) )) || { err "Invalid MTU."; return 0; }
+  fi
+  read -rp "  Tunnel Name [direct-${port:-51820}]: " name; name=$(trim "${name:-direct-${port:-51820}}")
   preset=$(wiz_preset)
   echo
   echo "  ${C_BLD}--- Summary ---${C_RST}"
-  echo "  Type: Direct (Iran dials kharej)   Transport: $tr   Preset: $preset   MTU: $([[ $mtu == 0 ]] && echo auto || echo "$mtu")"
-  echo "  Kharej: $fip   Tunnel port: $port"
+  echo "  Type: Direct (Iran dials kharej)   Transport: $([[ $tr == gre ]] && echo "GRE ($gre_mode)" || echo "$tr")   Preset: $preset   MTU: $([[ $mtu == 0 ]] && echo auto || echo "$mtu")"
+  echo "  Kharej: $fip   Tunnel port: $([[ $tr == gre && $gre_mode == gre ]] && echo '-' || echo "$port")"
   echo "  Forwarded ports: $(trim "${spec:-none}")"
+  [[ $tr == gre ]] && warn "  GRE is a plain L3 tunnel - fast but NOT encrypted. For encryption pick WireGuard transports."
   echo
   confirm "Create This Tunnel?" || { info "Canceled."; return 0; }
   if [[ ! -f $WEB_PY ]]; then
@@ -4162,27 +4754,39 @@ wizard_direct_iran() {   # Direct Tunnel - Iran: Iran dials out to the kharej
     parse_ports_spec "$spec" > "$CONF_DIR/.ports.$$" 2>/dev/null \
       || { rm -f "$CONF_DIR/.ports.$$"; err "No forwards were added."; spec=""; }
   fi
-  tun_add "$fip" "$port" "$mtu" "$preset" fwd "$name" "$tr" "" \
-    || { rm -f "$CONF_DIR/.ports.$$"; err "Tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
-  id=${TROW:-}; id=$(cut -d'|' -f1 <<< "$(tun_row "$fip")")
+  if [[ $tr == gre ]]; then
+    id=$(gre_add "$fip" "$port" "$gre_mode" "" "$mtu" "$preset" "$name") \
+      || { rm -f "$CONF_DIR/.ports.$$"; err "GRE tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
+  else
+    tun_add "$fip" "$port" "$mtu" "$preset" fwd "$name" "$tr" "" \
+      || { rm -f "$CONF_DIR/.ports.$$"; err "Tunnel creation failed - run 'dr-cpanel doctor' to see why."; return 0; }
+    id=${TROW:-}; id=$(cut -d'|' -f1 <<< "$(tun_row "$fip")")
+  fi
   if [[ -s $CONF_DIR/.ports.$$ ]]; then
     while read -r l d; do
-      add_forward_auto "fw$l" both "$l" "10.66.$id.2" "$d" \
+      add_forward_auto "fw$l" both "$l" "10.$([[ $tr == gre ]] && echo 67 || echo 66).$id.2" "$d" \
         && { ok "Forward  :$l -> kharej :$d  (through the tunnel)"; fwdn=$((fwdn + 1)); }
     done < "$CONF_DIR/.ports.$$"
   fi
   rm -f "$CONF_DIR/.ports.$$"
-  (( fwdn > 0 )) && tun_active "$fip" 1 >/dev/null 2>&1 && ok "Forwards route through the encrypted tunnel."
+  (( fwdn > 0 )) && [[ $tr != gre ]] && tun_active "$fip" 1 >/dev/null 2>&1 && ok "Forwards route through the encrypted tunnel."
+  (( fwdn > 0 )) && [[ $tr == gre ]] && ok "Forwards target the GRE peer 10.67.$id.2 - they go live once the kharej side is up."
   echo
-  tok=$(tun_link "$fip" 2>/dev/null)
+  if [[ $tr == gre ]]; then
+    tok=$(gre_link "$id" 2>/dev/null)
+  else
+    tok=$(tun_link "$fip" 2>/dev/null)
+  fi
   url=$(web_base_url)
   if [[ -n $url && ${#tok} -ge 16 ]]; then
     ok "Tunnel #$id created. Run this ONE line on the KHAREJ server (as root):"
     echo; echo "  ${C_BLD}${C_GRN}bash <(curl -fsSLk $url/join/$tok)${C_RST}"; echo
-    info "Classic alternative: Manage -> Tunnels -> #$id -> Foreign Script."
+    info "Classic alternative: Manage -> $([[ $tr == gre ]] && echo 'GRE Tunnels' || echo Tunnels) -> #$id -> Foreign Script."
   else
     ok "Tunnel #$id created. Run this on the KHAREJ server:"
-    echo; tun_script "$fip"; echo
+    echo
+    if [[ $tr == gre ]]; then gre_script "$id"; else tun_script "$fip"; fi
+    echo
     info "Save it as a file and run as root on the kharej server."
   fi
 }
@@ -4460,23 +5064,117 @@ forward_actions() {   # our one extra: the classic DNAT port forwarding
   done
 }
 
+# --- GRE tunnel management (CLI) ---------------------------------------------
+gre_table() {   # the GRE tunnel table; sets GRE_COUNT
+  local i=0 id fip port mode mtu a pr ty name st
+  GRE_COUNT=0
+  [[ -s $GRE ]] || { info "No GRE tunnels yet - build one from Setup Iran / Setup Kharej."; return 1; }
+  printf "  ${C_BLD}%-3s %-18s %-7s %-7s %-9s %-10s %-11s %s${C_RST}\n" "#" "NAME" "MODE" "PORT" "TYPE" "STATE" "PRESET" "FOREIGN IP"
+  while IFS='|' read -r id fip port mode _ mtu a pr ty tok name; do
+    [[ -z $id ]] && continue; i=$((i + 1))
+    if [[ $fip == pending ]]; then st="waiting-join"
+    elif ip link show "drgre$id" >/dev/null 2>&1 && ping -c 1 -W 1 "10.67.$id.2" >/dev/null 2>&1; then st="linked"
+    elif ip link show "drgre$id" >/dev/null 2>&1; then st="no-peer"
+    else st="stopped"
+    fi
+    printf "  %-3s %-18s %-7s %-7s %-9s %-10s %-11s %s\n" \
+      "$i" "${name:-gre$id}" "$mode" "$([[ $mode == fou ]] && echo "$port" || echo '-')" \
+      "$([[ $ty == rev ]] && echo reverse || echo direct)" "$st" "${pr:--}" "$fip"
+  done < "$GRE"
+  GRE_COUNT=$i
+  return 0
+}
+
+gre_pick_row() {   # sets GROW/GID/GFIP from a table line number
+  local n
+  GROW=""; GID=""; GFIP=""
+  [[ -s $GRE ]] || { err "No GRE tunnels yet."; return 1; }
+  read -rp "  GRE tunnel number: " n
+  [[ $n =~ ^[0-9]+$ ]] || { err "Invalid number."; return 1; }
+  GROW=$(sed -n "${n}p" "$GRE")
+  [[ -n $GROW ]] || { err "Invalid number."; return 1; }
+  GID=${GROW%%|*}; GFIP=$(cut -d'|' -f2 <<< "$GROW")
+  return 0
+}
+
+gre_show_link() {   # id : the one-line join command for a GRE tunnel
+  local id=$1 r tok url fip
+  r=$(awk -F'|' -v i="$id" '$1==i{print;exit}' "$GRE")
+  [[ -n $r ]] || { err "No such GRE tunnel."; return 1; }
+  fip=$(cut -d'|' -f2 <<< "$r")
+  tok=$(cut -d'|' -f10 <<< "$r")
+  [[ ${#tok} -ge 16 ]] || tok=$(gre_link "$id") || { err "Could not create a join token."; return 1; }
+  url=$(web_base_url)
+  [[ -z $url ]] && { err "The web backend is not reachable - install/restart it from menu 5 first."; return 1; }
+  ok "Run this ONE line on the KHAREJ server (as root):"
+  echo; echo "  ${C_BLD}${C_GRN}bash <(curl -fsSLk $url/join/$tok)${C_RST}"; echo
+  [[ $fip == pending ]] && info "GRE tunnel: the link goes live on both sides the moment the kharej runs that line."
+  return 0
+}
+
+gre_actions() {   # per-GRE-tunnel management
+  local id fip name c got
+  banner; echo "  ${C_BLD}GRE Tunnels${C_RST}"; echo
+  gre_table
+  echo
+  gre_pick_row || return 0
+  id=$GID; fip=$GFIP
+  name=$(cut -d'|' -f11 <<< "$GROW")
+  while true; do
+    echo
+    echo "  ${C_BLD}GRE tunnel #$id${C_RST}${name:+ \"$name\"}  ($([[ $(cut -d'|' -f9 <<< "$GROW") == rev ]] && echo reverse || echo direct) · mode: $(cut -d'|' -f4 <<< "$GROW"))"
+    echo "   1) Start             build the link and verify the peer"
+    echo "   2) Stop              tear the link down"
+    echo "   3) Setup Link        the one-line join command for the kharej"
+    echo "   4) Foreign Script    the classic full script for the kharej"
+    echo "   5) Mode              switch raw GRE (proto 47) / GRE over UDP (FOU)"
+    echo "   6) Preset            per-tunnel performance preset"
+    echo "   7) Auto MTU          find the largest packet the path passes"
+    echo "   8) Delete            remove this GRE tunnel"
+    echo "   0) Back"; echo
+    read -rp "  Select: " c || return 0
+    case $c in
+      1) gre_use "$id" 1 && ok "Started - the peer answers.";;
+      2) gre_use "$id" 0 && ok "Stopped.";;
+      3) gre_show_link "$id";;
+      4) echo; gre_script "$fip"; echo; info "Save the whole script above as a file on the kharej server and run it as root.";;
+      5) echo "  Current mode: $(gre_mode_switch "$id")"
+         echo "   1) GRE over UDP (FOU) - recommended   2) raw GRE (protocol 47)"
+         read -rp "  Select [1]: " m
+         if [[ ${m:-1} == 1 ]]; then read -rp "  FOU UDP port [5555]: " mp; got=$(gre_mode_switch "$id" fou "${mp:-5555}") && ok "Mode: $got"
+         else got=$(gre_mode_switch "$id" gre) && ok "Mode: $got"; fi;;
+      6) cur=$(gre_preset "$id"); echo "  Current preset: ${cur:-- (system default)}"
+         echo "   1) Balanced   2) Turbo   3) Throughput   4) Gaming   5) Follow the system preset"
+         read -rp "  Select: " p
+         case $p in 1) got=balanced;; 2) got=turbo;; 3) got=throughput;; 4) got=gaming;; 5) got=none;; *) err "Canceled."; continue;; esac
+         gre_preset "$id" "$got" >/dev/null && ok "Preset: $got";;
+      7) got=$(gre_automtu "$id" 2>/dev/null) && ok "Best MTU for this path: $got" || err "Could not measure (the link must be connected first).";;
+      8) confirm "Delete GRE tunnel #$id ($fip)?" && { gre_del "$id" && ok "Deleted - its forwards stopped working."; return 0; };;
+      0) return 0;;
+    esac
+    GROW=$(gre_row "$id")
+  done
+}
+
 manage_menu() {   # BackPack: "tunnels, status, health, tests"
   local c
   while true; do
     banner; echo "  ${C_BLD}Manage${C_RST}"; echo
     echo "   1) Tunnels              start/stop, links, transport, preset, MTU, delete"
-    echo "   2) Forward Ports        list, test, remove the DNAT forwards"
-    echo "   3) Reverse Forwards     ports on kharej that reach services on Iran"
-    echo "   4) Status               full status"
-    echo "   5) Tunnel Security      IP allow-list, connection and rate limits"
+    echo "   2) GRE Tunnels          fast L3 tunnels: raw GRE / GRE over UDP (FOU)"
+    echo "   3) Forward Ports        list, test, remove the DNAT forwards"
+    echo "   4) Reverse Forwards     ports on kharej that reach services on Iran"
+    echo "   5) Status               full status"
+    echo "   6) Tunnel Security      IP allow-list, connection and rate limits"
     echo "   0) Back"; echo
     read -rp "  Select: " c || return 0; echo
     case $c in
       1) tunnel_actions;;
-      2) forward_actions;;
-      3) reverse_menu;;
-      4) status; pause;;
-      5) security_menu; pause;;
+      2) gre_actions; pause;;
+      3) forward_actions;;
+      4) reverse_menu;;
+      5) status; pause;;
+      6) security_menu; pause;;
       0) return 0;;
     esac
   done
@@ -4567,6 +5265,12 @@ doctor() {   # the first stop when a tunnel will not build
   { modprobe wireguard 2>/dev/null || [[ -d /sys/module/wireguard ]]; } \
     && cok "wireguard kernel module" \
     || { ip link add drwgchk type wireguard 2>/dev/null && ip link del drwgchk 2>/dev/null && cok "wireguard kernel module (built-in)" || cbad "wireguard kernel module FAILED to load"; }
+  modprobe ip_gre 2>/dev/null || true; modprobe fou 2>/dev/null; modprobe ip_fou 2>/dev/null || true
+  if ip link add drgrechk type gre local 127.0.0.1 remote 127.0.0.2 2>/dev/null; then
+    ip link del drgrechk 2>/dev/null; cok "GRE kernel support (ip_gre + fou)"
+  else
+    warn "GRE kernel support missing - GRE/FOU tunnels will not build (modprobe ip_gre fou)"
+  fi
   [[ -x /usr/local/bin/drc-gost ]]     && cok "gost carrier installed"     || info "gost carrier: installs on the first carried tunnel"
   [[ -f $WEB_PY ]]                     && cok "web backend installed"      || warn "web backend NOT installed (join/test links need it - menu 5)"
   systemctl is-active dr-cpanel-web >/dev/null 2>&1 && cok "web backend running" || warn "web backend NOT running (menu 5 -> Restart)"
@@ -4618,7 +5322,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   ensure_deps
   migrate_legacy
   case "${1:-}" in
-    apply) apply_rules; gost_boot;;
+    apply) apply_rules; gre_sync; gost_boot;;
     list)  list_rules;;
     tunnel) shift; tunnel_cli "$@";;
     reverse) shift; tunnel_cli reverse "$@";;
@@ -4627,6 +5331,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     ctest-open) shift; ctest_open;;
     ctest-close) ctest_close;;
     ctest-daemon) shift; ctest_daemon "$@";;
+    web-reload) web_write_files; systemctl restart dr-cpanel-web 2>/dev/null; ok "Web panel files regenerated from v$VERSION.";;
     conntest) conntest_cli;;
     doctor) doctor;;
     perf)  shift; perf_apply "${1:-}";;

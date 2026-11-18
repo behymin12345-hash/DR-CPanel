@@ -67,6 +67,15 @@ install -m 755 "$TMP" "$BIN"
 rm -f "$TMP"
 ok "v$VER saved to $BIN"
 
+# a panel installed on this server must pick up the new backend + UI right away
+if [[ -f /etc/dr-cpanel/web.json ]]; then
+  if "$BIN" web-reload >/dev/null 2>&1; then
+    ok "Web panel regenerated for v$VER and restarted."
+  else
+    info "Web panel not refreshed - run menu 5 → 1) Install / update to regenerate it."
+  fi
+fi
+
 if [[ $MODE == update ]]; then
   ok "Updated (existing tunnels and settings in /etc/dr-cpanel are kept)."
   info "If anything breaks:  dr-cpanel rollback"
